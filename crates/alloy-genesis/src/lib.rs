@@ -422,6 +422,13 @@ pub struct ChainConfig {
     /// The deposit contract address
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deposit_contract_address: Option<Address>,
+
+    /// The beijing hard fork block (None = no fork, 0 = already on beijing).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "alloy_serde::quantity::opt::deserialize"
+    )]
+    pub beijing_block: Option<u64>,
 }
 
 impl ChainConfig {
@@ -546,6 +553,7 @@ impl Default for ChainConfig {
             parlia: None,
             extra_fields: Default::default(),
             deposit_contract_address: None,
+            beijing_block: None
         }
     }
 }

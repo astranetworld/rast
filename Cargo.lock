@@ -175,8 +175,6 @@ dependencies = [
 [[package]]
 name = "alloy-genesis"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20cb76c8a3913f2466c5488f3a915e3a15d15596bdc935558c1a9be75e9ec508"
 dependencies = [
  "alloy-primitives",
  "alloy-serde",

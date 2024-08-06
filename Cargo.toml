@@ -112,6 +112,7 @@ unarray.opt-level = 3
 [patch.crates-io]
 reth-primitives = { path = "crates/primitives" }
 reth-primitives-traits = { path = "crates/primitives-traits" }
+alloy-genesis = { path = "crates/alloy-genesis" }
 
 [workspace.dependencies]
 reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.3" ,default-features = false, features = ["std"] }
