@@ -53,6 +53,8 @@ impl EvmCommand {
 
         let executor = block_executor!(provider_factory.chain_spec());
 
+        let chain_spec = provider_factory.chain_spec();
+        info!(target: "&xex::evm",beijing_block=?chain_spec.genesis.config.beijing_block,"this is test");
         // configure blockchain tree
         let tree_externals =
             TreeExternals::new(provider_factory.clone(), consensus, executor);

@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.0.1"
+version = "1.0.4"
 edition = "2021"
 rust-version = "1.79"
 license = "MIT OR Apache-2.0"
@@ -139,15 +139,17 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
-[patch.crates-io]
+[patch.'https://github.com/paradigmxyz/reth.git']
 reth-primitives = { path = "crates/primitives" }
 reth-primitives-traits = { path = "crates/primitives-traits" }
-alloy-genesis = { path = "crates/alloy-genesis" }
 reth-node-api = { path = "crates/node/api" }
 reth-node-builder = { path = "crates/node/builder" }
 reth-node-core = { path = "crates/node/core" }
 reth-node-events = { path = "crates/node/events" }
 reth-node-metrics = { path = "crates/node/metrics" }
+
+[patch.crates-io]
+alloy-genesis = { path = "./crates/alloy-genesis" }
 
 [workspace.dependencies]
 

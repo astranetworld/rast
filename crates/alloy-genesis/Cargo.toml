@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.76"
 name = "alloy-genesis"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Alloy Contributors"]
 build = false
 exclude = [
@@ -71,11 +71,14 @@ std = [
 ]
 
 [lints.clippy]
-all = "warn"
 missing-const-for-fn = "warn"
 option-if-let-else = "warn"
 redundant-clone = "warn"
 use-self = "warn"
+
+[lints.clippy.all]
+level = "warn"
+priority = -1
 
 [lints.rust]
 missing-debug-implementations = "warn"
