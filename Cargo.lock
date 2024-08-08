@@ -5951,7 +5951,6 @@ dependencies = [
 [[package]]
 name = "reth-db"
 version = "1.0.4"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4#e24e4c773d7571a5a54dba7854643c02d0b0a841"
 dependencies = [
  "bytes",
  "derive_more",

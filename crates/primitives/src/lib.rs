@@ -22,6 +22,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+mod bodytest;
 #[cfg(feature = "alloy-compat")]
 mod alloy_compat;
 pub mod basefee;
