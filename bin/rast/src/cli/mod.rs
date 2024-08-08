@@ -2,14 +2,14 @@
 
 use crate::{
     args::{
-        LogArgs,
         utils::{chain_help, chain_value_parser, SUPPORTED_CHAINS},
+        LogArgs,
     },
     commands::debug_cmd,
     macros::block_executor,
     version::{LONG_VERSION, SHORT_VERSION},
 };
-use clap::{Parser, Subcommand, value_parser};
+use clap::{value_parser, Parser, Subcommand};
 use reth_chainspec::ChainSpec;
 use reth_cli_commands::{
     config_cmd, db, dump_genesis, import, init_cmd, init_state,
