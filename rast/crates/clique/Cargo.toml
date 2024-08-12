@@ -1,0 +1,34 @@
+[package]
+name = "clique"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+
+ethereum-types = "0.14" 
+rand = "0.8" 
+types = "0.1" 
+unexpected = "0.1" 
+log = "0.4"  
+hash-db = "0.16.0"
+keccak-hash = "0.10.0"
+rlp = "0.4"
+itertools = "0.13.0"
+derive_more = "0.14.0"
+lazy_static = "1.4" 
+lru-cache = "0.1"
+lru = "0.7" 
+parking_lot = "0.7.1"
+primitive-types = "0.3.0"
+
+reth-primitives-traits = {git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4", default-features = false, features = ["std"]  }
+
+
+[lints]
+workspace = true
