@@ -30,7 +30,7 @@
 Clone the repository:
 
 ```bash
-git clone [https://github.com/astranetworld/rast.git]
+git clone https://github.com/astranetworld/rast.git
 cd rust-blockchain
 ```
 
