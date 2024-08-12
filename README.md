@@ -31,7 +31,7 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/astranetworld/rast.git
-cd rust-blockchain
+cd rast
 ```
 
 Build the project:
