@@ -8,12 +8,13 @@ repository = "https://github.com/astranetworld/rast"
 exclude = [".github/"]
 
 
-
 [workspace]
 members = [
     "bin/rast/",
     "crates/primitives/",
-    "crates/primitives-traits/"
+    "crates/primitives-traits/",
+    "crates/storage/db/",
+    # "crates/storage/db-api/",
 ]
 default-members = ["bin/rast"]
 
@@ -147,7 +148,7 @@ reth-node-builder = { path = "crates/node/builder" }
 reth-node-core = { path = "crates/node/core" }
 reth-node-events = { path = "crates/node/events" }
 reth-node-metrics = { path = "crates/node/metrics" }
-reth-db={path="crates/storage/db"}
+reth-db = { path = "crates/storage/db" }
 
 [patch.crates-io]
 alloy-genesis = { path = "./crates/alloy-genesis" }
@@ -172,7 +173,7 @@ reth-config = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" 
 reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
 reth-consensus-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
 reth-consensus-debug-client = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
-reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" ,default-features = false}
+reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4", default-features = false }
 reth-db-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
 reth-discv4 = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
@@ -231,7 +232,9 @@ reth-optimism-rpc = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
 reth-payload-validator = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4", default-features = false, features = ["std"]  }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4", default-features = false, features = [
+    "std",
+] }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4", default-features = false }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
 reth-prune = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.4" }
@@ -290,10 +293,14 @@ alloy-genesis = { version = "0.2.1", default-features = false }
 alloy-json-rpc = { version = "0.2.1", default-features = false }
 alloy-network = { version = "0.2.1", default-features = false }
 alloy-node-bindings = { version = "0.2.1", default-features = false }
-alloy-provider = { version = "0.2.1", features = ["reqwest"], default-features = false }
+alloy-provider = { version = "0.2.1", features = [
+    "reqwest",
+], default-features = false }
 alloy-pubsub = { version = "0.2.1", default-features = false }
 alloy-rpc-client = { version = "0.2.1", default-features = false }
-alloy-rpc-types = { version = "0.2.1", features = ["eth"], default-features = false }
+alloy-rpc-types = { version = "0.2.1", features = [
+    "eth",
+], default-features = false }
 alloy-rpc-types-admin = { version = "0.2.1", default-features = false }
 alloy-rpc-types-anvil = { version = "0.2.1", default-features = false }
 alloy-rpc-types-beacon = { version = "0.2.1", default-features = false }
@@ -306,7 +313,9 @@ alloy-serde = { version = "0.2.1", default-features = false }
 alloy-signer = { version = "0.2.1", default-features = false }
 alloy-signer-local = { version = "0.2.1", default-features = false }
 alloy-transport = { version = "0.2.1" }
-alloy-transport-http = { version = "0.2.1", features = ["reqwest-rustls-tls"], default-features = false }
+alloy-transport-http = { version = "0.2.1", features = [
+    "reqwest-rustls-tls",
+], default-features = false }
 alloy-transport-ipc = { version = "0.2.1", default-features = false }
 alloy-transport-ws = { version = "0.2.1", default-features = false }
 
@@ -341,7 +350,8 @@ rand = "0.8.5"
 rayon = "1.7"
 rustc-hash = { version = "2.0", default-features = false }
 schnellru = "0.2"
-serde = { version = "1.0", default-features = false }
+# serde = { version = "1.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.94"
 serde_with = "3.3.0"
 sha2 = { version = "0.10", default-features = false }

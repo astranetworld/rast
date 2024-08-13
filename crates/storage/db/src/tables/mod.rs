@@ -39,6 +39,7 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+// use reth_primitives::verifier::PublicKey;
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -269,9 +270,24 @@ macro_rules! tables {
     };
 }
 
+use reth_db_api::table::Decompress;
+use serde::Serializer;
+
+const PUBLIC_KEY_LENGTH: usize = 48;
+#[derive(Debug, Decompress)]
+pub struct PublicKey([u8; PUBLIC_KEY_LENGTH]);
+impl Serialize for PublicKey {
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
 tables! {
     ///
-    // table BlockVerify<key=BlockNumber,value=BlockHash>;
+    table BlockVerify<Key=Address,Value=PublicKey>;
 
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;

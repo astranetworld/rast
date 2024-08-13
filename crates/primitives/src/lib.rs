@@ -22,7 +22,9 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-mod bodytest;
+pub mod blockbody;
+pub mod verifier;
+pub mod reward;
 #[cfg(feature = "alloy-compat")]
 mod alloy_compat;
 pub mod basefee;
@@ -40,7 +42,7 @@ pub mod transaction;
 #[cfg(any(test, feature = "arbitrary"))]
 pub use block::{generate_valid_header, valid_header_strategy};
 pub use block::{
-    Block, BlockBody, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, BlockWithSenders,
+    Block, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, BlockWithSenders,
     ForkBlock, RpcBlockHash, SealedBlock, SealedBlockWithSenders,
 };
 #[cfg(feature = "reth-codec")]
