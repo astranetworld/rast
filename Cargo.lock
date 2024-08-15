@@ -650,9 +650,13 @@ checksum = "03704f265cbbb943b117ecb5055fd46e8f41e7dc8a58b1aed20bcd40ace38c15"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "arbitrary",
+ "derive_arbitrary",
  "derive_more",
  "hashbrown 0.14.5",
  "nybbles",
+ "proptest",
+ "proptest-derive 0.4.0",
  "serde",
  "smallvec",
  "tracing",
@@ -2894,6 +2898,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash-db"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d23bd4e7b5eda0d0f3a307e8b381fdc8ba9000f26fbe912250c0a4cc3956364a"
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3151,6 +3161,38 @@ dependencies = [
  "tower",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "iai-callgrind"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "146bf76de95f03c5f4b118f0f2f350ef18df47cc0595755bd29d8f668209466c"
+dependencies = [
+ "bincode",
+ "iai-callgrind-macros",
+ "iai-callgrind-runner",
+]
+
+[[package]]
+name = "iai-callgrind-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2a4bb39225592c0a28cfca6f70af52ebd8da23f533c2cdd0a3329c1fa252d56"
+dependencies = [
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.72",
+]
+
+[[package]]
+name = "iai-callgrind-runner"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60484b2e469ef4f1af6f196af738889ff375151dd11ac223647ed8a97529107d"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -4550,6 +4592,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95f06be0417d97f81fe4e5c86d7d01b392655a9cac9c19a848aa033e18937b23"
 dependencies = [
  "alloy-rlp",
+ "arbitrary",
  "const-hex",
  "proptest",
  "serde",
@@ -4890,6 +4933,15 @@ name = "pkg-config"
 version = "0.3.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231b230927b5e4ad203db57bbcbee2802f6bce620b1e4a9024a07d94e2907ec"
+
+[[package]]
+name = "plain_hasher"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e19e6491bdde87c2c43d70f4c194bc8a758f2eb732df00f61e43f7362e3b4cc"
+dependencies = [
+ "crunchy",
+]
 
 [[package]]
 name = "plotters"
@@ -5380,7 +5432,7 @@ dependencies = [
  "reth-payload-primitives",
  "reth-payload-validator",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-revm",
  "reth-rpc",
@@ -5617,7 +5669,7 @@ dependencies = [
  "reth-network-p2p",
  "reth-network-peers",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-rpc-types",
  "reth-stages-api",
@@ -5642,7 +5694,7 @@ dependencies = [
  "reth-payload-builder",
  "reth-payload-primitives",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-tasks",
  "reth-transaction-pool",
@@ -5671,7 +5723,7 @@ dependencies = [
  "reth-payload-primitives",
  "reth-payload-validator",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-rpc-types",
  "reth-stages-api",
@@ -5704,7 +5756,7 @@ dependencies = [
  "reth-metrics",
  "reth-network",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune-types",
  "reth-revm",
  "reth-stages-api",
@@ -5738,6 +5790,7 @@ dependencies = [
  "metrics",
  "parking_lot 0.12.3",
  "pin-project",
+ "rand 0.8.5",
  "reth-chainspec",
  "reth-errors",
  "reth-execution-types",
@@ -5745,6 +5798,7 @@ dependencies = [
  "reth-primitives",
  "reth-storage-api",
  "reth-trie",
+ "revm",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -5825,7 +5879,7 @@ dependencies = [
  "reth-node-events",
  "reth-node-metrics",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-stages",
  "reth-static-file",
@@ -5951,14 +6005,20 @@ dependencies = [
 [[package]]
 name = "reth-db"
 version = "1.0.4"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4#e24e4c773d7571a5a54dba7854643c02d0b0a841"
 dependencies = [
+ "arbitrary",
+ "assert_matches",
  "bytes",
+ "criterion",
  "derive_more",
  "eyre",
+ "iai-callgrind",
  "metrics",
  "page_size",
  "paste",
+ "pprof",
+ "proptest",
+ "rand 0.8.5",
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
@@ -5973,8 +6033,11 @@ dependencies = [
  "reth-trie-common",
  "rustc-hash 2.0.0",
  "serde",
+ "serde_json",
  "strum",
  "sysinfo",
+ "tempfile",
+ "test-fuzz",
  "thiserror",
 ]
 
@@ -6016,7 +6079,7 @@ dependencies = [
  "reth-etl",
  "reth-fs-util",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-stages-types",
  "reth-trie",
  "reth-trie-db",
@@ -6189,7 +6252,7 @@ dependencies = [
  "reth-payload-primitives",
  "reth-payload-validator",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-revm",
  "reth-rpc-types",
@@ -6302,7 +6365,7 @@ dependencies = [
  "reth-network-p2p",
  "reth-payload-builder",
  "reth-payload-validator",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-stages-api",
  "reth-tasks",
@@ -6360,7 +6423,7 @@ dependencies = [
  "reth-execution-types",
  "reth-payload-builder",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-transaction-pool",
  "revm",
@@ -6459,6 +6522,7 @@ dependencies = [
  "reth-primitives",
  "reth-trie",
  "revm",
+ "serde",
 ]
 
 [[package]]
@@ -6478,7 +6542,7 @@ dependencies = [
  "reth-payload-builder",
  "reth-primitives",
  "reth-primitives-traits",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune-types",
  "reth-revm",
  "reth-stages-api",
@@ -6494,7 +6558,7 @@ version = "1.0.4"
 source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4#e24e4c773d7571a5a54dba7854643c02d0b0a841"
 dependencies = [
  "alloy-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
 ]
 
 [[package]]
@@ -6748,7 +6812,7 @@ dependencies = [
  "reth-network-api",
  "reth-payload-builder",
  "reth-payload-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-tasks",
  "reth-transaction-pool",
 ]
@@ -6786,7 +6850,7 @@ dependencies = [
  "reth-node-metrics",
  "reth-payload-builder",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-rpc",
  "reth-rpc-builder",
@@ -6833,7 +6897,7 @@ dependencies = [
  "reth-network-p2p",
  "reth-network-peers",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune-types",
  "reth-rpc-api",
  "reth-rpc-eth-api",
@@ -6876,7 +6940,7 @@ dependencies = [
  "reth-node-core",
  "reth-node-events",
  "reth-payload-builder",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-rpc",
  "reth-rpc-engine-api",
  "reth-rpc-types",
@@ -6902,7 +6966,7 @@ dependencies = [
  "reth-network-api",
  "reth-primitives",
  "reth-primitives-traits",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-stages",
  "reth-static-file",
@@ -6925,7 +6989,7 @@ dependencies = [
  "procfs",
  "reth-db-api",
  "reth-metrics",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-tasks",
  "tikv-jemalloc-ctl",
  "tokio",
@@ -6962,7 +7026,7 @@ dependencies = [
  "reth-optimism-rpc",
  "reth-payload-builder",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-rpc",
  "reth-rpc-eth-api",
@@ -7006,7 +7070,7 @@ dependencies = [
  "reth-node-events",
  "reth-optimism-primitives",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-stages",
  "reth-stages-types",
@@ -7045,7 +7109,7 @@ dependencies = [
  "reth-payload-builder",
  "reth-payload-primitives",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-rpc-types",
  "reth-rpc-types-compat",
@@ -7076,7 +7140,7 @@ dependencies = [
  "reth-network-api",
  "reth-node-api",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-rpc",
  "reth-rpc-eth-api",
  "reth-rpc-eth-types",
@@ -7102,7 +7166,7 @@ dependencies = [
  "reth-metrics",
  "reth-payload-primitives",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-rpc-types",
  "reth-transaction-pool",
  "thiserror",
@@ -7154,7 +7218,10 @@ dependencies = [
  "derive_more",
  "k256",
  "modular-bitfield",
+ "num-bigint",
+ "num-traits",
  "once_cell",
+ "parity-scale-codec",
  "pprof",
  "proptest",
  "proptest-arbitrary-interop",
@@ -7167,9 +7234,11 @@ dependencies = [
  "reth-static-file-types",
  "reth-trie-common",
  "revm-primitives",
+ "rlp",
  "secp256k1",
  "serde",
  "serde_json",
+ "serde_with",
  "tempfile",
  "test-fuzz",
  "thiserror",
@@ -7201,6 +7270,48 @@ dependencies = [
  "serde",
  "serde_json",
  "test-fuzz",
+]
+
+[[package]]
+name = "reth-provider"
+version = "1.0.4"
+dependencies = [
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
+ "assert_matches",
+ "auto_impl",
+ "dashmap 6.0.1",
+ "itertools 0.13.0",
+ "metrics",
+ "parking_lot 0.12.3",
+ "rand 0.8.5",
+ "rayon",
+ "reth-blockchain-tree-api",
+ "reth-chain-state",
+ "reth-chainspec",
+ "reth-codecs",
+ "reth-db",
+ "reth-db-api",
+ "reth-errors",
+ "reth-evm",
+ "reth-execution-types",
+ "reth-fs-util",
+ "reth-metrics",
+ "reth-network-p2p",
+ "reth-nippy-jar",
+ "reth-primitives",
+ "reth-prune-types",
+ "reth-stages-types",
+ "reth-storage-api",
+ "reth-storage-errors",
+ "reth-testing-utils",
+ "reth-trie",
+ "reth-trie-db",
+ "revm",
+ "strum",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -7257,7 +7368,7 @@ dependencies = [
  "reth-errors",
  "reth-exex-types",
  "reth-metrics",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune-types",
  "reth-static-file-types",
  "reth-tokio-util",
@@ -7326,7 +7437,7 @@ dependencies = [
  "reth-network-types",
  "reth-node-api",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-rpc-api",
  "reth-rpc-engine-api",
@@ -7380,7 +7491,7 @@ dependencies = [
  "reth-metrics",
  "reth-network-api",
  "reth-node-core",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-rpc",
  "reth-rpc-api",
  "reth-rpc-eth-api",
@@ -7443,7 +7554,7 @@ dependencies = [
  "reth-execution-types",
  "reth-network-api",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
@@ -7476,7 +7587,7 @@ dependencies = [
  "reth-execution-types",
  "reth-metrics",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-revm",
  "reth-rpc-server-types",
  "reth-rpc-types",
@@ -7575,7 +7686,7 @@ dependencies = [
  "reth-network-p2p",
  "reth-primitives",
  "reth-primitives-traits",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-prune-types",
  "reth-revm",
@@ -7604,7 +7715,7 @@ dependencies = [
  "reth-metrics",
  "reth-network-p2p",
  "reth-primitives-traits",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune",
  "reth-stages-types",
  "reth-static-file",
@@ -7639,7 +7750,7 @@ dependencies = [
  "reth-db",
  "reth-db-api",
  "reth-nippy-jar",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-prune-types",
  "reth-stages-types",
  "reth-static-file-types",
@@ -7707,6 +7818,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-testing-utils"
+version = "1.0.4"
+source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4#e24e4c773d7571a5a54dba7854643c02d0b0a841"
+dependencies = [
+ "alloy-genesis",
+ "rand 0.8.5",
+ "reth-primitives",
+ "secp256k1",
+]
+
+[[package]]
 name = "reth-tokio-util"
 version = "1.0.4"
 source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4#e24e4c773d7571a5a54dba7854643c02d0b0a841"
@@ -7749,7 +7871,7 @@ dependencies = [
  "reth-fs-util",
  "reth-metrics",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-tasks",
  "revm",
  "rustc-hash 2.0.0",
@@ -7780,7 +7902,9 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm",
+ "serde",
  "tracing",
+ "triehash",
 ]
 
 [[package]]
@@ -7793,10 +7917,13 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
+ "arbitrary",
  "bytes",
  "derive_more",
+ "hash-db",
  "itertools 0.13.0",
  "nybbles",
+ "plain_hasher",
  "reth-codecs",
  "reth-primitives-traits",
  "revm-primitives",
@@ -7842,7 +7969,7 @@ dependencies = [
  "reth-execution-errors",
  "reth-metrics",
  "reth-primitives",
- "reth-provider",
+ "reth-provider 1.0.4 (git+https://github.com/paradigmxyz/reth.git?tag=v1.0.4)",
  "reth-tasks",
  "reth-trie",
  "reth-trie-db",
@@ -8655,6 +8782,7 @@ version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c5e1a9a646d36c3599cd173a41282daf47c44583ad367b8e6837255952e5c67"
 dependencies = [
+ "arbitrary",
  "serde",
 ]
 
@@ -9449,6 +9577,16 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "triehash"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1631b201eb031b563d2e85ca18ec8092508e262a3196ce9bd10a67ec87b9f5c"
+dependencies = [
+ "hash-db",
+ "rlp",
 ]
 
 [[package]]
