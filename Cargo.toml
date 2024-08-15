@@ -142,6 +142,7 @@ lto = "fat"
 codegen-units = 1
 
 [patch.'https://github.com/paradigmxyz/reth.git']
+reth-chainspec = { path = "crates/chainspec" }
 reth-primitives = { path = "crates/primitives" }
 reth-primitives-traits = { path = "crates/primitives-traits" }
 reth-node-api = { path = "crates/node/api" }
