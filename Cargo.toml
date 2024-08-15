@@ -15,6 +15,7 @@ members = [
     "crates/primitives-traits/",
     "crates/storage/db/",
     # "crates/storage/db-api/",
+    "crates/storage/provider/"
 ]
 default-members = ["bin/rast"]
 

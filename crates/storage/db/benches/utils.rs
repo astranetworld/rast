@@ -1,4 +1,5 @@
-use reth_db::{test_utils::create_test_rw_db_with_path, DatabaseEnv};
+use reth_db::DatabaseEnv;
+use reth_db::test_utils::create_test_rw_db_with_path;
 use reth_db_api::{
     database::Database,
     table::{Compress, Encode, Table, TableRow},

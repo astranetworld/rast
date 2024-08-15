@@ -4,9 +4,13 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub(crate) struct DurationsRecorder {
+    //某个操作或时间段的开始时间。Instant类型通常用于记录时间间隔。
     start: Instant,
+    //与数据库提供者相关的度量指标
     current_metrics: DatabaseProviderMetrics,
+    //一系列的操作和它们各自的持续时间
     pub(crate) actions: Vec<(Action, Duration)>,
+    //最新的持续时间
     latest: Option<Duration>,
 }
 
@@ -25,19 +29,29 @@ impl DurationsRecorder {
     /// Saves the provided duration for future logging and instantly reports as a metric with
     /// `action` label.
     pub(crate) fn record_duration(&mut self, action: Action, duration: Duration) {
+        //将action和duration作为一个元组添加到actions向量中，用于记录操作和持续时间。
         self.actions.push((action, duration));
+        //更新度量指标
         self.current_metrics.record_duration(action, duration);
+        //更新latest字段为从start时间点到现在的持续时间。
         self.latest = Some(self.start.elapsed());
     }
 
     /// Records the duration since last record, saves it for future logging and instantly reports as
     /// a metric with `action` label.
+    /// 计算从上次记录以来经过的时间
     pub(crate) fn record_relative(&mut self, action: Action) {
+        //计算从start时间点到现在的总持续时间
         let elapsed = self.start.elapsed();
+        //计算自上次记录以来经过的时间。如果latest是Some，则从elapsed中减去latest值，
+        //否则使用unwrap_or_default()，这意味着如果latest是None，则使用默认的Duration值
         let duration = elapsed - self.latest.unwrap_or_default();
 
+        //将计算出的相对持续时间和action作为元组添加到actions向量中
         self.actions.push((action, duration));
+        //更新度量指标
         self.current_metrics.record_duration(action, duration);
+        //更新latest字段为当前的总持续时间
         self.latest = Some(elapsed);
     }
 }
@@ -66,9 +80,13 @@ pub(crate) enum Action {
     InsertTransactionBlocks,
     GetNextTxNum,
     GetParentTD,
+    //lytest
+    InsertBlockVerify,
+    InsertBlockRewards,
 }
 
 /// Database provider metrics
+/// 记录不同数据库操作的持续时间分布
 #[derive(Metrics)]
 #[metrics(scope = "storage.providers.database")]
 struct DatabaseProviderMetrics {
@@ -116,6 +134,10 @@ struct DatabaseProviderMetrics {
     get_next_tx_num: Histogram,
     /// Duration of get parent TD
     get_parent_td: Histogram,
+    /// lytest
+    insert_block_verify:Histogram,
+    /// lytest
+    insert_block_rewards:Histogram,
 }
 
 impl DatabaseProviderMetrics {
@@ -144,6 +166,9 @@ impl DatabaseProviderMetrics {
             Action::InsertTransactionBlocks => self.insert_tx_blocks.record(duration),
             Action::GetNextTxNum => self.get_next_tx_num.record(duration),
             Action::GetParentTD => self.get_parent_td.record(duration),
+            //lytest
+            Action::InsertBlockVerify=>self.insert_block_verify.record(duration),
+            Action::InsertBlockRewards=>self.insert_block_rewards.record(duration),
         }
     }
 }

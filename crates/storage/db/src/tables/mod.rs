@@ -270,24 +270,118 @@ macro_rules! tables {
     };
 }
 
-use reth_db_api::table::Decompress;
-use serde::Serializer;
+// use reth_db_api::table::Decompress;
+// use serde::Serializer;
 
-const PUBLIC_KEY_LENGTH: usize = 48;
-#[derive(Debug, Decompress)]
-pub struct PublicKey([u8; PUBLIC_KEY_LENGTH]);
-impl Serialize for PublicKey {
-    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
-    where
-        Ser: Serializer,
-    {
-        serializer.serialize_bytes(&self.0)
+// const PUBLIC_KEY_LENGTH: usize = 48;
+// #[derive(Debug, Decompress)]
+// pub struct PublicKey([u8; PUBLIC_KEY_LENGTH]);
+// impl Serialize for PublicKey {
+//     fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+//     where
+//         Ser: Serializer,
+//     {
+//         serializer.serialize_bytes(&self.0)
+//     }
+// }
+use bytes::BytesMut;
+use reth_db_api::table::{Compress, Decompress};
+use reth_db_api::DatabaseError;
+use reth_primitives::alloy_primitives::FixedBytes;
+use reth_storage_errors::db::DatabaseErrorInfo;
+/// lytest
+#[derive(Serialize, Debug)]
+pub struct PublicKey(pub FixedBytes<32>);
+impl Decompress for PublicKey {
+    fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, DatabaseError> {
+        let bytes = value.as_ref();
+        if bytes.len() != 32 {
+            // 直接构造 DatabaseErrorInfo 实例
+            let error_info = DatabaseErrorInfo {
+                message: "Invalid length of data".to_string(),
+                code: -1, // 假设 -1 是一个合适的错误码，你需要根据实际情况来设置
+            };
+            return Err(DatabaseError::Read(error_info));
+        }
+
+        // 假设 FixedBytes 可以接收一个长度为 32 的字节数组并创建一个新的实例
+        Self::decompress_owned(bytes.to_vec())
+    }
+
+    fn decompress_owned(value: Vec<u8>) -> Result<Self, DatabaseError> {
+        // FixedBytes 构造函数的实现，这里假设它接受一个 Vec<u8>
+        let fixed_bytes = FixedBytes(value.try_into().map_err(|_| {
+            DatabaseError::Read(DatabaseErrorInfo {
+                message: "Failed to convert Vec<u8> into array".to_string(),
+                code: -2, // 假设 -2 是转换失败的错误码
+            })
+        })?);
+        Ok(PublicKey(fixed_bytes))
     }
 }
 
+// 实现 Compress trait 对于 PublicKey
+impl Compress for PublicKey {
+    // 定义关联类型 Compressed 为 BytesMut
+    type Compressed = BytesMut;
+
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B) {
+        // 将 PublicKey 中的字节复制到提供的缓冲区中
+        buf.put_slice(&self.0 .0); // 假设 self.0 是 FixedBytes，self.0.0 是其中的字节数组
+    }
+}
+
+#[derive(Serialize,Debug)]
+pub struct Amount([u8; 32]);
+
+// 假定的解压缩函数，实际使用时应替换为具体的解压缩算法
+fn fake_decompress<B: AsRef<[u8]>>(data: B) -> Result<Vec<u8>, DatabaseError> {
+    // 这里只是一个示例，实际的解压缩逻辑会依赖于使用的压缩算法
+    Ok(data.as_ref().to_vec()) // 假设数据已经是解压缩的，直接返回
+}
+
+// Decompress trait的实现
+impl Decompress for Amount {
+    fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, DatabaseError> {
+        let decompressed_data = fake_decompress(value)?;
+        
+        // 检查解压缩后的数据长度是否正确
+        if decompressed_data.len() != 32 {
+            return Err(DatabaseError::Other("Decompressed data length is incorrect".to_string()));
+        }
+
+        // 将解压缩的数据转换为Amount类型
+        let mut amount_bytes = [0u8; 32];
+        amount_bytes.copy_from_slice(&decompressed_data[..32]);
+        
+        Ok(Amount(amount_bytes))
+    }
+}
+
+impl Compress for Amount {
+    // 定义压缩后的类型为BytesMut，它实现了bytes::BufMut特性
+    type Compressed = BytesMut;
+
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B) {
+        // 将Amount的数据复制到buf中
+        buf.put_slice(&self.0);
+    }
+}
+
+
+
 tables! {
-    ///
+    /// verify information in the block
     table BlockVerify<Key=Address,Value=PublicKey>;
+
+    /// reward information in the block
+    table BlockRewards<Key=Address,Value=Amount>;
+
+    /// deposit in the chain
+    table Deposit<Key=Address,Value=Amount>;
+
+    /// reward in the chain
+    table Reward<Key=Address,Value=Amount>;
 
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;
