@@ -60,6 +60,8 @@ impl TryFrom<alloy_rpc_types::Block> for Block {
             // todo(onbjerg): we don't know if this is added to rpc yet, so for now we leave it as
             // empty.
             requests: None,
+            verifiers:None,
+            rewards:None,
         })
     }
 }

@@ -11,8 +11,10 @@ exclude = [".github/"]
 members = [
     "bin/rast/",
     "crates/primitives/",
-    "crates/primitives-traits/"
-, "crates/miner"]
+    "crates/primitives-traits/", 
+    "crates/storage/db/",
+    "crates/storage/db-api",
+]
 default-members = ["bin/rast"]
 
 
@@ -148,6 +150,7 @@ reth-node-events = { path = "crates/node/events" }
 reth-node-metrics = { path = "crates/node/metrics" }
 reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
+reth-db-api={path = "crates/storage/db-api"}
 
 [patch.crates-io]
 alloy-genesis = { path = "./crates/alloy-genesis" }

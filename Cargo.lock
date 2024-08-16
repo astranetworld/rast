@@ -3161,6 +3161,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "iai-callgrind"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "146bf76de95f03c5f4b118f0f2f350ef18df47cc0595755bd29d8f668209466c"
+dependencies = [
+ "bincode",
+ "iai-callgrind-macros",
+ "iai-callgrind-runner",
+]
+
+[[package]]
+name = "iai-callgrind-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2a4bb39225592c0a28cfca6f70af52ebd8da23f533c2cdd0a3329c1fa252d56"
+dependencies = [
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.74",
+]
+
+[[package]]
+name = "iai-callgrind-runner"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60484b2e469ef4f1af6f196af738889ff375151dd11ac223647ed8a97529107d"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4248,13 +4280,6 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
-]
-
-[[package]]
-name = "miner"
-version = "1.0.5"
-dependencies = [
- "reth-transaction-pool",
 ]
 
 [[package]]
@@ -5967,12 +5992,19 @@ dependencies = [
 name = "reth-db"
 version = "1.0.5"
 dependencies = [
+ "arbitrary",
+ "assert_matches",
  "bytes",
+ "criterion",
  "derive_more",
  "eyre",
+ "iai-callgrind",
  "metrics",
  "page_size",
  "paste",
+ "pprof",
+ "proptest",
+ "rand 0.8.5",
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
@@ -5987,23 +6019,31 @@ dependencies = [
  "reth-trie-common",
  "rustc-hash 2.0.0",
  "serde",
+ "serde_json",
  "strum",
  "sysinfo",
+ "tempfile",
+ "test-fuzz",
  "thiserror",
 ]
 
 [[package]]
 name = "reth-db-api"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "arbitrary",
+ "assert_matches",
  "bytes",
+ "criterion",
  "derive_more",
+ "iai-callgrind",
  "metrics",
  "modular-bitfield",
  "parity-scale-codec",
+ "pprof",
  "proptest",
+ "proptest-arbitrary-interop",
+ "rand 0.8.5",
  "reth-codecs",
  "reth-primitives",
  "reth-primitives-traits",
@@ -6012,6 +6052,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "serde",
+ "test-fuzz",
 ]
 
 [[package]]
