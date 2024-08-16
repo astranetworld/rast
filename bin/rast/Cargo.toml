@@ -119,7 +119,6 @@ libc = "0.2"
 [dev-dependencies]
 reth-discv4.workspace = true
 
-
 [features]
 default = ["jemalloc"]
 
