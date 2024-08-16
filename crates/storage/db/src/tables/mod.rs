@@ -26,6 +26,7 @@ use reth_db_api::{
         client_version::ClientVersion,
         storage_sharded_key::StorageShardedKey,
         CompactU256, ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals,
+        StoredBlockVerifiers,StoredBlockRewards,
     },
     table::{Decode, DupSort, Encode, Table},
 };
@@ -270,6 +271,12 @@ macro_rules! tables {
 }
 
 tables! {
+    /// verify in the block
+    table BlockVerifiers<Key=BlockNumber,Value=StoredBlockVerifiers>;
+
+    /// reward in the block
+    table BlockRewards<Key=BlockNumber,Value=StoredBlockRewards>;
+
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;
 
