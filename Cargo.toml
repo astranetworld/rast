@@ -11,7 +11,9 @@ exclude = [".github/"]
 members = [
     "bin/rast/",
     "crates/primitives/",
-    "crates/primitives-traits/", 
+    "crates/primitives-traits/",
+    "crates/chainspec/",
+    "crates/ethereum/cli/"
     "crates/storage/db/",
     "crates/storage/db-api",
 ]
@@ -150,6 +152,8 @@ reth-node-events = { path = "crates/node/events" }
 reth-node-metrics = { path = "crates/node/metrics" }
 reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
+reth-ethereum-forks = { path = "crates/ethereum-forks"}
+reth-ethereum-cli = { path = "crates/ethereum/cli"}
 reth-db-api={path = "crates/storage/db-api"}
 
 [patch.crates-io]
