@@ -14,6 +14,8 @@ members = [
     "crates/primitives-traits/",
     "crates/chainspec/",
     "crates/ethereum/cli/"
+    "crates/storage/db/",
+    "crates/storage/db-api",
 ]
 default-members = ["bin/rast"]
 
@@ -152,6 +154,7 @@ reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
 reth-ethereum-forks = { path = "crates/ethereum-forks"}
 reth-ethereum-cli = { path = "crates/ethereum/cli"}
+reth-db-api={path = "crates/storage/db-api"}
 
 [patch.crates-io]
 alloy-genesis = { path = "./crates/alloy-genesis" }
