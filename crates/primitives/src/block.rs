@@ -48,7 +48,9 @@ pub struct Block {
     pub withdrawals: Option<Withdrawals>,
     /// Block requests.
     pub requests: Option<Requests>,
+    /// Block verifiers
     pub verifiers:Option<Verifiers>,
+    /// Block rewards
     pub rewards:Option<Rewards>,
 }
 
@@ -305,7 +307,9 @@ pub struct SealedBlock {
     pub withdrawals: Option<Withdrawals>,
     /// Block requests.
     pub requests: Option<Requests>,
+    /// Block verifiers
     pub verifiers:Option<Verifiers>,
+    /// Block rewards
     pub rewards:Option<Rewards>,
 }
 

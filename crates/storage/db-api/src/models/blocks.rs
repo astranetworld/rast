@@ -1,13 +1,9 @@
 //! Block related models and types.
 
 use reth_codecs::{add_arbitrary_tests, Compact};
-use reth_primitives::{Header, TxNumber, Withdrawals, B256,Verifiers,Verifier,Rewards,Reward};
+use reth_primitives::{Header, TxNumber, Withdrawals, B256,Verifiers,Rewards};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
-use crate::table::{Decompress,Compress};
-use reth_storage_errors::db::DatabaseError;
-use reth_primitives_traits::{Address,PublicKey,Amount};
-use bytes::BufMut;
 
 /// Total number of transactions.
 pub type NumTransactions = u64;
@@ -95,107 +91,17 @@ pub struct StoredBlockWithdrawals {
 pub type HeaderHash = B256;
 
 /// ly
-#[derive(Serialize,Debug,PartialEq)]
+#[derive(Serialize,Debug,PartialEq,Compact,Deserialize,Clone,Default)]
 pub struct StoredBlockVerifiers{
     /// ly
     pub verifiers:Verifiers,
 }
 
-impl Decompress for StoredBlockVerifiers {
-    fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, DatabaseError> {
-        let data = value.as_ref();
-        
-        // 定义我们期望的每个Verifier的大小：Address长度 + PublicKey长度
-        const VERIFIER_SIZE: usize = 68;
-        
-        // 校验数据长度是否为Verifier的整数倍
-        if data.len() % VERIFIER_SIZE != 0 {
-            return Err(DatabaseError::Decode);
-        }
-
-        let mut verifiers = Vec::new();
-
-        // 解析每个Verifier
-        for chunk in data.chunks_exact(VERIFIER_SIZE) {
-            let address: Address = chunk[0..20].try_into().map_err(|_| DatabaseError::Decode)?;
-            let public_key_bytes: [u8; 48] = chunk[20..VERIFIER_SIZE].try_into().map_err(|_| DatabaseError::Decode)?;
-            let public_key = PublicKey(public_key_bytes);
-
-            verifiers.push(Verifier {
-                address,
-                public_key,
-            });
-        }
-
-        Ok(StoredBlockVerifiers {
-            verifiers: Verifiers(verifiers),
-        })
-    }
-}
-
-impl Compress for StoredBlockVerifiers {
-    type Compressed = Vec<u8>; // 使用 Vec<u8> 作为压缩后的数据类型
-
-    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(self, buf: &mut B) {
-        // 遍历每个 Verifier，并将其 address 和 public_key 写入 buf
-        for verifier in self.verifiers.0 {
-            buf.put_slice(&verifier.address); // 写入 address
-            buf.put_slice(&verifier.public_key.0); // 写入 public_key (假设 public_key.0 是 [u8; PUBLIC_KEY_LENGTH])
-        }
-    }
-}
-
-
 /// ly
-#[derive(Debug,Serialize)]
+#[derive(Debug,Serialize,Compact,Deserialize,Clone,PartialEq,Default)]
 pub struct StoredBlockRewards{
     /// ly
     pub rewards:Rewards,
-}
-
-impl Decompress for StoredBlockRewards {
-    fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, DatabaseError> {
-        let data = value.as_ref();
-        
-        // 定义我们期望的每个Reward的大小：Address长度 + Amount长度
-        const REWARD_SIZE: usize = 20 + 32; // 32字节对应Amount大小
-        
-        // 校验数据长度是否为Reward的整数倍
-        if data.len() % REWARD_SIZE != 0 {
-            return Err(DatabaseError::Decode);
-        }
-
-        let mut rewards = Vec::new();
-
-        // 解析每个Reward
-        for chunk in data.chunks_exact(REWARD_SIZE) {
-            let address: Address = chunk[0..20].try_into().map_err(|_| DatabaseError::Decode)?;
-            let amount_bytes: [u8; 32] = chunk[20..REWARD_SIZE].try_into().map_err(|_| DatabaseError::Decode)?;
-            let amount = Amount(amount_bytes);
-
-            rewards.push(Reward {
-                address,
-                amount,
-            });
-        }
-
-        Ok(StoredBlockRewards {
-            rewards: Rewards(rewards),
-        })
-    }
-}
-
-
-impl Compress for StoredBlockRewards {
-    type Compressed = Vec<u8>; // 使用 Vec<u8> 作为压缩后的数据类型
-
-    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(self, buf: &mut B) {
-        // 遍历每个 Reward，将其 address 和 amount 写入 buf
-        for reward in self.rewards.0 {
-            buf.put_slice(&reward.address); // 写入 address
-            buf.put_slice(&reward.amount.0); // 写入 amount (假设 amount.0 是 [u8; 32])
-        }
-    }
 }
 
 #[cfg(test)]

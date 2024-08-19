@@ -5,9 +5,7 @@ use alloy_rlp::Decodable;
 use reth_db::tables;
 use reth_db_api::{database::Database, models::StoredBlockBodyIndices};
 use reth_primitives::{
-    alloy_primitives, b256, hex_literal::hex, Account, Address, BlockNumber, Bytes, Header,
-    Receipt, Requests, SealedBlock, SealedBlockWithSenders, TxType, Withdrawal, Withdrawals, B256,
-    U256,
+    alloy_primitives, b256, hex_literal::hex, Account, Address, BlockNumber, Bytes, Header, Receipt, Requests, Rewards, SealedBlock, SealedBlockWithSenders, TxType, Verifiers, Withdrawal, Withdrawals, B256, U256
 };
 use reth_trie::root::{state_root_unhashed, storage_root_unhashed};
 use revm::{
@@ -37,6 +35,8 @@ pub fn assert_genesis_block<DB: Database>(provider: &DatabaseProviderRW<DB>, g: 
     assert_eq!(tx.table::<tables::BlockOmmers>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::BlockWithdrawals>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::BlockRequests>().unwrap(), vec![]);
+    assert_eq!(tx.table::<tables::BlockVerifiers>().unwrap(), vec![]);
+    assert_eq!(tx.table::<tables::BlockRewards>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::Transactions>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::TransactionBlocks>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::TransactionHashNumbers>().unwrap(), vec![]);
@@ -109,6 +109,8 @@ pub fn genesis() -> SealedBlock {
         ommers: vec![],
         withdrawals: Some(Withdrawals::default()),
         requests: Some(Requests::default()),
+        verifiers:Some(Verifiers::default()),
+        rewards:Some(Rewards::default()),
     }
 }
 

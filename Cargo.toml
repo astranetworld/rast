@@ -14,6 +14,7 @@ members = [
     "crates/primitives-traits/", 
     "crates/storage/db/",
     "crates/storage/db-api",
+    "crates/storage/storage-api/",
 ]
 default-members = ["bin/rast"]
 
@@ -151,6 +152,7 @@ reth-node-metrics = { path = "crates/node/metrics" }
 reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
 reth-db-api={path = "crates/storage/db-api"}
+reth-storage-api={path="crates/storage/storage-api"}
 
 [patch.crates-io]
 alloy-genesis = { path = "./crates/alloy-genesis" }
