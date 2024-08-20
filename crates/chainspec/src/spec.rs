@@ -15,7 +15,7 @@ use reth_network_peers::NodeRecord;
 use reth_primitives_traits::{
     constants::{
         DEV_GENESIS_HASH, EIP1559_INITIAL_BASE_FEE, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT,
-        HOLESKY_GENESIS_HASH, MAINNET_GENESIS_HASH, SEPOLIA_GENESIS_HASH,
+        HOLESKY_GENESIS_HASH, MAINNET_GENESIS_HASH, SEPOLIA_GENESIS_HASH, AST_GENESIS_HASH, AST_BLOCK_GAS_LIMIT
     },
     Header, SealedHeader,
 };
@@ -30,6 +30,28 @@ use reth_network_peers::{
     base_nodes, base_testnet_nodes, holesky_nodes, mainnet_nodes, op_nodes, op_testnet_nodes,
     sepolia_nodes,
 };
+
+/// The AST mainnet spec
+pub static AST_MAINNET: Lazy<Arc<ChainSpec>> = Lazy::new(|| {
+    let mut spec = ChainSpec {
+        // chain: Chain(ChainKind::Id(94)),
+        chain: Chain::from_id(94),
+        genesis: serde_json::from_str(include_str!("../res/genesis/mainnet.json"))
+            .expect("Can't deserialize Ast genesis json"),
+        genesis_hash: Some(AST_GENESIS_HASH),
+        paris_block_and_final_difficulty: Some((
+            0,
+            U256::ZERO,
+        )),
+        hardforks: EthereumHardfork::ast().into(),
+        deposit_contract: None,
+        base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),
+        max_gas_limit: AST_BLOCK_GAS_LIMIT,
+        prune_delete_limit: 20000,
+    };
+    spec.genesis.config.dao_fork_support = true;
+    spec.into()
+});
 
 /// The Ethereum mainnet spec
 pub static MAINNET: Lazy<Arc<ChainSpec>> = Lazy::new(|| {
