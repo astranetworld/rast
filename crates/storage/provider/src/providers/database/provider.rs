@@ -19,7 +19,7 @@ use itertools::{izip, Itertools};
 use rayon::slice::ParallelSliceMut;
 use reth_chainspec::{ChainInfo, ChainSpec, EthereumHardforks};
 use reth_db::{
-    cursor::DbDupCursorRW, models::StoredBlockVerifiers, table, tables, BlockNumberList, BlockVerifiers, PlainAccountState, PlainStorageState
+    cursor::DbDupCursorRW,tables, BlockNumberList,  PlainAccountState, PlainStorageState
 };
 use reth_db_api::{
     common::KeyValue,
@@ -27,7 +27,7 @@ use reth_db_api::{
     database::Database,
     models::{
         sharded_key, storage_sharded_key::StorageShardedKey, AccountBeforeTx, BlockNumberAddress,
-        ShardedKey, StoredBlockBodyIndices, StoredBlockOmmers, StoredBlockWithdrawals,
+        ShardedKey, StoredBlockBodyIndices, StoredBlockOmmers, StoredBlockWithdrawals,StoredBlockVerifiers,StoredBlockRewards,
     },
     table::{Table, TableRow},
     transaction::{DbTx, DbTxMut},
@@ -2543,7 +2543,10 @@ impl<TX: DbTx> RequestsProvider for DatabaseProvider<TX> {
 
 impl<TX:DbTx> VerifiersProvider for DatabaseProvider<TX>{
     fn verifiers_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Verifiers>>{
-        let is_beijing_active=false;//todo:添加判断
+        let mut is_beijing_active=false;
+        if timestamp>0 {
+            is_beijing_active=false;//todo:添加判断，使用timestamp
+        }
         if is_beijing_active{
             if let Some(number)=self.convert_hash_or_number(id)?{
                 let verifiers=self.tx.get::<tables::BlockVerifiers>(number).map(|w|w.map(|w|w.verifiers))?.unwrap_or_default();
@@ -2556,7 +2559,10 @@ impl<TX:DbTx> VerifiersProvider for DatabaseProvider<TX>{
 
 impl<TX:DbTx> RewardsProvider for DatabaseProvider<TX>{
     fn rewards_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Rewards>>{
-        let is_beijing_active=false;//todo:添加判断
+        let mut is_beijing_active=false;
+        if timestamp>0 {
+            is_beijing_active=false;//todo:添加判断，使用timestamp
+        }
         if is_beijing_active{
             if let Some(number)=self.convert_hash_or_number(id)?{
                 let rewards=self.tx.get::<tables::BlockRewards>(number).map(|w|w.map(|w|w.rewards))?.unwrap_or_default();
@@ -3678,14 +3684,14 @@ impl<TX: DbTxMut + DbTx> BlockWriter for DatabaseProvider<TX> {
         }
 
         if let Some(verifiers)=block.block.verifiers{
-            if !verifiers.is_empty(){
+            if !verifiers.0.is_empty(){
                 self.tx.put::<tables::BlockVerifiers>(block_number, StoredBlockVerifiers{verifiers},)?;
                 durations_recorder.record_relative(metrics::Action::InsertBlockVerifiers);
             }
         }
 
         if let Some(rewards)=block.block.rewards{
-            if !rewards.is_empty(){
+            if !rewards.0.is_empty(){
                 self.tx.put::<tables::BlockRewards>(block_number, StoredBlockRewards{rewards},)?;
                 durations_recorder.record_relative(metrics::Action::InsertBlockRewards);
             }

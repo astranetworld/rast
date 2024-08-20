@@ -19,7 +19,7 @@ use reth_primitives::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{StageCheckpointReader, StateProofProvider};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
-use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage};
+use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage,prefix_set::TriePrefixSetsMut,};
 use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use std::{
     collections::{BTreeMap, HashMap},

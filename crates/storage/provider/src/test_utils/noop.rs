@@ -22,7 +22,7 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::StateProofProvider;
 use reth_storage_errors::provider::ProviderResult;
-use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState};
+use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState,prefix_set::TriePrefixSetsMut,};
 use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use tokio::sync::{broadcast, watch};
 
