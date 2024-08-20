@@ -6724,12 +6724,13 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "enr",
+ "rand 0.8.5",
  "secp256k1",
+ "serde_json",
  "serde_with",
  "thiserror",
  "tokio",
