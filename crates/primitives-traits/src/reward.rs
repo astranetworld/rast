@@ -9,35 +9,35 @@ type Address = [u8; ADDRESS_LENGTH];
 /// ly
 // #[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::derive_arbitrary(rlp 32))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
-pub struct Amount(pub [u8; 32]); //在ast中使用的是[u64; 4]
+pub struct Amount(pub [u8; 32]); //[u64; 4] in ast
 
 impl Compact for Amount {
-    /// 将`Amount`实例序列化到提供的缓冲区中，并返回写入的字节长度。
+    /// Serialize the Amount instance into the provided buffer and return the length of the bytes written.
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
-        // 将内部数组直接复制到缓冲区
+        // Directly copy the internal array to the buffer.
         buf.put_slice(&self.0);
-        // 返回写入的字节长度
+        // Return the length of the bytes written.
         self.0.len()
     }
 
-    /// 从提供的缓冲区中反序列化`Amount`实例，并更新缓冲区的内部游标。
+    /// Deserialize an Amount instance from the provided buffer and update the internal cursor of the buffer.
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        // 检查缓冲区长度是否足够
+        // Check if the buffer length is sufficient.
         assert!(buf.len() >= len, "Buffer length is smaller than expected");
         
-        // 创建一个新的Amount实例
+        // Create a new instance of Amount.
         let mut array = [0u8; 32];
         array.copy_from_slice(&buf[..len]);
         
-        // 返回Amount实例和剩余的缓冲区切片
+        // Return the Amount instance and the remaining slice of the buffer.
         (Amount(array), &buf[len..])
     }
-    
-    // 如果没有特殊情况，specialized_to_compact 和 specialized_from_compact
-    // 可以简单地委托给 to_compact 和 from_compact。
+
+    // Unless there are special circumstances, specialized_to_compact and specialized_from_compact
+    // can simply delegate to to_compact and from_compact.
     fn specialized_to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,

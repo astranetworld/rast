@@ -22,41 +22,37 @@ const PUBLIC_KEY_LENGTH: usize = 48;
 pub struct PublicKey(pub [u8; PUBLIC_KEY_LENGTH]);
 
 impl Default for PublicKey {
-    /// 返回`PublicKey`类型的默认值。
+    /// Returns the default value for the `PublicKey` type.
     ///
-    /// 这里我们简单地将公钥初始化为全零。
+    /// Here we simply initialize the public key to all zeroes.
     fn default() -> Self {
         PublicKey([0u8; PUBLIC_KEY_LENGTH])
     }
 }
 
 impl Compact for PublicKey {
-    /// 将公钥转换为紧凑格式并写入提供的缓冲区。
+    /// Convert the public key to a compact format and write it into the provided buffer.
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: BufMut + AsMut<[u8]>,
     {
-        // 将公钥的字节数组直接复制到缓冲区
+        // Directly copy the byte array of the public key into the buffer.
         buf.as_mut().copy_from_slice(&self.0);
-        // 返回写入的字节数
+        // Return the number of bytes written.
         PUBLIC_KEY_LENGTH
     }
 
-    /// 从紧凑格式中读取公钥。
+    /// Read the public key from a compact format.
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        // 确保缓冲区长度足够
+        // Ensure the buffer length is sufficient.
         assert!(len == PUBLIC_KEY_LENGTH, "Invalid buffer length for PublicKey");
         
-        // 创建公钥实例
+        // Create an instance of the public key.
         let public_key = PublicKey(buf[..PUBLIC_KEY_LENGTH].try_into().expect("Slice with incorrect length"));
         
-        // 返回公钥实例和剩余的缓冲区
+        // Return the public key instance and the remaining buffer.
         (public_key, &buf[PUBLIC_KEY_LENGTH..])
     }
-    
-    // 可以选择实现specialized_to_compact和specialized_from_compact方法
-    // 如果它们与默认实现相同，可以简单地调用默认方法
-    // 如果有特定的序列化或反序列化逻辑，可以在这里实现
 }
 
 struct PublicKeyVisitor;

@@ -13,7 +13,7 @@ members = [
     "crates/primitives/",
     "crates/primitives-traits/",
     "crates/chainspec/",
-    "crates/ethereum/cli/"
+    "crates/ethereum/cli/",
     "crates/storage/db/",
     "crates/storage/db-api",
     "crates/storage/storage-api/",

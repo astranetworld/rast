@@ -235,7 +235,7 @@ where
             requests_root,
         };
 
-        // lytest简单生成
+        // lytest Simple generation.
         let verifiers=Some(Verifiers::default());
         let rewards=Some(Rewards::default());
         let block = Block { header, body: vec![], ommers: vec![], withdrawals, requests,verifiers,rewards };
@@ -535,7 +535,7 @@ where
     };
 
     // seal the block
-    // lytest简单生成
+    // lytest Simple generation.
     let verifiers=Some(Verifiers::default());
     let rewards=Some(Rewards::default());
     let block = Block { header, body: executed_txs, ommers: vec![], withdrawals, requests,verifiers,rewards };

@@ -786,7 +786,7 @@ impl<TX: DbTx> DatabaseProvider<TX> {
                 requests = None;
             }
 
-            //todo：这里要根据header.timestamp判断这两个字段是否有效，现全部设为None
+            // todo: Determine the validity of these two fields based on `header.timestamp`, currently set all to None.
             let beijing_is_active=false;
             let mut verifiers=Some(Verifiers::default());
             let mut rewards=Some(Rewards::default());
@@ -1521,7 +1521,8 @@ impl<TX: DbTxMut + DbTx> DatabaseProvider<TX> {
                 requests = None;
             }
 
-            let beijing_is_active=false;//根据区块头时间戳判断是否区块是否已经启用verifiers和rewards两个字段
+            // Determine whether the block has enabled the `verifiers` and `rewards` fields based on the block header timestamp.
+            let beijing_is_active=false;
             let mut verifiers=Some(Verifiers::default());
             let mut rewards=Some(Rewards::default());
             if beijing_is_active{
@@ -2545,7 +2546,7 @@ impl<TX:DbTx> VerifiersProvider for DatabaseProvider<TX>{
     fn verifiers_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Verifiers>>{
         let mut is_beijing_active=false;
         if timestamp>0 {
-            is_beijing_active=false;//todo:添加判断，使用timestamp
+            is_beijing_active=false;// todo: Add a check using the `timestamp`.
         }
         if is_beijing_active{
             if let Some(number)=self.convert_hash_or_number(id)?{
@@ -2561,7 +2562,7 @@ impl<TX:DbTx> RewardsProvider for DatabaseProvider<TX>{
     fn rewards_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Rewards>>{
         let mut is_beijing_active=false;
         if timestamp>0 {
-            is_beijing_active=false;//todo:添加判断，使用timestamp
+            is_beijing_active=false;// todo: Add a check using the `timestamp`.
         }
         if is_beijing_active{
             if let Some(number)=self.convert_hash_or_number(id)?{
