@@ -11,9 +11,14 @@ exclude = [".github/"]
 members = [
     "bin/rast/",
     "crates/primitives/",
+<<<<<<< HEAD:rast/Cargo.toml
     "crates/primitives-traits/",
     "crates/clique/"
 ]
+=======
+    "crates/primitives-traits/"
+, "crates/miner"]
+>>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.toml
 default-members = ["bin/rast"]
 
 
