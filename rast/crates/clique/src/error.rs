@@ -25,11 +25,13 @@ use ethereum_types::H64;
 // use ethkey::Error as EthkeyError;
 // use ethtrie::TrieError;
 use rlp;
-use crate::traits::InvalidInput;
-use crate::snapshot::Error as SnapshotError;
+// use crate::traits::InvalidInput;
+// use crate::snapshot::Error as SnapshotError;
 // use types::BlockNumber;
 // use types::transaction::Error as TransactionError;
 use unexpected::{Mismatch, OutOfBounds};
+
+use crate::apos::SnapshotError;
 
 // use crate::voting_error::EngineError;
 
@@ -237,8 +239,8 @@ pub enum Error {
 	// #[display(fmt = "Transaction error: {}", _0)]
 	// Transaction(TransactionError),
 	/// Snappy error
-	#[display(fmt = "Snappy error: {}", _0)]
-	Snappy(InvalidInput),
+	// #[display(fmt = "Snappy error: {}", _0)]
+	// Snappy(InvalidInput),
 	/// Consensus vote error.
 	#[display(fmt = "Engine error: {}", _0)]
 	Engine(EngineError),
@@ -390,3 +392,7 @@ impl error::Error for EngineError {
 		"Engine error"
 	}
 }
+
+
+
+
