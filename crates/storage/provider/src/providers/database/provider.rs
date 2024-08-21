@@ -13,13 +13,13 @@ use crate::{
     ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RequestsProvider, RevertsInit,
     StageCheckpointReader, StateChangeWriter, StateProviderBox, StateWriter, StatsReader,
     StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt, TrieWriter, WithdrawalsProvider,
+    TransactionsProviderExt, TrieWriter, WithdrawalsProvider,VerifiersProvider,RewardsProvider,
 };
 use itertools::{izip, Itertools};
 use rayon::slice::ParallelSliceMut;
 use reth_chainspec::{ChainInfo, ChainSpec, EthereumHardforks};
 use reth_db::{
-    cursor::DbDupCursorRW, tables, BlockNumberList, PlainAccountState, PlainStorageState,
+    cursor::DbDupCursorRW,tables, BlockNumberList,  PlainAccountState, PlainStorageState
 };
 use reth_db_api::{
     common::KeyValue,
@@ -27,7 +27,7 @@ use reth_db_api::{
     database::Database,
     models::{
         sharded_key, storage_sharded_key::StorageShardedKey, AccountBeforeTx, BlockNumberAddress,
-        ShardedKey, StoredBlockBodyIndices, StoredBlockOmmers, StoredBlockWithdrawals,
+        ShardedKey, StoredBlockBodyIndices, StoredBlockOmmers, StoredBlockWithdrawals,StoredBlockVerifiers,StoredBlockRewards,
     },
     table::{Table, TableRow},
     transaction::{DbTx, DbTxMut},
@@ -41,7 +41,7 @@ use reth_primitives::{
     BlockWithSenders, Bytecode, GotExpected, Header, Receipt, Requests, SealedBlock,
     SealedBlockWithSenders, SealedHeader, StaticFileSegment, StorageEntry, TransactionMeta,
     TransactionSigned, TransactionSignedEcRecovered, TransactionSignedNoHash, TxHash, TxNumber,
-    Withdrawal, Withdrawals, B256, U256,
+    Withdrawal, Withdrawals, B256, U256,Verifiers,Rewards,
 };
 use reth_prune_types::{PruneCheckpoint, PruneLimiter, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
@@ -401,6 +401,8 @@ impl<TX: DbTx> DatabaseProvider<TX> {
             Vec<Header>,
             Option<Withdrawals>,
             Option<Requests>,
+            Option<Verifiers>,
+            Option<Rewards>,
         ) -> ProviderResult<Option<B>>,
     {
         let Some(block_number) = self.convert_hash_or_number(id)? else { return Ok(None) };
@@ -410,6 +412,9 @@ impl<TX: DbTx> DatabaseProvider<TX> {
         let withdrawals =
             self.withdrawals_by_block(block_number.into(), header.as_ref().timestamp)?;
         let requests = self.requests_by_block(block_number.into(), header.as_ref().timestamp)?;
+        // lytest
+        let verifiers=self.verifiers_by_block(block_number.into(), header.as_ref().timestamp)?;
+        let rewards=self.rewards_by_block(block_number.into(), header.as_ref().timestamp)?;
 
         // Get the block body
         //
@@ -440,7 +445,7 @@ impl<TX: DbTx> DatabaseProvider<TX> {
             })
             .collect();
 
-        construct_block(header, body, senders, ommers, withdrawals, requests)
+        construct_block(header, body, senders, ommers, withdrawals, requests,verifiers,rewards)
     }
 
     /// Returns a range of blocks from the database.
@@ -468,6 +473,8 @@ impl<TX: DbTx> DatabaseProvider<TX> {
             Vec<Header>,
             Option<Withdrawals>,
             Option<Requests>,
+            Option<Verifiers>,
+            Option<Rewards>,
         ) -> ProviderResult<R>,
     {
         if range.is_empty() {
@@ -482,6 +489,9 @@ impl<TX: DbTx> DatabaseProvider<TX> {
         let mut withdrawals_cursor = self.tx.cursor_read::<tables::BlockWithdrawals>()?;
         let mut requests_cursor = self.tx.cursor_read::<tables::BlockRequests>()?;
         let mut block_body_cursor = self.tx.cursor_read::<tables::BlockBodyIndices>()?;
+        // lytest
+        let mut verifiers_cursor=self.tx.cursor_read::<tables::BlockVerifiers>()?;
+        let mut rewards_cursor=self.tx.cursor_read::<tables::BlockRewards>()?;
 
         for header in headers {
             let header_ref = header.as_ref();
@@ -523,8 +533,21 @@ impl<TX: DbTx> DatabaseProvider<TX> {
                             .map(|(_, o)| o.ommers)
                             .unwrap_or_default()
                     };
+                // lytest
+                let is_beijing_active=false;
+                let verifiers=if is_beijing_active{
+                    Some(verifiers_cursor.seek_exact(header_ref.number)?.map(|(_,w)|w.verifiers).unwrap_or_default(),)
+                }else{
+                    None
+                };
+                let rewards=if is_beijing_active{
+                    Some(rewards_cursor.seek_exact(header_ref.number)?.map(|(_,w)|w.rewards).unwrap_or_default(),)
+                }else{
+                    None
+                };
 
-                if let Ok(b) = assemble_block(header, tx_range, ommers, withdrawals, requests) {
+
+                if let Ok(b) = assemble_block(header, tx_range, ommers, withdrawals, requests,verifiers,rewards) {
                     blocks.push(b);
                 }
             }
@@ -560,12 +583,14 @@ impl<TX: DbTx> DatabaseProvider<TX> {
             Option<Withdrawals>,
             Option<Requests>,
             Vec<Address>,
+            Option<Verifiers>,
+            Option<Rewards>,
         ) -> ProviderResult<B>,
     {
         let mut tx_cursor = self.tx.cursor_read::<tables::Transactions>()?;
         let mut senders_cursor = self.tx.cursor_read::<tables::TransactionSenders>()?;
 
-        self.block_range(range, headers_range, |header, tx_range, ommers, withdrawals, requests| {
+        self.block_range(range, headers_range, |header, tx_range, ommers, withdrawals, requests,verifiers,rewards| {
             let (body, senders) = if tx_range.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
@@ -597,7 +622,7 @@ impl<TX: DbTx> DatabaseProvider<TX> {
                 (body, senders)
             };
 
-            assemble_block(header, body, ommers, withdrawals, requests, senders)
+            assemble_block(header, body, ommers, withdrawals, requests, senders,verifiers,rewards)
         })
     }
 
@@ -688,6 +713,9 @@ impl<TX: DbTx> DatabaseProvider<TX> {
         let block_ommers = self.get::<tables::BlockOmmers>(range.clone())?;
         let block_withdrawals = self.get::<tables::BlockWithdrawals>(range.clone())?;
         let block_requests = self.get::<tables::BlockRequests>(range.clone())?;
+        // lytest
+        let block_verifiers=self.get::<tables::BlockVerifiers>(range.clone())?;
+        let block_rewards=self.get::<tables::BlockRewards>(range.clone())?;
 
         let block_tx = self.get_block_transaction_range(range)?;
 
@@ -700,9 +728,17 @@ impl<TX: DbTx> DatabaseProvider<TX> {
         let mut block_ommers_iter = block_ommers.into_iter();
         let mut block_withdrawals_iter = block_withdrawals.into_iter();
         let mut block_requests_iter = block_requests.into_iter();
+        let mut block_verifiers_iter=block_verifiers.into_iter();
+        let mut block_rewards_iter=block_rewards.into_iter();
+
+
         let mut block_ommers = block_ommers_iter.next();
         let mut block_withdrawals = block_withdrawals_iter.next();
         let mut block_requests = block_requests_iter.next();
+        let mut block_verifiers=block_verifiers_iter.next();
+        let mut block_rewards=block_rewards_iter.next();
+
+
 
         let mut blocks = Vec::new();
         for ((main_block_number, header), (_, header_hash), (_, tx)) in
@@ -750,8 +786,31 @@ impl<TX: DbTx> DatabaseProvider<TX> {
                 requests = None;
             }
 
+            // todo: Determine the validity of these two fields based on `header.timestamp`, currently set all to None.
+            let beijing_is_active=false;
+            let mut verifiers=Some(Verifiers::default());
+            let mut rewards=Some(Rewards::default());
+            if beijing_is_active{
+                if let Some((block_number,_))=block_verifiers.as_ref(){
+                    if *block_number==main_block_number{
+                        verifiers=Some(block_verifiers.take().unwrap().1.verifiers);
+                        block_verifiers=block_verifiers_iter.next();
+                    }
+                }
+                if let Some((block_number,_))=block_rewards.as_ref(){
+                    if *block_number==main_block_number{
+                        rewards=Some(block_rewards.take().unwrap().1.rewards);
+                        block_rewards=block_rewards_iter.next();
+                    }
+                }
+            }else{
+                verifiers=None;
+                rewards=None;
+            }
+
+
             blocks.push(SealedBlockWithSenders {
-                block: SealedBlock { header, body, ommers, withdrawals, requests },
+                block: SealedBlock { header, body, ommers, withdrawals, requests,verifiers,rewards },
                 senders,
             })
         }
@@ -1339,6 +1398,9 @@ impl<TX: DbTxMut + DbTx> DatabaseProvider<TX> {
         self.remove::<tables::BlockOmmers>(range.clone())?;
         self.remove::<tables::BlockWithdrawals>(range.clone())?;
         self.remove::<tables::BlockRequests>(range.clone())?;
+        // lytest
+        self.remove::<tables::BlockVerifiers>(range.clone())?;
+        self.remove::<tables::BlockRewards>(range.clone())?;
         self.remove_block_transaction_range(range.clone())?;
         self.remove::<tables::HeaderTerminalDifficulties>(range)?;
 
@@ -1383,6 +1445,9 @@ impl<TX: DbTxMut + DbTx> DatabaseProvider<TX> {
         let block_withdrawals = self.take::<tables::BlockWithdrawals>(range.clone())?;
         let block_requests = self.take::<tables::BlockRequests>(range.clone())?;
         let block_tx = self.take_block_transaction_range(range.clone())?;
+        //lytest
+        let block_verifiers=self.take::<tables::BlockVerifiers>(range.clone())?;
+        let block_rewards=self.take::<tables::BlockRewards>(range.clone())?;
 
         // rm HeaderTerminalDifficulties
         self.remove::<tables::HeaderTerminalDifficulties>(range)?;
@@ -1396,9 +1461,19 @@ impl<TX: DbTxMut + DbTx> DatabaseProvider<TX> {
         let mut block_ommers_iter = block_ommers.into_iter();
         let mut block_withdrawals_iter = block_withdrawals.into_iter();
         let mut block_requests_iter = block_requests.into_iter();
+        //lytest
+        let mut block_verifiers_iter=block_verifiers.into_iter();
+        let mut block_rewards_iter=block_rewards.into_iter();
+
+
+
         let mut block_ommers = block_ommers_iter.next();
         let mut block_withdrawals = block_withdrawals_iter.next();
         let mut block_requests = block_requests_iter.next();
+        //lytest
+        let mut block_verifiers=block_verifiers_iter.next();
+        let mut block_rewards=block_rewards_iter.next();
+
 
         let mut blocks = Vec::new();
         for ((main_block_number, header), (_, header_hash), (_, tx)) in
@@ -1446,8 +1521,31 @@ impl<TX: DbTxMut + DbTx> DatabaseProvider<TX> {
                 requests = None;
             }
 
+            // Determine whether the block has enabled the `verifiers` and `rewards` fields based on the block header timestamp.
+            let beijing_is_active=false;
+            let mut verifiers=Some(Verifiers::default());
+            let mut rewards=Some(Rewards::default());
+            if beijing_is_active{
+                if let Some((block_number, _)) = block_verifiers.as_ref() {
+                    if *block_number == main_block_number {
+                        verifiers = Some(block_verifiers.take().unwrap().1.verifiers);
+                        block_verifiers = block_verifiers_iter.next();
+                    }
+                }
+                if let Some((block_number, _)) = block_rewards.as_ref() {
+                    if *block_number == main_block_number {
+                        rewards = Some(block_rewards.take().unwrap().1.rewards);
+                        block_rewards = block_rewards_iter.next();
+                    }
+                }
+            }else{
+                verifiers=None;
+                rewards=None;
+            }
+
+
             blocks.push(SealedBlockWithSenders {
-                block: SealedBlock { header, body, ommers, withdrawals, requests },
+                block: SealedBlock { header, body, ommers, withdrawals, requests,verifiers,rewards },
                 senders,
             })
         }
@@ -1982,8 +2080,11 @@ impl<TX: DbTx> BlockReader for DatabaseProvider<TX> {
                     Some(transactions) => transactions,
                     None => return Ok(None),
                 };
+                // lytest
+                let verifiers=self.verifiers_by_block(number.into(),header.timestamp)?;
+                let rewards=self.rewards_by_block(number.into(),header.timestamp)?;
 
-                return Ok(Some(Block { header, body: transactions, ommers, withdrawals, requests }))
+                return Ok(Some(Block { header, body: transactions, ommers, withdrawals, requests,verifiers,rewards }))
             }
         }
 
@@ -2038,8 +2139,8 @@ impl<TX: DbTx> BlockReader for DatabaseProvider<TX> {
             id,
             transaction_kind,
             |block_number| self.header_by_number(block_number),
-            |header, body, senders, ommers, withdrawals, requests| {
-                Block { header, body, ommers, withdrawals, requests }
+            |header, body, senders, ommers, withdrawals, requests,verifiers,rewards| {
+                Block { header, body, ommers, withdrawals, requests ,verifiers,rewards}
                     // Note: we're using unchecked here because we know the block contains valid txs
                     // wrt to its height and can ignore the s value check so pre
                     // EIP-2 txs are allowed
@@ -2059,8 +2160,8 @@ impl<TX: DbTx> BlockReader for DatabaseProvider<TX> {
             id,
             transaction_kind,
             |block_number| self.sealed_header(block_number),
-            |header, body, senders, ommers, withdrawals, requests| {
-                SealedBlock { header, body, ommers, withdrawals, requests }
+            |header, body, senders, ommers, withdrawals, requests,verifiers,rewards| {
+                SealedBlock { header, body, ommers, withdrawals, requests,verifiers,rewards }
                     // Note: we're using unchecked here because we know the block contains valid txs
                     // wrt to its height and can ignore the s value check so pre
                     // EIP-2 txs are allowed
@@ -2076,7 +2177,7 @@ impl<TX: DbTx> BlockReader for DatabaseProvider<TX> {
         self.block_range(
             range,
             |range| self.headers_range(range),
-            |header, tx_range, ommers, withdrawals, requests| {
+            |header, tx_range, ommers, withdrawals, requests,verifiers,rewards| {
                 let body = if tx_range.is_empty() {
                     Vec::new()
                 } else {
@@ -2085,7 +2186,7 @@ impl<TX: DbTx> BlockReader for DatabaseProvider<TX> {
                         .map(Into::into)
                         .collect()
                 };
-                Ok(Block { header, body, ommers, withdrawals, requests })
+                Ok(Block { header, body, ommers, withdrawals, requests ,verifiers,rewards})
             },
         )
     }
@@ -2097,8 +2198,8 @@ impl<TX: DbTx> BlockReader for DatabaseProvider<TX> {
         self.block_with_senders_range(
             range,
             |range| self.headers_range(range),
-            |header, body, ommers, withdrawals, requests, senders| {
-                Block { header, body, ommers, withdrawals, requests }
+            |header, body, ommers, withdrawals, requests, senders,verifiers,rewards| {
+                Block { header, body, ommers, withdrawals, requests ,verifiers,rewards}
                     .try_with_senders_unchecked(senders)
                     .map_err(|_| ProviderError::SenderRecoveryError)
             },
@@ -2112,9 +2213,9 @@ impl<TX: DbTx> BlockReader for DatabaseProvider<TX> {
         self.block_with_senders_range(
             range,
             |range| self.sealed_headers_range(range),
-            |header, body, ommers, withdrawals, requests, senders| {
+            |header, body, ommers, withdrawals, requests, senders,verifiers,rewards| {
                 SealedBlockWithSenders::new(
-                    SealedBlock { header, body, ommers, withdrawals, requests },
+                    SealedBlock { header, body, ommers, withdrawals, requests,verifiers,rewards },
                     senders,
                 )
                 .ok_or(ProviderError::SenderRecoveryError)
@@ -2435,6 +2536,38 @@ impl<TX: DbTx> RequestsProvider for DatabaseProvider<TX> {
                 // empty
                 let requests = self.tx.get::<tables::BlockRequests>(number)?.unwrap_or_default();
                 return Ok(Some(requests))
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl<TX:DbTx> VerifiersProvider for DatabaseProvider<TX>{
+    fn verifiers_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Verifiers>>{
+        let mut is_beijing_active=false;
+        if timestamp>0 {
+            is_beijing_active=false;// todo: Add a check using the `timestamp`.
+        }
+        if is_beijing_active{
+            if let Some(number)=self.convert_hash_or_number(id)?{
+                let verifiers=self.tx.get::<tables::BlockVerifiers>(number).map(|w|w.map(|w|w.verifiers))?.unwrap_or_default();
+                return Ok(Some(verifiers))
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl<TX:DbTx> RewardsProvider for DatabaseProvider<TX>{
+    fn rewards_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Rewards>>{
+        let mut is_beijing_active=false;
+        if timestamp>0 {
+            is_beijing_active=false;// todo: Add a check using the `timestamp`.
+        }
+        if is_beijing_active{
+            if let Some(number)=self.convert_hash_or_number(id)?{
+                let rewards=self.tx.get::<tables::BlockRewards>(number).map(|w|w.map(|w|w.rewards))?.unwrap_or_default();
+                return Ok(Some(rewards))
             }
         }
         Ok(None)
@@ -3548,6 +3681,20 @@ impl<TX: DbTxMut + DbTx> BlockWriter for DatabaseProvider<TX> {
             if !requests.0.is_empty() {
                 self.tx.put::<tables::BlockRequests>(block_number, requests)?;
                 durations_recorder.record_relative(metrics::Action::InsertBlockRequests);
+            }
+        }
+
+        if let Some(verifiers)=block.block.verifiers{
+            if !verifiers.0.is_empty(){
+                self.tx.put::<tables::BlockVerifiers>(block_number, StoredBlockVerifiers{verifiers},)?;
+                durations_recorder.record_relative(metrics::Action::InsertBlockVerifiers);
+            }
+        }
+
+        if let Some(rewards)=block.block.rewards{
+            if !rewards.0.is_empty(){
+                self.tx.put::<tables::BlockRewards>(block_number, StoredBlockRewards{rewards},)?;
+                durations_recorder.record_relative(metrics::Action::InsertBlockRewards);
             }
         }
 

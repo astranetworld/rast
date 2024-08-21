@@ -95,6 +95,8 @@ where
         ommers: block.ommers,
         withdrawals: block.withdrawals,
         requests: block.requests,
+        verifiers:block.verifiers,
+        rewards:block.rewards,
     };
 
     validate_block_pre_execution(&block, &chain_spec)?;

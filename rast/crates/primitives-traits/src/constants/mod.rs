@@ -31,6 +31,9 @@ pub const EPOCH_DURATION: Duration = Duration::from_secs(12 * EPOCH_SLOTS);
 /// The default block nonce in the beacon consensus
 pub const BEACON_NONCE: u64 = 0u64;
 
+/// ast block gas limit
+pub const AST_BLOCK_GAS_LIMIT: u64 = 9_223_372_036_854_775_807;
+
 /// The default Ethereum block gas limit.
 // TODO: This should be a chain spec parameter.
 /// See <https://github.com/paradigmxyz/reth/issues/3233>.
@@ -98,6 +101,11 @@ pub const FINNEY_TO_WEI: u128 = (GWEI_TO_WEI as u128) * 1_000_000;
 
 /// Multiplier for converting ether to wei.
 pub const ETH_TO_WEI: u128 = FINNEY_TO_WEI * 1000;
+
+/// The Ast mainnet genesis hash:
+/// `0x138734b7044254e5ecbabf8056f5c2b73cd0847aaa5acac7345507cbeab387b8`
+pub const AST_GENESIS_HASH: B256 =
+    b256!("138734b7044254e5ecbabf8056f5c2b73cd0847aaa5acac7345507cbeab387b8");
 
 /// The Ethereum mainnet genesis hash:
 /// `0x0d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3`

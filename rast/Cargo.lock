@@ -355,8 +355,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -538,6 +542,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloy-signer-local"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b0707d4f63e4356a110b30ef3add8732ab6d181dd7be4607bf79b8777105cee"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer",
+ "async-trait",
+ "k256",
+ "rand 0.8.5",
+ "thiserror",
+]
+
+[[package]]
 name = "alloy-sol-macro"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -552,8 +572,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -573,8 +597,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "syn-solidity",
  "tiny-keccak",
 ]
@@ -594,8 +622,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "syn-solidity",
 ]
 
@@ -681,9 +713,17 @@ checksum = "03704f265cbbb943b117ecb5055fd46e8f41e7dc8a58b1aed20bcd40ace38c15"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+<<<<<<< HEAD:rast/Cargo.lock
  "derive_more 0.99.18",
+=======
+ "arbitrary",
+ "derive_arbitrary",
+ "derive_more",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "hashbrown 0.14.5",
  "nybbles",
+ "proptest",
+ "proptest-derive 0.4.0",
  "serde",
  "smallvec 1.13.2",
  "tracing",
@@ -780,8 +820,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -925,6 +969,7 @@ checksum = "9d151e35f61089500b617991b791fc8bfd237ae50cd5950803758a179b41e67a"
 
 [[package]]
 name = "arrayvec"
+<<<<<<< HEAD:rast/Cargo.lock
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd9fd44efafa8690358b7408d253adf110036b88f55672a933f01d616ad9b1b9"
@@ -935,8 +980,11 @@ dependencies = [
 [[package]]
 name = "arrayvec"
 version = "0.7.4"
+=======
+version = "0.7.6"
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96d30a06541fbafbc7f82ed10c06164cfbd2c401138f6addd8404629c4b16711"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "asn1_der"
@@ -989,8 +1037,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -1005,8 +1057,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -1058,8 +1114,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
  "syn 2.0.74",
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -1169,7 +1229,7 @@ dependencies = [
  "regex",
  "rustc-hash 1.1.0",
  "shlex",
- "syn 2.0.74",
+ "syn 2.0.75",
 ]
 
 [[package]]
@@ -1383,8 +1443,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "synstructure",
 ]
 
@@ -1490,18 +1554,18 @@ checksum = "c3ac9f8b63eca6fd385229b3675f6cc0dc5c8a5c8a54a59d4f52ffd670d87b0c"
 
 [[package]]
 name = "bytemuck"
-version = "1.16.3"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "102087e286b4677862ea56cf8fc58bb2cdfa8725c40ffb80fe3a008eb7f2fc83"
+checksum = "6fd4c6dcc3b0aea2f5c0b4b82c2b15fe39ddbc76041a310848f4706edf76bb31"
 dependencies = [
  "bytemuck_derive",
 ]
 
 [[package]]
 name = "bytemuck_derive"
-version = "1.7.0"
+version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ee891b04274a59bd38b412188e24b849617b2e45a0fd8d057deb63e7403761b"
+checksum = "0cc8b54b395f2fcfbb3d90c47b01c7f444d94d05bdeb775811dec868ac3bbc26"
 dependencies = [
 <<<<<<< HEAD:rast/Cargo.lock
  "proc-macro2 1.0.86",
@@ -1509,8 +1573,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -1544,9 +1612,9 @@ dependencies = [
 
 [[package]]
 name = "camino"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3054fea8a20d8ff3968d5b22cc27501d2b08dc4decdb31b184323f00c5ef23bb"
+checksum = "8b96ec4966b5813e2c0507c1f86115c8c5abaadc3980879c3424042a02fd1ad3"
 dependencies = [
  "serde",
 ]
@@ -1597,9 +1665,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68064e60dbf1f17005c2fde4d07c16d8baa506fd7ffed8ccab702d93617975c7"
+checksum = "72db2f7947ecee9b03b510377e8bb9077afa27176fdbff55c51027e976fdcc48"
 dependencies = [
  "jobserver",
  "libc",
@@ -1734,8 +1802,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -2202,8 +2274,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -2227,7 +2303,7 @@ dependencies = [
  "proc-macro2 1.0.86",
  "quote 1.0.36",
  "strsim",
- "syn 2.0.74",
+ "syn 2.0.75",
 ]
 
 [[package]]
@@ -2241,8 +2317,12 @@ dependencies = [
  "quote 1.0.36",
 =======
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -2389,8 +2469,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
  "syn 2.0.74",
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -2403,7 +2487,7 @@ dependencies = [
  "proc-macro2 1.0.86",
  "quote 1.0.36",
  "rustc_version 0.4.0",
- "syn 2.0.74",
+ "syn 2.0.75",
 ]
 
 [[package]]
@@ -2521,8 +2605,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -2690,8 +2778,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -2706,8 +2798,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -2979,8 +3075,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -3165,9 +3265,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa82e28a107a8cc405f0839610bdc9b15f1e25ec7d696aa5cf173edbcb1486ab"
+checksum = "524e8ac6999421f49a846c2d4411f337e53497d8ec55d67753beffa43c5d9205"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3194,9 +3294,15 @@ dependencies = [
 
 [[package]]
 name = "hash-db"
+<<<<<<< HEAD:rast/Cargo.lock
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e7d7786361d7425ae2fe4f9e407eb0efaa0840f5212d109cc018c40c35c6ab4"
+=======
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d23bd4e7b5eda0d0f3a307e8b381fdc8ba9000f26fbe912250c0a4cc3956364a"
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 
 [[package]]
 name = "hashbrown"
@@ -3474,6 +3580,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "iai-callgrind"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "146bf76de95f03c5f4b118f0f2f350ef18df47cc0595755bd29d8f668209466c"
+dependencies = [
+ "bincode",
+ "iai-callgrind-macros",
+ "iai-callgrind-runner",
+]
+
+[[package]]
+name = "iai-callgrind-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2a4bb39225592c0a28cfca6f70af52ebd8da23f533c2cdd0a3329c1fa252d56"
+dependencies = [
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.75",
+]
+
+[[package]]
+name = "iai-callgrind-runner"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60484b2e469ef4f1af6f196af738889ff375151dd11ac223647ed8a97529107d"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3615,8 +3753,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -3813,7 +3955,7 @@ dependencies = [
  "socket2 0.5.7",
  "widestring",
  "windows-sys 0.48.0",
- "winreg 0.50.0",
+ "winreg",
 ]
 
 [[package]]
@@ -4029,8 +4171,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -4213,9 +4359,9 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "libc"
-version = "0.2.156"
+version = "0.2.158"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5f43f184355eefb8d17fc948dbecf6c13be3c141f20d834ae842193a448c72a"
+checksum = "d8adc4bb1803a324070e64a98ae98f38934d91957a99cfb3a43dcbc01bc56439"
 
 [[package]]
 name = "libloading"
@@ -4634,13 +4780,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "miner"
-version = "1.0.5"
-dependencies = [
- "reth-transaction-pool",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4938,8 +5077,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -4958,6 +5101,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95f06be0417d97f81fe4e5c86d7d01b392655a9cac9c19a848aa033e18937b23"
 dependencies = [
  "alloy-rlp",
+ "arbitrary",
  "const-hex",
  "proptest",
  "serde",
@@ -5290,8 +5434,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -5324,8 +5472,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -5365,6 +5517,15 @@ name = "pkg-config"
 version = "0.3.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231b230927b5e4ad203db57bbcbee2802f6bce620b1e4a9024a07d94e2907ec"
+
+[[package]]
+name = "plain_hasher"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e19e6491bdde87c2c43d70f4c194bc8a758f2eb732df00f61e43f7362e3b4cc"
+dependencies = [
+ "crunchy",
+]
 
 [[package]]
 name = "plotters"
@@ -5465,8 +5626,12 @@ dependencies = [
  "proc-macro2 1.0.86",
 =======
  "proc-macro2",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -5632,8 +5797,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -6126,9 +6295,9 @@ dependencies = [
 
 [[package]]
 name = "redox_users"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd283d9651eeda4b2a83a43c1c91b266c40fd76ecd39a50a8c630ae69dc72891"
+checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
 dependencies = [
  "getrandom 0.2.15",
  "libredox",
@@ -6191,9 +6360,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.5"
+version = "0.12.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7d6d2a27d57148378eb5e111173f4276ad26340ecc5c49a4a2152167a2d6a37"
+checksum = "f8f4955649ef5c38cc7f9e8aa41761d48fb9677197daea9984dc54f56aad5e63"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6229,7 +6398,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "webpki-roots",
- "winreg 0.52.0",
+ "windows-registry",
 ]
 
 [[package]]
@@ -6245,7 +6414,6 @@ dependencies = [
 [[package]]
 name = "reth-auto-seal-consensus"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "futures-util",
  "reth-beacon-consensus",
@@ -6372,13 +6540,15 @@ dependencies = [
 [[package]]
 name = "reth-chain-state"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
+ "alloy-signer",
+ "alloy-signer-local",
  "auto_impl",
  "derive_more 0.99.18",
  "metrics",
  "parking_lot 0.12.3",
  "pin-project",
+ "rand 0.8.5",
  "reth-chainspec",
  "reth-errors",
  "reth-execution-types",
@@ -6386,6 +6556,7 @@ dependencies = [
  "reth-primitives",
  "reth-storage-api",
  "reth-trie",
+ "revm",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -6399,6 +6570,7 @@ dependencies = [
  "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-trie",
  "auto_impl",
 <<<<<<< HEAD:rast/Cargo.lock
@@ -6538,8 +6710,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -6602,12 +6778,23 @@ dependencies = [
 name = "reth-db"
 version = "1.0.5"
 dependencies = [
+ "arbitrary",
+ "assert_matches",
  "bytes",
+<<<<<<< HEAD:rast/Cargo.lock
  "derive_more 0.99.18",
+=======
+ "criterion",
+ "derive_more",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "eyre",
+ "iai-callgrind",
  "metrics",
  "page_size",
  "paste",
+ "pprof",
+ "proptest",
+ "rand 0.8.5",
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
@@ -6622,23 +6809,35 @@ dependencies = [
  "reth-trie-common",
  "rustc-hash 2.0.0",
  "serde",
+ "serde_json",
  "strum",
  "sysinfo",
+ "tempfile",
+ "test-fuzz",
  "thiserror",
 ]
 
 [[package]]
 name = "reth-db-api"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "arbitrary",
+ "assert_matches",
  "bytes",
+<<<<<<< HEAD:rast/Cargo.lock
  "derive_more 0.99.18",
+=======
+ "criterion",
+ "derive_more",
+ "iai-callgrind",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "metrics",
  "modular-bitfield",
  "parity-scale-codec",
+ "pprof",
  "proptest",
+ "proptest-arbitrary-interop",
+ "rand 0.8.5",
  "reth-codecs",
  "reth-primitives",
  "reth-primitives-traits",
@@ -6647,6 +6846,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "serde",
+ "test-fuzz",
 ]
 
 [[package]]
@@ -6878,7 +7078,6 @@ dependencies = [
 [[package]]
 name = "reth-engine-util"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "eyre",
  "futures",
@@ -6959,6 +7158,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-ethereum-cli"
+version = "1.0.5"
+dependencies = [
+ "alloy-genesis",
+ "clap",
+ "eyre",
+ "reth-chainspec",
+ "reth-cli",
+ "serde_json",
+ "shellexpand",
+]
+
+[[package]]
 name = "reth-ethereum-consensus"
 version = "1.0.5"
 source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
@@ -6991,7 +7203,6 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-forks"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-chains",
  "alloy-primitives",
@@ -7011,7 +7222,6 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-payload-builder"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "reth-basic-payload-builder",
  "reth-errors",
@@ -7119,18 +7329,23 @@ dependencies = [
  "reth-primitives",
  "reth-trie",
  "revm",
+ "serde",
 ]
 
 [[package]]
 name = "reth-exex"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "eyre",
  "futures",
  "metrics",
+ "reth-blockchain-tree",
+ "reth-chainspec",
  "reth-config",
+ "reth-db-api",
+ "reth-db-common",
  "reth-evm",
+ "reth-evm-ethereum",
  "reth-exex-types",
  "reth-metrics",
  "reth-node-api",
@@ -7143,7 +7358,9 @@ dependencies = [
  "reth-revm",
  "reth-stages-api",
  "reth-tasks",
+ "reth-testing-utils",
  "reth-tracing",
+ "secp256k1",
  "tokio",
  "tokio-util",
 ]
@@ -7155,6 +7372,7 @@ source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0
 dependencies = [
  "alloy-primitives",
  "reth-provider",
+ "serde",
 ]
 
 [[package]]
@@ -7242,7 +7460,7 @@ dependencies = [
  "quote",
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "regex",
- "syn 2.0.74",
+ "syn 2.0.75",
 ]
 
 [[package]]
@@ -7867,6 +8085,7 @@ dependencies = [
 name = "reth-provider"
 version = "1.0.5"
 dependencies = [
+ "alloy-rlp",
  "alloy-rpc-types-engine",
  "auto_impl",
  "dashmap 6.0.1",
@@ -8086,7 +8305,6 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-api"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-dyn-abi",
  "async-trait",
@@ -8120,7 +8338,6 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-types"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-sol-types",
  "derive_more 0.99.18",
@@ -8149,6 +8366,7 @@ dependencies = [
  "revm-primitives",
  "schnellru",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -8205,13 +8423,13 @@ dependencies = [
 [[package]]
 name = "reth-rpc-types-compat"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-rlp",
  "alloy-rpc-types",
  "reth-primitives",
  "reth-rpc-types",
  "reth-trie-common",
+ "serde_json",
 ]
 
 [[package]]
@@ -8323,7 +8541,6 @@ dependencies = [
 [[package]]
 name = "reth-storage-api"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "auto_impl",
  "reth-chainspec",
@@ -8364,6 +8581,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-futures",
+]
+
+[[package]]
+name = "reth-testing-utils"
+version = "1.0.5"
+source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
+dependencies = [
+ "alloy-genesis",
+ "rand 0.8.5",
+ "reth-primitives",
+ "secp256k1",
 ]
 
 [[package]]
@@ -8426,22 +8654,36 @@ dependencies = [
 [[package]]
 name = "reth-trie"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-rlp",
  "auto_impl",
+<<<<<<< HEAD:rast/Cargo.lock
  "derive_more 0.99.18",
+=======
+ "criterion",
+ "derive_more",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "itertools 0.13.0",
  "metrics",
+ "proptest",
+ "proptest-arbitrary-interop",
  "rayon",
+ "reth-chainspec",
  "reth-execution-errors",
  "reth-metrics",
  "reth-primitives",
+ "reth-provider",
  "reth-stages-types",
  "reth-storage-errors",
  "reth-trie-common",
  "revm",
+ "serde",
+ "serde_json",
+ "similar-asserts",
+ "tokio",
+ "tokio-stream",
  "tracing",
+ "triehash",
 ]
 
 [[package]]
@@ -8454,10 +8696,17 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
+ "arbitrary",
  "bytes",
+<<<<<<< HEAD:rast/Cargo.lock
  "derive_more 0.99.18",
+=======
+ "derive_more",
+ "hash-db",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "itertools 0.13.0",
  "nybbles",
+ "plain_hasher",
  "reth-codecs",
  "reth-primitives-traits",
  "revm-primitives",
@@ -8467,25 +8716,39 @@ dependencies = [
 [[package]]
 name = "reth-trie-db"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-rlp",
  "auto_impl",
+<<<<<<< HEAD:rast/Cargo.lock
  "derive_more 0.99.18",
+=======
+ "criterion",
+ "derive_more",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "itertools 0.13.0",
  "metrics",
+ "proptest",
+ "proptest-arbitrary-interop",
  "rayon",
+ "reth-chainspec",
  "reth-db",
  "reth-db-api",
  "reth-execution-errors",
  "reth-metrics",
  "reth-primitives",
+ "reth-provider",
  "reth-stages-types",
  "reth-storage-errors",
  "reth-trie",
  "reth-trie-common",
  "revm",
+ "serde",
+ "serde_json",
+ "similar-asserts",
+ "tokio",
+ "tokio-stream",
  "tracing",
+ "triehash",
 ]
 
 [[package]]
@@ -8823,9 +9086,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a88d6d420651b496bdd98684116959239430022a115c1240e6c3993be0b15fba"
+checksum = "04182dffc9091a404e0fc069ea5cd60e5b866c3adf881eff99a32d048242dffa"
 dependencies = [
  "openssl-probe",
  "rustls-pemfile",
@@ -9144,8 +9407,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -9213,8 +9480,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -9443,6 +9714,7 @@ version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c5e1a9a646d36c3599cd173a41282daf47c44583ad367b8e6837255952e5c67"
 dependencies = [
+ "arbitrary",
  "serde",
 ]
 
@@ -9530,8 +9802,12 @@ dependencies = [
  "quote 1.0.36",
 =======
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -9583,7 +9859,7 @@ dependencies = [
  "proc-macro2 1.0.86",
  "quote 1.0.36",
  "rustversion",
- "syn 2.0.74",
+ "syn 2.0.75",
 ]
 
 [[package]]
@@ -9662,9 +9938,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.74"
+version = "2.0.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fceb41e3d546d0bd83421d3409b1460cc7444cd389341a4c880fe7a042cb3d7"
+checksum = "f6af063034fc1935ede7be0122941bafa9bacb949334d090b77ca98b5817c7d9"
 dependencies = [
  "proc-macro2 1.0.86",
  "quote 1.0.36",
@@ -9684,8 +9960,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -9693,6 +9973,9 @@ name = "sync_wrapper"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7065abeca94b6a8a577f9bd45aa0867a2238b74e8eb67cf10d492bc39351394"
+dependencies = [
+ "futures-core",
+]
 
 [[package]]
 name = "synstructure"
@@ -9706,8 +9989,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -9782,8 +10069,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -9826,8 +10117,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -9980,9 +10275,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.39.2"
+version = "1.39.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daa4fb1bc778bd6f04cbfc4bb2d06a7396a8f299dc33ea1900cedaa316f467b1"
+checksum = "9babc99b9923bfa4804bd74722ff02c0381021eafa4db9949217e3be8e84fff5"
 dependencies = [
  "backtrace",
  "bytes",
@@ -10008,8 +10303,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -10211,8 +10510,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -10298,6 +10601,16 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "triehash"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1631b201eb031b563d2e85ca18ec8092508e262a3196ce9bd10a67ec87b9f5c"
+dependencies = [
+ "hash-db",
+ "rlp",
 ]
 
 [[package]]
@@ -10481,6 +10794,7 @@ checksum = "0336d538f7abc86d282a4189614dfaa90810dfc2c6f6427eaf88e16311dd225d"
 
 [[package]]
 name = "unicode-xid"
+<<<<<<< HEAD:rast/Cargo.lock
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc72304796d0818e357ead4e000d19c9c174ab23dc11093ac919054d20a6a7fc"
@@ -10488,8 +10802,11 @@ checksum = "fc72304796d0818e357ead4e000d19c9c174ab23dc11093ac919054d20a6a7fc"
 [[package]]
 name = "unicode-xid"
 version = "0.2.4"
+=======
+version = "0.2.5"
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f962df74c8c05a667b5ee8bcf162993134c104e96440b663c8daa176dc772d8c"
+checksum = "229730647fbc343e3a80e463c1db7f78f3855d3f3739bee0dda773c9a037c90a"
 
 [[package]]
 name = "universal-hash"
@@ -10667,8 +10984,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "wasm-bindgen-shared",
 ]
 
@@ -10706,8 +11027,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "wasm-bindgen-backend",
  "wasm-bindgen-shared",
 ]
@@ -10821,7 +11146,7 @@ checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
 dependencies = [
  "windows-implement",
  "windows-interface",
- "windows-result",
+ "windows-result 0.1.2",
  "windows-targets 0.52.6",
 ]
 
@@ -10837,8 +11162,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -10853,8 +11182,23 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+]
+
+[[package]]
+name = "windows-registry"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e400001bb720a623c1c69032f8e3e4cf09984deec740f007dd2b03ec864804b0"
+dependencies = [
+ "windows-result 0.2.0",
+ "windows-strings",
+ "windows-targets 0.52.6",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -10863,6 +11207,25 @@ version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e383302e8ec8515204254685643de10811af0ed97ea37210dc26fb0032647f8"
 dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d1043d8214f791817bab27572aaa8af63732e11bf84aa21a45a78d6c317ae0e"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-strings"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd9b125c486025df0eabcb585e62173c6c9eddcec5d117d3b6e8c30e2ee4d10"
+dependencies = [
+ "windows-result 0.2.0",
  "windows-targets 0.52.6",
 ]
 
@@ -11043,16 +11406,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winreg"
-version = "0.52.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a277a57398d4bfa075df44f501a17cfdf8542d224f0d36095a2adc7aee4ef0a5"
-dependencies = [
- "cfg-if",
- "windows-sys 0.48.0",
-]
-
-[[package]]
 name = "write16"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11125,8 +11478,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "synstructure",
 ]
 
@@ -11152,8 +11509,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -11177,8 +11538,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
  "synstructure",
 ]
 
@@ -11203,8 +11568,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
@@ -11230,8 +11599,12 @@ dependencies = [
 =======
  "proc-macro2",
  "quote",
+<<<<<<< HEAD:rast/Cargo.lock
 >>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.lock
  "syn 2.0.74",
+=======
+ "syn 2.0.75",
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.lock
 ]
 
 [[package]]
