@@ -11,16 +11,6 @@ exclude = [".github/"]
 members = [
     "bin/rast/",
     "crates/primitives/",
-<<<<<<< HEAD:rast/Cargo.toml
-<<<<<<< HEAD:rast/Cargo.toml
-    "crates/primitives-traits/",
-    "crates/clique/"
-]
-=======
-    "crates/primitives-traits/"
-, "crates/miner"]
->>>>>>> 512438d671c9549028c63f3e6856fe2e4b6ce3ee:Cargo.toml
-=======
     "crates/primitives-traits/",
     "crates/chainspec/",
     "crates/ethereum/cli/",
@@ -38,7 +28,6 @@ members = [
     "crates/rpc/rpc-eth-api",
     "crates/exex/exex",
 ]
->>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c:Cargo.toml
 default-members = ["bin/rast"]
 
 
