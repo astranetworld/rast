@@ -1,9 +1,11 @@
 use alloy_rlp::RlpDecodable;
 use alloy_rlp::RlpEncodable;
+use reth_codecs::Compact;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use arbitrary::Arbitrary;
+use bytes::BufMut;
 // use reth_db_api::table::Decompress;
 
 const ADDRESS_LENGTH: usize = 20;
@@ -18,6 +20,40 @@ const PUBLIC_KEY_LENGTH: usize = 48;
 // #[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::derive_arbitrary(rlp 32))]
 #[derive(Eq, PartialEq, Debug, Clone, RlpEncodable, RlpDecodable,Arbitrary)]
 pub struct PublicKey(pub [u8; PUBLIC_KEY_LENGTH]);
+
+impl Default for PublicKey {
+    /// Returns the default value for the `PublicKey` type.
+    ///
+    /// Here we simply initialize the public key to all zeroes.
+    fn default() -> Self {
+        PublicKey([0u8; PUBLIC_KEY_LENGTH])
+    }
+}
+
+impl Compact for PublicKey {
+    /// Convert the public key to a compact format and write it into the provided buffer.
+    fn to_compact<B>(&self, buf: &mut B) -> usize
+    where
+        B: BufMut + AsMut<[u8]>,
+    {
+        // Directly copy the byte array of the public key into the buffer.
+        buf.as_mut().copy_from_slice(&self.0);
+        // Return the number of bytes written.
+        PUBLIC_KEY_LENGTH
+    }
+
+    /// Read the public key from a compact format.
+    fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
+        // Ensure the buffer length is sufficient.
+        assert!(len == PUBLIC_KEY_LENGTH, "Invalid buffer length for PublicKey");
+        
+        // Create an instance of the public key.
+        let public_key = PublicKey(buf[..PUBLIC_KEY_LENGTH].try_into().expect("Slice with incorrect length"));
+        
+        // Return the public key instance and the remaining buffer.
+        (public_key, &buf[PUBLIC_KEY_LENGTH..])
+    }
+}
 
 struct PublicKeyVisitor;
 impl<'de> Visitor<'de> for PublicKeyVisitor {
@@ -43,13 +79,13 @@ impl<'de> Visitor<'de> for PublicKeyVisitor {
 
 /// ly
 // #[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::derive_arbitrary(rlp 32))]
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, RlpEncodable, RlpDecodable,Arbitrary)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, RlpEncodable, RlpDecodable,Arbitrary,Default,Compact)]
 pub struct Verifiers(pub Vec<Verifier>);
 
 
 /// ly
 // #[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::derive_arbitrary(rlp 32))]
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, RlpEncodable, RlpDecodable,Arbitrary)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, RlpEncodable, RlpDecodable,Arbitrary,Compact,Default)]
 pub struct Verifier {
     /// ly
     pub address: Address,

@@ -13,9 +13,20 @@ members = [
     "crates/primitives/",
     "crates/primitives-traits/",
     "crates/chainspec/",
-    "crates/ethereum/cli/"
+    "crates/ethereum/cli/",
     "crates/storage/db/",
     "crates/storage/db-api",
+    "crates/storage/storage-api/",
+    "crates/rpc/rpc-types-compat",
+    "crates/chain-state",
+    "crates/trie/trie",
+    "crates/trie/db",
+    "crates/rpc/rpc-eth-types",
+    "crates/ethereum/payload",
+    "crates/consensus/auto-seal",
+    "crates/engine/util",
+    "crates/rpc/rpc-eth-api",
+    "crates/exex/exex",
 ]
 default-members = ["bin/rast"]
 
@@ -155,6 +166,17 @@ reth-db = {path = "crates/storage/db" }
 reth-ethereum-forks = { path = "crates/ethereum-forks"}
 reth-ethereum-cli = { path = "crates/ethereum/cli"}
 reth-db-api={path = "crates/storage/db-api"}
+reth-storage-api={path="crates/storage/storage-api"}
+reth-rpc-types-compat={path="crates/rpc/rpc-types-compat"}
+reth-chain-state={path="crates/chain-state"}
+reth-trie={path="crates/trie/trie"}
+reth-trie-db={path="crates/trie/db"}
+reth-rpc-eth-types={path="crates/rpc/rpc-eth-types"}
+reth-ethereum-payload-builder={path="crates/ethereum/payload"}
+reth-auto-seal-consensus={path="crates/consensus/auto-seal"}
+reth-engine-util={path="crates/engine/util"}
+reth-rpc-eth-api={path="crates/rpc/rpc-eth-api"}
+reth-exex={path="crates/exex/exex"}
 
 [patch.crates-io]
 alloy-genesis = { path = "./crates/alloy-genesis" }

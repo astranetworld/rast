@@ -6,7 +6,7 @@ use crate::{
 use reth_primitives::{Account, Address, BlockNumber, Bytecode, Bytes, B256};
 use reth_storage_api::StateProofProvider;
 use reth_storage_errors::provider::ProviderResult;
-use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage};
+use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage,prefix_set::TriePrefixSetsMut,};
 use revm::db::BundleState;
 
 /// A state provider that resolves to data from either a wrapped [`crate::ExecutionOutcome`]
@@ -67,6 +67,33 @@ impl<SP: StateProvider, EDP: ExecutionDataProvider> AccountReader for BundleStat
 impl<SP: StateProvider, EDP: ExecutionDataProvider> StateRootProvider
     for BundleStateProvider<SP, EDP>
 {
+    fn hashed_state_root_from_nodes(
+        &self,
+        _nodes: TrieUpdates,
+        _hashed_state: HashedPostState,
+        _prefix_sets: TriePrefixSetsMut,
+    ) -> ProviderResult<B256> {
+        unimplemented!()
+    }
+
+    fn hashed_state_root_from_nodes_with_updates(
+        &self,
+        nodes: TrieUpdates,
+        hashed_state: HashedPostState,
+        prefix_sets: TriePrefixSetsMut,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        let bundle_state = self.block_execution_data_provider.execution_outcome().state();
+        let mut state = HashedPostState::from_bundle_state(&bundle_state.state);
+        let mut state_prefix_sets = state.construct_prefix_sets();
+        state.extend(hashed_state);
+        state_prefix_sets.extend(prefix_sets);
+        self.state_provider.hashed_state_root_from_nodes_with_updates(
+            nodes,
+            state,
+            state_prefix_sets,
+        )
+    }
+
     fn state_root(&self, bundle_state: &BundleState) -> ProviderResult<B256> {
         let mut state = self.block_execution_data_provider.execution_outcome().state().clone();
         state.extend(bundle_state.clone());
