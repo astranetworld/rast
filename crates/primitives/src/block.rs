@@ -47,6 +47,10 @@ pub struct Block {
     pub withdrawals: Option<Withdrawals>,
     /// Block requests.
     pub requests: Option<Requests>,
+    /// Block verifiers
+    pub verifiers:Option<Verifiers>,
+    /// Block rewards
+    pub rewards:Option<Rewards>,
 }
 
 impl Block {
@@ -296,6 +300,13 @@ pub struct SealedBlock {
     pub withdrawals: Option<Withdrawals>,
     /// Block requests.
     pub requests: Option<Requests>,
+<<<<<<< HEAD
+=======
+    /// Block verifiers
+    pub verifiers:Option<Verifiers>,
+    /// Block rewards
+    pub rewards:Option<Rewards>,
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c
 }
 
 impl SealedBlock {

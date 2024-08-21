@@ -51,9 +51,13 @@ hardfork!(
         Cancun,
         /// Prague: <https://github.com/ethereum/execution-specs/blob/master/network-upgrades/mainnet-upgrades/prague.md>
         Prague,
+        /// beijing
         BeiJing,
+        /// eip150
         Eip150,
+        /// eip155
         Eip155,
+        /// eip158
         Eip158,
     }
 );

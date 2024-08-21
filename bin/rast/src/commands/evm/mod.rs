@@ -73,7 +73,7 @@ impl EvmCommand {
             eyre::bail!("The end block number is higher than the latest block number")
         }
 
-        // 创建任务池
+        // Create a Task Pool
         let mut tasks = VecDeque::new();
         let mut current_start = self.begin_number;
         while current_start <= self.end_number {
@@ -88,17 +88,17 @@ impl EvmCommand {
             current_start = current_end + 1;
         }
 
-        // 获取 CPU 核心数，减一作为线程数
+        // Retrieve the number of CPU cores and subtract one to use as the thread count.
         let thread_count = self.get_cpu_count() * 2 - 1;
         let mut threads: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(thread_count);
 
-        // 创建共享 gas 计数器
+        // Create a shared gas counter.
         let task_queue = Arc::new(Mutex::new(tasks));
         let cumulative_gas = Arc::new(Mutex::new(0));
         let block_counter = Arc::new(Mutex::new(self.begin_number - 1));
         let txs_counter = Arc::new(Mutex::new(0));
 
-        // 创建状态输出线程
+        // Create a status output thread.
         {
             let cumulative_gas = Arc::clone(&cumulative_gas);
             let block_counter = Arc::clone(&block_counter);
@@ -254,7 +254,7 @@ impl EvmCommand {
         Ok(())
     }
 
-    // 获取系统 CPU 核心数
+    // Retrieve the system's CPU core count.
     fn get_cpu_count(&self) -> usize {
         num_cpus::get()
     }

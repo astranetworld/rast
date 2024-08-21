@@ -31,6 +31,7 @@ pub const EPOCH_DURATION: Duration = Duration::from_secs(12 * EPOCH_SLOTS);
 /// The default block nonce in the beacon consensus
 pub const BEACON_NONCE: u64 = 0u64;
 
+/// ast block gas limit
 pub const AST_BLOCK_GAS_LIMIT: u64 = 9_223_372_036_854_775_807;
 
 /// The default Ethereum block gas limit.
