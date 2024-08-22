@@ -28,7 +28,7 @@ pub use alloy_eips::eip1559::BaseFeeParams;
 use reth_ethereum_forks::OptimismHardfork;
 use reth_network_peers::{
     base_nodes, base_testnet_nodes, holesky_nodes, mainnet_nodes, op_nodes, op_testnet_nodes,
-    sepolia_nodes,
+    sepolia_nodes, ast_nodes
 };
 
 /// The AST mainnet spec
@@ -707,14 +707,28 @@ impl ChainSpec {
     pub fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
         use NamedChain as C;
         let chain = self.chain;
-        match chain.try_into().ok()? {
-            C::Mainnet => Some(mainnet_nodes()),
-            C::Sepolia => Some(sepolia_nodes()),
-            C::Holesky => Some(holesky_nodes()),
-            C::Base => Some(base_nodes()),
-            C::Optimism => Some(op_nodes()),
-            C::BaseGoerli | C::BaseSepolia => Some(base_testnet_nodes()),
-            C::OptimismSepolia | C::OptimismGoerli | C::OptimismKovan => Some(op_testnet_nodes()),
+        // match chain.try_into().ok()? {
+        //     C::Mainnet => Some(mainnet_nodes()),
+        //     C::Sepolia => Some(sepolia_nodes()),
+        //     C::Holesky => Some(holesky_nodes()),
+        //     C::Base => Some(base_nodes()),
+        //     C::Optimism => Some(op_nodes()),
+        //     C::BaseGoerli | C::BaseSepolia => Some(base_testnet_nodes()),
+        //     C::OptimismSepolia | C::OptimismGoerli | C::OptimismKovan => Some(op_testnet_nodes()),
+        //     _ => None,
+        // }
+        match chain.kind() {
+            ChainKind::Named(named_chain) => match named_chain {
+                C::Mainnet => Some(mainnet_nodes()),
+                C::Sepolia => Some(sepolia_nodes()),
+                C::Holesky => Some(holesky_nodes()),
+                C::Base => Some(base_nodes()),
+                C::Optimism => Some(op_nodes()),
+                C::BaseGoerli | C::BaseSepolia => Some(base_testnet_nodes()),
+                C::OptimismSepolia | C::OptimismGoerli | C::OptimismKovan => Some(op_testnet_nodes()),
+                _ => None,
+            },
+            ChainKind::Id(id) if *id == 94 => Some(ast_nodes()),
             _ => None,
         }
     }

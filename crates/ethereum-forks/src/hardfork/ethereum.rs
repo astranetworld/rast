@@ -74,8 +74,34 @@ impl EthereumHardfork {
         if chain == Chain::holesky() {
             return self.holesky_activation_block()
         }
+        if chain.id() == 94 {
+            return self.ast_activation_block()
+        }
 
         None
+    }
+
+    /// Retrieves the activation block for the specified hardfork on the Ast mainnet.
+    pub const fn ast_activation_block(&self) -> Option<u64> {
+        match self {
+            Self::Homestead => Some(0),
+            Self::Dao => None,
+            Self::Eip150 => Some(0),
+            Self::Eip155 => Some(0),
+            Self::Eip158 => Some(0),
+            Self::Byzantium => Some(0),
+            Self::Constantinople => Some(0),
+            Self::Petersburg => Some(0),
+            Self::Istanbul => Some(0),
+            Self::MuirGlacier => Some(0),
+            Self::Berlin => Some(0),
+            Self::London => Some(0),
+            Self::ArrowGlacier => Some(0),
+            Self::BeiJing => Some(770000),
+            Self::Shanghai => Some(0),
+            Self::Cancun => Some(0),
+            _ => None,
+        }
     }
 
     /// Retrieves the activation block for the specified hardfork on the Ethereum mainnet.
@@ -210,8 +236,36 @@ impl EthereumHardfork {
         if chain == Chain::holesky() {
             return self.holesky_activation_timestamp()
         }
+        if chain.id() == 94 {
+            return self.ast_activation_timestamp()
+        }
 
         None
+    }
+
+    /// Retrieves the activation timestamp for the specified hardfork on the Ast mainnet.
+    pub const fn ast_activation_timestamp(&self) -> Option<u64> {
+        match self {
+            Self::Homestead => Some(0),
+            Self::Dao => None,
+            Self::Eip150 => Some(0),
+            Self::Eip155 => Some(0),
+            Self::Eip158 => Some(0),
+            Self::Byzantium => Some(0),
+            Self::Constantinople => Some(0),
+            Self::Petersburg => Some(0),
+            Self::Istanbul => Some(0),
+            Self::MuirGlacier => Some(0),
+            Self::Berlin => Some(0),
+            Self::London => Some(0),
+            Self::ArrowGlacier => Some(0),
+            Self::BeiJing => Some(770000),///////
+            Self::Shanghai => Some(0),
+            Self::Cancun => Some(0),
+
+            // upcoming hardforks
+            _ => None,
+        }
     }
 
     /// Retrieves the activation timestamp for the specified hardfork on the Ethereum mainnet.
