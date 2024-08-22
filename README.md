@@ -84,12 +84,12 @@ Use the command-line interface (CLI) or integrate with the blockchain via the JS
 
 ## Contributing
 
-We welcome contributions to the Rust Blockchain Project! To contribute, please follow these steps:
+We're excited to welcome contributions to the Rust Blockchain Project! To get started, please follow these steps:
 
 1. Fork the repository.
-2. Create a new branch with your feature or bugfix.
+2. Create a new branch for your feature or bug fix.
 3. Commit your changes and push them to your branch.
-4. Create a pull request with a detailed description of your changes.
+4. Submit a pull request with a detailed description of your changes.
 
 Kindly make sure your code complies with the project's coding standards and successfully passes all tests before submitting a pull request.
 
