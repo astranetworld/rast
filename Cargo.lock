@@ -6031,19 +6031,12 @@ dependencies = [
 name = "reth-db"
 version = "1.0.5"
 dependencies = [
- "arbitrary",
- "assert_matches",
  "bytes",
- "criterion",
  "derive_more",
  "eyre",
- "iai-callgrind",
  "metrics",
  "page_size",
  "paste",
- "pprof",
- "proptest",
- "rand 0.8.5",
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
@@ -6058,31 +6051,23 @@ dependencies = [
  "reth-trie-common",
  "rustc-hash 2.0.0",
  "serde",
- "serde_json",
  "strum",
  "sysinfo",
- "tempfile",
- "test-fuzz",
  "thiserror",
 ]
 
 [[package]]
 name = "reth-db-api"
 version = "1.0.5"
+source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "arbitrary",
- "assert_matches",
  "bytes",
- "criterion",
  "derive_more",
- "iai-callgrind",
  "metrics",
  "modular-bitfield",
  "parity-scale-codec",
- "pprof",
  "proptest",
- "proptest-arbitrary-interop",
- "rand 0.8.5",
  "reth-codecs",
  "reth-primitives",
  "reth-primitives-traits",
@@ -6091,7 +6076,6 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "serde",
- "test-fuzz",
 ]
 
 [[package]]
@@ -6811,12 +6795,13 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "1.0.5"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "enr",
+ "rand 0.8.5",
  "secp256k1",
+ "serde_json",
  "serde_with",
  "thiserror",
  "tokio",

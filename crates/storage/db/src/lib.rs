@@ -38,9 +38,8 @@ pub use mdbx::{create_db, init_db, open_db, open_db_read_only, DatabaseEnv, Data
 
 pub use reth_db_api::*;
 
-
 /// Collection of database test utilities
-// #[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils {
     use super::*;
     use crate::mdbx::DatabaseArguments;

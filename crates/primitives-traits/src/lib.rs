@@ -33,12 +33,6 @@ pub use request::{Request, Requests};
 mod withdrawal;
 pub use withdrawal::{Withdrawal, Withdrawals};
 
-mod verifier;
-pub use verifier::{Verifier,Verifiers,Address,PublicKey};
-
-mod reward;
-pub use reward::{Rewards,Amount,Reward};
-
 mod error;
 pub use error::{GotExpected, GotExpectedBoxed};
 

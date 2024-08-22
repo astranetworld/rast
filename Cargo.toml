@@ -14,6 +14,7 @@ members = [
     "crates/primitives-traits/",
     "crates/chainspec/",
     "crates/ethereum/cli/",
+    "crates/net/peers/",
     "crates/storage/db/",
     "crates/storage/db-api",
     "crates/storage/storage-api/",
@@ -165,6 +166,7 @@ reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
 reth-ethereum-forks = { path = "crates/ethereum-forks"}
 reth-ethereum-cli = { path = "crates/ethereum/cli"}
+reth-network-peers = { path = "crates/net/peers"}
 reth-db-api={path = "crates/storage/db-api"}
 reth-storage-api={path="crates/storage/storage-api"}
 reth-rpc-types-compat={path="crates/rpc/rpc-types-compat"}

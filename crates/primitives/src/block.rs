@@ -13,7 +13,6 @@ use proptest::prelude::prop_compose;
 pub use reth_primitives_traits::test_utils::{generate_valid_header, valid_header_strategy};
 use reth_primitives_traits::Requests;
 use serde::{Deserialize, Serialize};
-use reth_primitives_traits::{Verifiers,Rewards};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -63,8 +62,6 @@ impl Block {
             ommers: self.ommers,
             withdrawals: self.withdrawals,
             requests: self.requests,
-            verifiers:self.verifiers,
-            rewards:self.rewards,
         }
     }
 
@@ -78,8 +75,6 @@ impl Block {
             ommers: self.ommers,
             withdrawals: self.withdrawals,
             requests: self.requests,
-            verifiers:self.verifiers,
-            rewards:self.rewards,
         }
     }
 
@@ -203,8 +198,6 @@ impl<'a> arbitrary::Arbitrary<'a> for Block {
             // for now just generate empty requests, see HACK above
             requests: u.arbitrary()?,
             withdrawals: u.arbitrary()?,
-            verifiers:u.arbitrary()?,
-            rewards:u.arbitrary()?,
         })
     }
 }
@@ -307,18 +300,21 @@ pub struct SealedBlock {
     pub withdrawals: Option<Withdrawals>,
     /// Block requests.
     pub requests: Option<Requests>,
+<<<<<<< HEAD
+=======
     /// Block verifiers
     pub verifiers:Option<Verifiers>,
     /// Block rewards
     pub rewards:Option<Rewards>,
+>>>>>>> 886263e501bdbef9264ee88a03c9117b624f0d6c
 }
 
 impl SealedBlock {
     /// Create a new sealed block instance using the sealed header and block body.
     #[inline]
     pub fn new(header: SealedHeader, body: BlockBody) -> Self {
-        let BlockBody { transactions, ommers, withdrawals, requests ,verifiers,rewards} = body;
-        Self { header, body: transactions, ommers, withdrawals, requests ,verifiers,rewards}
+        let BlockBody { transactions, ommers, withdrawals, requests } = body;
+        Self { header, body: transactions, ommers, withdrawals, requests }
     }
 
     /// Header hash.
@@ -343,8 +339,6 @@ impl SealedBlock {
                 ommers: self.ommers,
                 withdrawals: self.withdrawals,
                 requests: self.requests,
-                verifiers:self.verifiers,
-                rewards:self.rewards,
             },
         )
     }
@@ -438,8 +432,6 @@ impl SealedBlock {
             ommers: self.ommers,
             withdrawals: self.withdrawals,
             requests: self.requests,
-            verifiers:self.verifiers,
-            rewards:self.rewards,
         }
     }
 
@@ -583,10 +575,6 @@ pub struct BlockBody {
     pub withdrawals: Option<Withdrawals>,
     /// Requests in the block.
     pub requests: Option<Requests>,
-    /// Verifiers in the block.
-    pub verifiers:Option<Verifiers>,
-    /// Rewards in the block.
-    pub rewards:Option<Rewards>,
 }
 
 impl BlockBody {
@@ -599,8 +587,6 @@ impl BlockBody {
             ommers: self.ommers.clone(),
             withdrawals: self.withdrawals.clone(),
             requests: self.requests.clone(),
-            verifiers:self.verifiers.clone(),
-            rewards:self.rewards.clone(),
         }
     }
 
@@ -646,8 +632,6 @@ impl From<Block> for BlockBody {
             ommers: block.ommers,
             withdrawals: block.withdrawals,
             requests: block.requests,
-            verifiers:block.verifiers,
-            rewards:block.rewards,
         }
     }
 }
@@ -664,7 +648,7 @@ impl<'a> arbitrary::Arbitrary<'a> for BlockBody {
         let ommers = (0..2).map(|_| Header::arbitrary(u)).collect::<arbitrary::Result<Vec<_>>>()?;
 
         // for now just generate empty requests, see HACK above
-        Ok(Self { transactions, ommers, requests: None, withdrawals: u.arbitrary()?,verifiers:u.arbitrary()?,rewards:u.arbitrary()? })
+        Ok(Self { transactions, ommers, requests: None, withdrawals: u.arbitrary()? })
     }
 }
 
