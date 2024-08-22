@@ -27,6 +27,7 @@ members = [
     "crates/engine/util",
     "crates/rpc/rpc-eth-api",
     "crates/exex/exex",
+    "crates/net/peers"
 ]
 default-members = ["bin/rast"]
 
@@ -177,6 +178,7 @@ reth-auto-seal-consensus={path="crates/consensus/auto-seal"}
 reth-engine-util={path="crates/engine/util"}
 reth-rpc-eth-api={path="crates/rpc/rpc-eth-api"}
 reth-exex={path="crates/exex/exex"}
+reth-network-peers = { path = "crates/net/peers"}
 
 [patch.crates-io]
 alloy-genesis = { path = "./crates/alloy-genesis" }
