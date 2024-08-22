@@ -91,7 +91,7 @@ We welcome contributions to the Rust Blockchain Project! To contribute, please f
 3. Commit your changes and push them to your branch.
 4. Create a pull request with a detailed description of your changes.
 
-Please ensure that your code adheres to the project's coding standards and passes all tests before submitting a pull request.
+Kindly make sure your code complies with the project's coding standards and successfully passes all tests before submitting a pull request.
 
 ## License
 
