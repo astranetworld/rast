@@ -66,11 +66,11 @@ cargo doc --open
 
 ### Setting Up a Node
 
-To set up a full node, follow these steps:
+To configure a full node, follow these steps:
 
-1. Install Rust and Cargo (if not already installed).
-2. Build the project using the steps outlined above.
-3. Run the node using the provided command.
+1. **Install Rust and Cargo** (if they are not already installed).
+2. **Build the Project** using the instructions provided above.
+3. **Run the Node** using the specified command.
 
 ### Interacting with the Blockchain
 
