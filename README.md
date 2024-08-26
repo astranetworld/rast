@@ -10,12 +10,12 @@
 
 ## Features
 
-- **Decentralized Consensus**: Implements a Proof of Stake (PoS) consensus algorithm, ensuring a secure and energy-efficient network.
-- **Smart Contracts**: Supports smart contracts using WebAssembly (Wasm), allowing developers to write contracts in multiple languages.
-- **High Throughput**: Optimized for high transactions per second (TPS), suitable for large-scale applications.
-- **Interoperability**: Compatible with existing blockchain ecosystems, enabling cross-chain communication.
-- **Security**: Built with Rust to ensure memory safety and prevent common vulnerabilities such as buffer overflows.
-
+- **Decentralized Consensus**: Utilizes a Proof of Stake (PoS) consensus mechanism to provide a secure and energy-efficient network.
+- **Smart Contracts**: Enables smart contracts through WebAssembly (Wasm), allowing developers to write contracts in various programming languages.
+- **High Throughput**: Designed for high transactions per second (TPS), making it ideal for large-scale applications.
+- **Interoperability**: Compatible with current blockchain ecosystems, facilitating cross-chain communication.
+- **Security**: Developed in Rust to ensure memory safety and guard against common vulnerabilities like buffer overflows.
+  
 ## Getting Started
 
 ### Prerequisites
