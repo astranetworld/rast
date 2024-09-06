@@ -7,19 +7,22 @@ use reth_config::config::EtlConfig;
 use reth_db::tables;
 use reth_db_api::{database::Database, transaction::DbTxMut, DatabaseError};
 use reth_etl::Collector;
+use reth_node_types::NodeTypesWithDB;
 use reth_primitives::{
     Account, Address, Bytecode, Receipts, StaticFileSegment, StorageEntry, B256, U256,
 };
 use reth_provider::{
-    bundle_state::{BundleStateInit, RevertsInit},
     errors::provider::ProviderResult,
     providers::{StaticFileProvider, StaticFileWriter},
-    BlockHashReader, BlockNumReader, ChainSpecProvider, DatabaseProviderRW, ExecutionOutcome,
-    HashingWriter, HistoryWriter, OriginalValuesKnown, ProviderError, ProviderFactory,
-    StageCheckpointWriter, StateWriter, StaticFileProviderFactory,
+    writer::UnifiedStorageWriter,
+    BlockHashReader, BlockNumReader, BundleStateInit, ChainSpecProvider, DatabaseProviderRW,
+    ExecutionOutcome, HashingWriter, HistoryWriter, OriginalValuesKnown, ProviderError,
+    ProviderFactory, RevertsInit, StageCheckpointWriter, StateWriter, StaticFileProviderFactory,
+    TrieWriter,
 };
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_trie::{IntermediateStateRootState, StateRoot as StateRootComputer, StateRootProgress};
+use reth_trie_db::DatabaseStateRoot;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -64,7 +67,7 @@ pub enum InitDatabaseError {
     #[error(
         "state root mismatch, state dump: {expected_state_root}, computed: {computed_state_root}"
     )]
-    SateRootMismatch {
+    StateRootMismatch {
         /// Expected state root.
         expected_state_root: B256,
         /// Actual state root.
@@ -79,7 +82,9 @@ impl From<DatabaseError> for InitDatabaseError {
 }
 
 /// Write the genesis block if it has not already been written
-pub fn init_genesis<DB: Database>(factory: ProviderFactory<DB>) -> Result<B256, InitDatabaseError> {
+pub fn init_genesis<N: NodeTypesWithDB<ChainSpec = ChainSpec>>(
+    factory: ProviderFactory<N>,
+) -> Result<B256, InitDatabaseError> {
     let chain = factory.chain_spec();
 
     let genesis = chain.genesis();
@@ -122,8 +127,16 @@ pub fn init_genesis<DB: Database>(factory: ProviderFactory<DB>) -> Result<B256, 
         provider_rw.save_stage_checkpoint(stage, Default::default())?;
     }
 
-    provider_rw.commit()?;
-    static_file_provider.commit()?;
+    // Static file segments start empty, so we need to initialize the genesis block.
+    let segment = StaticFileSegment::Receipts;
+    static_file_provider.latest_writer(segment)?.increment_block(0)?;
+
+    let segment = StaticFileSegment::Transactions;
+    static_file_provider.latest_writer(segment)?.increment_block(0)?;
+
+    // `commit_unwind`` will first commit the DB and then the static file provider, which is
+    // necessary on `init_genesis`.
+    UnifiedStorageWriter::commit_unwind(provider_rw, static_file_provider)?;
 
     Ok(hash)
 }
@@ -150,10 +163,17 @@ pub fn insert_state<'a, 'b, DB: Database>(
 
     for (address, account) in alloc {
         let bytecode_hash = if let Some(code) = &account.code {
-            let bytecode = Bytecode::new_raw(code.clone());
-            let hash = bytecode.hash_slow();
-            contracts.insert(hash, bytecode);
-            Some(hash)
+            match Bytecode::new_raw_checked(code.clone()) {
+                Ok(bytecode) => {
+                    let hash = bytecode.hash_slow();
+                    contracts.insert(hash, bytecode);
+                    Some(hash)
+                }
+                Err(err) => {
+                    error!(%address, %err, "Failed to decode genesis bytecode.");
+                    return Err(DatabaseError::Other(err.to_string()).into());
+                }
+            }
         } else {
             None
         };
@@ -201,7 +221,8 @@ pub fn insert_state<'a, 'b, DB: Database>(
         Vec::new(),
     );
 
-    execution_outcome.write_to_storage(provider, None, OriginalValuesKnown::Yes)?;
+    let mut storage_writer = UnifiedStorageWriter::from_database(provider);
+    storage_writer.write_to_storage(execution_outcome, OriginalValuesKnown::Yes)?;
 
     trace!(target: "reth::cli", "Inserted state");
 
@@ -214,8 +235,7 @@ pub fn insert_genesis_hashes<'a, 'b, DB: Database>(
     alloc: impl Iterator<Item = (&'a Address, &'b GenesisAccount)> + Clone,
 ) -> ProviderResult<()> {
     // insert and hash accounts to hashing table
-    let alloc_accounts =
-        alloc.clone().map(|(addr, account)| (*addr, Some(Account::from_genesis_account(account))));
+    let alloc_accounts = alloc.clone().map(|(addr, account)| (*addr, Some(Account::from(account))));
     provider.insert_account_for_hashing(alloc_accounts)?;
 
     trace!(target: "reth::cli", "Inserted account hashes");
@@ -282,7 +302,7 @@ pub fn insert_genesis_header<DB: Database>(
         Ok(None) | Err(ProviderError::MissingStaticFileBlock(StaticFileSegment::Headers, 0)) => {
             let (difficulty, hash) = (header.difficulty, block_hash);
             let mut writer = static_file_provider.latest_writer(StaticFileSegment::Headers)?;
-            writer.append_header(header, difficulty, hash)?;
+            writer.append_header(&header, difficulty, &hash)?;
         }
         Ok(Some(_)) => {}
         Err(e) => return Err(e),
@@ -300,9 +320,9 @@ pub fn insert_genesis_header<DB: Database>(
 /// It's similar to [`init_genesis`] but supports importing state too big to fit in memory, and can
 /// be set to the highest block present. One practical usecase is to import OP mainnet state at
 /// bedrock transition block.
-pub fn init_from_state_dump<DB: Database>(
+pub fn init_from_state_dump<N: NodeTypesWithDB<ChainSpec = ChainSpec>>(
     mut reader: impl BufRead,
-    factory: ProviderFactory<DB>,
+    factory: ProviderFactory<N>,
     etl_config: EtlConfig,
 ) -> eyre::Result<B256> {
     let block = factory.last_block_number()?;
@@ -326,19 +346,19 @@ pub fn init_from_state_dump<DB: Database>(
 
     // compute and compare state root. this advances the stage checkpoints.
     let computed_state_root = compute_state_root(&provider_rw)?;
-    if computed_state_root != expected_state_root {
+    if computed_state_root == expected_state_root {
+        info!(target: "reth::cli",
+            ?computed_state_root,
+            "Computed state root matches state root in state dump"
+        );
+    } else {
         error!(target: "reth::cli",
             ?computed_state_root,
             ?expected_state_root,
             "Computed state root does not match state root in state dump"
         );
 
-        Err(InitDatabaseError::SateRootMismatch { expected_state_root, computed_state_root })?
-    } else {
-        info!(target: "reth::cli",
-            ?computed_state_root,
-            "Computed state root matches state root in state dump"
-        );
+        Err(InitDatabaseError::StateRootMismatch { expected_state_root, computed_state_root })?
     }
 
     // insert sync stages for stages that require state
@@ -461,7 +481,7 @@ fn compute_state_root<DB: Database>(provider: &DatabaseProviderRW<DB>) -> eyre::
             .root_with_progress()?
         {
             StateRootProgress::Progress(state, _, updates) => {
-                let updated_len = updates.write_to_database(tx)?;
+                let updated_len = provider.write_trie_updates(&updates)?;
                 total_flushed_updates += updated_len;
 
                 trace!(target: "reth::cli",
@@ -481,7 +501,7 @@ fn compute_state_root<DB: Database>(provider: &DatabaseProviderRW<DB>) -> eyre::
                 }
             }
             StateRootProgress::Complete(root, _, updates) => {
-                let updated_len = updates.write_to_database(tx)?;
+                let updated_len = provider.write_trie_updates(&updates)?;
                 total_flushed_updates += updated_len;
 
                 trace!(target: "reth::cli",
@@ -528,7 +548,9 @@ mod tests {
     };
     use reth_primitives::{HOLESKY_GENESIS_HASH, MAINNET_GENESIS_HASH, SEPOLIA_GENESIS_HASH};
     use reth_primitives_traits::IntegerList;
-    use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
+    use reth_provider::test_utils::{
+        create_test_provider_factory_with_chain_spec, MockNodeTypesWithDB,
+    };
 
     fn collect_table_entries<DB, T>(
         tx: &<DB as Database>::TX,
@@ -574,7 +596,7 @@ mod tests {
         init_genesis(factory.clone()).unwrap();
 
         // Try to init db with a different genesis block
-        let genesis_hash = init_genesis(ProviderFactory::new(
+        let genesis_hash = init_genesis(ProviderFactory::<MockNodeTypesWithDB>::new(
             factory.into_db(),
             MAINNET.clone(),
             static_file_provider,

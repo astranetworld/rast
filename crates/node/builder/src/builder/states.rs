@@ -8,8 +8,9 @@
 use std::{fmt, future::Future, marker::PhantomData};
 
 use reth_exex::ExExContext;
-use reth_network::NetworkHandle;
-use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypes};
+use reth_node_api::{
+    FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypesWithDB, NodeTypesWithEngine,
+};
 use reth_node_core::{
     node_config::NodeConfig,
     rpc::eth::{helpers::AddDevSigners, FullEthApiServer},
@@ -35,7 +36,7 @@ pub struct NodeBuilderWithTypes<T: FullNodeTypes> {
 
 impl<T: FullNodeTypes> NodeBuilderWithTypes<T> {
     /// Creates a new instance of the node builder with the given configuration and types.
-    pub const fn new(config: NodeConfig, database: T::DB) -> Self {
+    pub const fn new(config: NodeConfig, database: <T::Types as NodeTypesWithDB>::DB) -> Self {
         Self { config, adapter: NodeTypesAdapter::new(database) }
     }
 
@@ -62,12 +63,12 @@ impl<T: FullNodeTypes> NodeBuilderWithTypes<T> {
 /// Container for the node's types and the database the node uses.
 pub struct NodeTypesAdapter<T: FullNodeTypes> {
     /// The database type used by the node.
-    pub database: T::DB,
+    pub database: <T::Types as NodeTypesWithDB>::DB,
 }
 
 impl<T: FullNodeTypes> NodeTypesAdapter<T> {
     /// Create a new adapter from the given node types.
-    pub(crate) const fn new(database: T::DB) -> Self {
+    pub(crate) const fn new(database: <T::Types as NodeTypesWithDB>::DB) -> Self {
         Self { database }
     }
 }
@@ -89,13 +90,8 @@ pub struct NodeAdapter<T: FullNodeTypes, C: NodeComponents<T>> {
     pub provider: T::Provider,
 }
 
-impl<T: FullNodeTypes, C: NodeComponents<T>> NodeTypes for NodeAdapter<T, C> {
-    type Primitives = T::Primitives;
-    type Engine = T::Engine;
-}
-
 impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeTypes for NodeAdapter<T, C> {
-    type DB = T::DB;
+    type Types = T::Types;
     type Provider = T::Provider;
 }
 
@@ -103,6 +99,7 @@ impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<
     type Pool = C::Pool;
     type Evm = C::Evm;
     type Executor = C::Executor;
+    type Network = C::Network;
 
     fn pool(&self) -> &Self::Pool {
         self.components.pool()
@@ -120,11 +117,11 @@ impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<
         &self.provider
     }
 
-    fn network(&self) -> &NetworkHandle {
+    fn network(&self) -> &Self::Network {
         self.components.network()
     }
 
-    fn payload_builder(&self) -> &PayloadBuilderHandle<T::Engine> {
+    fn payload_builder(&self) -> &PayloadBuilderHandle<<T::Types as NodeTypesWithEngine>::Engine> {
         self.components.payload_builder()
     }
 
@@ -273,9 +270,12 @@ impl<T, CB, AO> NodeBuilderWithComponents<T, CB, AO>
 where
     T: FullNodeTypes,
     CB: NodeComponentsBuilder<T>,
-    AO: NodeAddOns<NodeAdapter<T, CB::Components>>,
-    AO::EthApi:
-        EthApiBuilderProvider<NodeAdapter<T, CB::Components>> + FullEthApiServer + AddDevSigners,
+    AO: NodeAddOns<
+        NodeAdapter<T, CB::Components>,
+        EthApi: EthApiBuilderProvider<NodeAdapter<T, CB::Components>>
+                    + FullEthApiServer
+                    + AddDevSigners,
+    >,
 {
     /// Launches the node with the given launcher.
     pub async fn launch_with<L>(self, launcher: L) -> eyre::Result<L::Node>

@@ -1,20 +1,23 @@
 use std::{marker::PhantomData, pin::Pin};
 
+use alloy_network::Network;
 use alloy_rpc_types::BlockNumberOrTag;
 use eyre::Ok;
 use futures_util::Future;
 use reth::{
     api::{BuiltPayload, EngineTypes, FullNodeComponents, PayloadBuilderAttributes},
     builder::FullNode,
-    payload::PayloadTypes,
+    network::PeersHandleProvider,
     providers::{BlockReader, BlockReaderIdExt, CanonStateSubscriptions, StageCheckpointReader},
     rpc::{
         api::eth::helpers::{EthApiSpec, EthTransactions, TraceExt},
         types::engine::PayloadStatusEnum,
     },
 };
-use reth_node_builder::{NodeAddOns, NodeTypes};
+use reth_chainspec::ChainSpec;
+use reth_node_builder::{EthApiTypes, NodeAddOns, NodeTypesWithEngine};
 use reth_primitives::{BlockHash, BlockNumber, Bytes, B256};
+use reth_rpc_types::WithOtherFields;
 use reth_stages_types::StageId;
 use tokio_stream::StreamExt;
 
@@ -24,21 +27,30 @@ use crate::{
 };
 
 /// An helper struct to handle node actions
+#[allow(missing_debug_implementations)]
 pub struct NodeTestContext<Node, AddOns>
 where
     Node: FullNodeComponents,
     AddOns: NodeAddOns<Node>,
 {
+    /// The core structure representing the full node.
     pub inner: FullNode<Node, AddOns>,
-    pub payload: PayloadTestContext<Node::Engine>,
-    pub network: NetworkTestContext,
-    pub engine_api: EngineApiTestContext<Node::Engine>,
+    /// Context for testing payload-related features.
+    pub payload: PayloadTestContext<<Node::Types as NodeTypesWithEngine>::Engine>,
+    /// Context for testing network functionalities.
+    pub network: NetworkTestContext<Node::Network>,
+    /// Context for testing the Engine API.
+    pub engine_api: EngineApiTestContext<<Node::Types as NodeTypesWithEngine>::Engine>,
+    /// Context for testing RPC features.
     pub rpc: RpcTestContext<Node, AddOns::EthApi>,
 }
 
-impl<Node, AddOns> NodeTestContext<Node, AddOns>
+impl<Node, Engine, AddOns> NodeTestContext<Node, AddOns>
 where
+    Engine: EngineTypes,
     Node: FullNodeComponents,
+    Node::Types: NodeTypesWithEngine<ChainSpec = ChainSpec, Engine = Engine>,
+    Node::Network: PeersHandleProvider,
     AddOns: NodeAddOns<Node>,
 {
     /// Creates a new test node
@@ -52,14 +64,14 @@ where
             engine_api: EngineApiTestContext {
                 engine_api_client: node.auth_server_handle().http_client(),
                 canonical_stream: node.provider.canonical_state_stream(),
-                _marker: PhantomData::<Node::Engine>,
+                _marker: PhantomData::<Engine>,
             },
             rpc: RpcTestContext { inner: node.rpc_registry },
         })
     }
 
     /// Establish a connection to the node
-    pub async fn connect(&mut self, node: &mut NodeTestContext<Node, AddOns>) {
+    pub async fn connect(&mut self, node: &mut Self) {
         self.network.add_peer(node.network.record()).await;
         node.network.next_session_established().await;
         self.network.next_session_established().await;
@@ -72,18 +84,14 @@ where
         &mut self,
         length: u64,
         tx_generator: impl Fn(u64) -> Pin<Box<dyn Future<Output = Bytes>>>,
-        attributes_generator: impl Fn(u64) -> <Node::Engine as PayloadTypes>::PayloadBuilderAttributes
-            + Copy,
-    ) -> eyre::Result<
-        Vec<(
-            <Node::Engine as PayloadTypes>::BuiltPayload,
-            <Node::Engine as PayloadTypes>::PayloadBuilderAttributes,
-        )>,
-    >
+        attributes_generator: impl Fn(u64) -> Engine::PayloadBuilderAttributes + Copy,
+    ) -> eyre::Result<Vec<(Engine::BuiltPayload, Engine::PayloadBuilderAttributes)>>
     where
-        <Node::Engine as EngineTypes>::ExecutionPayloadV3:
-            From<<Node::Engine as PayloadTypes>::BuiltPayload> + PayloadEnvelopeExt,
+        <Engine as EngineTypes>::ExecutionPayloadV3:
+            From<Engine::BuiltPayload> + PayloadEnvelopeExt,
         AddOns::EthApi: EthApiSpec + EthTransactions + TraceExt,
+        <AddOns::EthApi as EthApiTypes>::NetworkTypes:
+            Network<TransactionResponse = WithOtherFields<alloy_rpc_types::Transaction>>,
     {
         let mut chain = Vec::with_capacity(length as usize);
         for i in 0..length {
@@ -104,14 +112,11 @@ where
     /// It triggers the resolve payload via engine api and expects the built payload event.
     pub async fn new_payload(
         &mut self,
-        attributes_generator: impl Fn(u64) -> <Node::Engine as PayloadTypes>::PayloadBuilderAttributes,
-    ) -> eyre::Result<(
-        <<Node as NodeTypes>::Engine as PayloadTypes>::BuiltPayload,
-        <<Node as NodeTypes>::Engine as PayloadTypes>::PayloadBuilderAttributes,
-    )>
+        attributes_generator: impl Fn(u64) -> Engine::PayloadBuilderAttributes,
+    ) -> eyre::Result<(Engine::BuiltPayload, Engine::PayloadBuilderAttributes)>
     where
-        <Node::Engine as EngineTypes>::ExecutionPayloadV3:
-            From<<Node::Engine as PayloadTypes>::BuiltPayload> + PayloadEnvelopeExt,
+        <Engine as EngineTypes>::ExecutionPayloadV3:
+            From<Engine::BuiltPayload> + PayloadEnvelopeExt,
     {
         // trigger new payload building draining the pool
         let eth_attr = self.payload.new_payload(attributes_generator).await.unwrap();
@@ -129,14 +134,11 @@ where
     pub async fn advance_block(
         &mut self,
         versioned_hashes: Vec<B256>,
-        attributes_generator: impl Fn(u64) -> <Node::Engine as PayloadTypes>::PayloadBuilderAttributes,
-    ) -> eyre::Result<(
-        <Node::Engine as PayloadTypes>::BuiltPayload,
-        <<Node as NodeTypes>::Engine as PayloadTypes>::PayloadBuilderAttributes,
-    )>
+        attributes_generator: impl Fn(u64) -> Engine::PayloadBuilderAttributes,
+    ) -> eyre::Result<(Engine::BuiltPayload, Engine::PayloadBuilderAttributes)>
     where
-        <Node::Engine as EngineTypes>::ExecutionPayloadV3:
-            From<<Node::Engine as PayloadTypes>::BuiltPayload> + PayloadEnvelopeExt,
+        <Engine as EngineTypes>::ExecutionPayloadV3:
+            From<Engine::BuiltPayload> + PayloadEnvelopeExt,
     {
         let (payload, eth_attr) = self.new_payload(attributes_generator).await?;
 
@@ -182,14 +184,16 @@ where
                     assert_eq!(latest_block.hash_slow(), expected_block_hash);
                     break
                 }
-                if wait_finish_checkpoint {
-                    panic!("Finish checkpoint matches, but could not fetch block.");
-                }
+                assert!(
+                    !wait_finish_checkpoint,
+                    "Finish checkpoint matches, but could not fetch block."
+                );
             }
         }
         Ok(())
     }
 
+    /// Waits for the node to unwind to the given block number
     pub async fn wait_unwind(&self, number: BlockNumber) -> eyre::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
