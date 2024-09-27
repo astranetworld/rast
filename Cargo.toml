@@ -10,6 +10,7 @@ exclude = [".github/"]
 [workspace]
 members = [
     "bin/rast/",
+    "crates/ast/primitives",
     "crates/primitives/",
     "crates/primitives-traits/",
     "crates/chainspec/",
@@ -24,11 +25,12 @@ members = [
     "crates/rpc/rpc-eth-types",
     "crates/ethereum/payload",
     "crates/consensus/auto-seal",
+    "crates/clique",
     "crates/engine/util",
     "crates/rpc/rpc-eth-api",
     "crates/exex/exex",
     "crates/net/peers"
-]
+, "crates/ast/primitives"]
 default-members = ["bin/rast"]
 
 
@@ -184,6 +186,10 @@ reth-network-peers = { path = "crates/net/peers"}
 alloy-genesis = { path = "./crates/alloy-genesis" }
 
 [workspace.dependencies]
+# for ast
+rast-primitives = { path = "crates/ast/primitives" }
+blst = "0.3.11"
+clique={path="crates/clique"}
 
 reth-auto-seal-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.5" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.5" }
