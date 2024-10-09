@@ -534,13 +534,12 @@ impl<TX: DbTx> DatabaseProvider<TX> {
                             .unwrap_or_default()
                     };
                 // lytest
-                let is_beijing_active=false;
-                let verifiers=if is_beijing_active{
+                let verifiers=if self.chain_spec.is_beijing_active_at_timestamp(header_ref.timestamp){
                     Some(verifiers_cursor.seek_exact(header_ref.number)?.map(|(_,w)|w.verifiers).unwrap_or_default(),)
                 }else{
                     None
                 };
-                let rewards=if is_beijing_active{
+                let rewards=if self.chain_spec.is_beijing_active_at_timestamp(header_ref.timestamp){
                     Some(rewards_cursor.seek_exact(header_ref.number)?.map(|(_,w)|w.rewards).unwrap_or_default(),)
                 }else{
                     None
@@ -787,7 +786,7 @@ impl<TX: DbTx> DatabaseProvider<TX> {
             }
 
             // todo: Determine the validity of these two fields based on `header.timestamp`, currently set all to None.
-            let beijing_is_active=false;
+            let beijing_is_active=self.chain_spec.is_beijing_active_at_timestamp(header.timestamp);
             let mut verifiers=Some(Verifiers::default());
             let mut rewards=Some(Rewards::default());
             if beijing_is_active{
@@ -1522,7 +1521,7 @@ impl<TX: DbTxMut + DbTx> DatabaseProvider<TX> {
             }
 
             // Determine whether the block has enabled the `verifiers` and `rewards` fields based on the block header timestamp.
-            let beijing_is_active=false;
+            let beijing_is_active=self.chain_spec.is_beijing_active_at_timestamp(header.timestamp);
             let mut verifiers=Some(Verifiers::default());
             let mut rewards=Some(Rewards::default());
             if beijing_is_active{
@@ -2544,11 +2543,7 @@ impl<TX: DbTx> RequestsProvider for DatabaseProvider<TX> {
 
 impl<TX:DbTx> VerifiersProvider for DatabaseProvider<TX>{
     fn verifiers_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Verifiers>>{
-        let mut is_beijing_active=false;
-        if timestamp>0 {
-            is_beijing_active=false;// todo: Add a check using the `timestamp`.
-        }
-        if is_beijing_active{
+        if self.chain_spec.is_beijing_active_at_timestamp(timestamp){
             if let Some(number)=self.convert_hash_or_number(id)?{
                 let verifiers=self.tx.get::<tables::BlockVerifiers>(number).map(|w|w.map(|w|w.verifiers))?.unwrap_or_default();
                 return Ok(Some(verifiers))
@@ -2560,11 +2555,7 @@ impl<TX:DbTx> VerifiersProvider for DatabaseProvider<TX>{
 
 impl<TX:DbTx> RewardsProvider for DatabaseProvider<TX>{
     fn rewards_by_block(&self,id:BlockHashOrNumber,timestamp:u64,)->ProviderResult<Option<Rewards>>{
-        let mut is_beijing_active=false;
-        if timestamp>0 {
-            is_beijing_active=false;// todo: Add a check using the `timestamp`.
-        }
-        if is_beijing_active{
+        if self.chain_spec.is_beijing_active_at_timestamp(timestamp){
             if let Some(number)=self.convert_hash_or_number(id)?{
                 let rewards=self.tx.get::<tables::BlockRewards>(number).map(|w|w.map(|w|w.rewards))?.unwrap_or_default();
                 return Ok(Some(rewards))

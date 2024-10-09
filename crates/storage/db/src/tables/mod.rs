@@ -26,7 +26,8 @@ use reth_db_api::{
         client_version::ClientVersion,
         storage_sharded_key::StorageShardedKey,
         CompactU256, ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals,
-        StoredBlockVerifiers,StoredBlockRewards, StoredAposSnapshot,
+        StoredBlockVerifiers,StoredBlockRewards, 
+        // StoredAposSnapshot,
     },
     table::{Decode, DupSort, Encode, Table},
 };
