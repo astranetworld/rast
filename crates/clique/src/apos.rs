@@ -1,20 +1,13 @@
 
-use hex_literal::hex;
-use ethereum_types::U256;
-use k256::Secp256k1;
+use alloy_primitives::{U256, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address};
 
-use reth_primitives::{SealedBlock, SealedHeader};
-// use secp256k1::ffi::NonceFn;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 
 use std::error::Error;
+use std::hash::Hash;
 use std::time::Duration;
-use lru_cache::LruCache;
-use ethereum_types::H256;
-use keccak_hash::keccak256;
-use secp256k1::{PublicKey, Message};
 use std::time::SystemTime;
 
 use alloy_genesis::ChainConfig;
@@ -22,27 +15,35 @@ use std::time:: UNIX_EPOCH;
 use std::sync::mpsc::{Sender, Receiver};
 use blst::min_sig::Signature;
 use blst::min_sig::PublicKey as OtherPublicKey;
-use sha3::{Digest, Keccak256};
+
 use std::io::Cursor;
 use std::io::{self, Write};
+
+
+use reth_primitives::{Block, SealedBlock, SealedHeader};
+use tracing::{info, debug, error};
+use rast_primitives::{APosConfig, Snapshot};
+
+use reth_primitives_traits::Header;
+use reth_primitives::public_key_to_address;
+use reth_provider::{BlockReader, ChainSpecProvider, EvmEnvProvider, StateProviderFactory, HeaderProvider};
+
+use secp256k1::{ecdsa, Secp256k1};
+use secp256k1::ecdsa::{PublicKey, Message, RecoverableSignature, RecoveryId, SECP256K1};
+use secp256k1::Error as SecpError;
+use sha2::digest::consts::U2;
+use reth_primitives::bytes::Bytes;
+
+use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
+use bytes::BufMut;
+use rand::prelude::SliceRandom;
 use rlp::RlpStream;
-use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-// use tiny_keccak::{Keccak, Hasher};
-
-
-use crate::snapshot::{APosConfig, Snapshot,Hash,ADDRESS_LENGTH};
-use crate::snapshot::Address;
-use crate::ast_consensus::{DIFF_IN_TURN,DIFF_NO_TURN};
-use crate::traits::{Api, ChainHeaderReader, ChainReader, Engine};
-use crate::api::API;
-use crate::traits::API as OtherAPI;
-
-
+use reth_chainspec::ChainSpec;
 
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
-const INMEMORY_SNAPSHOTS: usize = 128; // Number of recent vote snapshots to keep in memory
-const INMEMORY_SIGNATURES: usize = 4096; // Number of recent block signatures to keep in memory
+const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
+const INMEMORY_SIGNATURES: u32 = 4096; // Number of recent block signatures to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
 const MERGE_SIGN_MIN_TIME: u64 = 4; // min time for merge sign
@@ -52,7 +53,9 @@ const MERGE_SIGN_MIN_TIME: u64 = 4; // min time for merge sign
 pub const EPOCH_LENGTH: u64 = 30000; // Default number of blocks after which to checkpoint and reset the pending votes
 
 pub const EXTRA_VANITY: usize = 32; // Fixed number of extra-data prefix bytes reserved for signer vanity
-pub const EXTRA_SEAL: usize = 64 + 1; // Fixed number of extra-data suffix bytes reserved for signer seal
+///  indicates the byte length required to carry a signature with recovery id.
+///  Fixed number of extra-data suffix bytes reserved for signer seal
+pub const SIGNATURE_LENGTH: usize = 64 + 1;
 
 pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
@@ -67,118 +70,159 @@ pub type BlockNonce = [u8; 8];
 
 
 #[derive(Debug, Clone)]
-pub struct SnapshotError {
-    msg: String,
+pub enum AposError {
+    UnknownBlock,
+    InvalidCheckpointBeneficiary,
+    InvalidVote,
+    InvalidCheckpointVote,
+    MissingVanity,
+    MissingSignature,
+    ExtraSigners,
+    InvalidCheckpointSigners,
+    MismatchingCheckpointSigners,
+    InvalidMixDigest,
+    InvalidUncleHash,
+    InvalidDifficulty,
+    WrongDifficulty,
+    InvalidTimestamp,
+    InvalidVotingChain,
+    UnauthorizedSigner,
+    RecentlySigned,
 }
 
-impl SnapshotError {
-    fn new(msg: &str) -> SnapshotError {
-        SnapshotError {
-            msg: msg.to_string(),
-        }
+impl std::fmt::Display for AposError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                AposError::UnknownBlock => "unknown block",
+                AposError::InvalidCheckpointBeneficiary => "beneficiary in checkpoint block non-zero",
+                AposError::InvalidVote => "vote nonce not 0x00..0 or 0xff..f",
+                AposError::InvalidCheckpointVote => "vote nonce in checkpoint block non-zero",
+                AposError::MissingVanity => "extra-data 32 byte vanity prefix missing",
+                AposError::MissingSignature => "extra-data 65 byte signature suffix missing",
+                AposError::ExtraSigners => "non-checkpoint block contains extra signer list",
+                AposError::InvalidCheckpointSigners => "invalid signer list on checkpoint block",
+                AposError::MismatchingCheckpointSigners => "mismatching signer list on checkpoint block",
+                AposError::InvalidMixDigest => "non-zero mix digest",
+                AposError::InvalidUncleHash => "non-empty uncle hash",
+                AposError::InvalidDifficulty => "invalid difficulty",
+                AposError::WrongDifficulty => "wrong difficulty",
+                AposError::InvalidTimestamp => "invalid timestamp",
+                AposError::InvalidVotingChain => "invalid voting chain",
+                AposError::UnauthorizedSigner => "unauthorized signer",
+                AposError::RecentlySigned => "recently signed",
+            }
+        )
     }
 }
 
-impl fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.msg)
-    }
-}
+impl Error for AposError {}
 
-impl Error for SnapshotError {}
-
-
-pub const ERR_UNKNOWN_BLOCK: &str = "unknown block";
-pub const ERR_INVALID_CHECKPOINT_BENEFICIARY: &str = "beneficiary in checkpoint block non-zero";
-pub const ERR_INVALID_VOTE: &str = "vote nonce not 0x00..0 or 0xff..f";
-pub const ERR_INVALID_CHECKPOINT_VOTE: &str = "vote nonce in checkpoint block non-zero";
-pub const ERR_MISSING_VANITY: &str = "extra-data 32 byte vanity prefix missing";
-pub const ERR_MISSING_SIGNATURE: &str = "extra-data 65 byte signature suffix missing";
-pub const ERR_EXTRA_SIGNERS: &str = "non-checkpoint block contains extra signer list";
-pub const ERR_INVALID_CHECKPOINT_SIGNERS: &str = "invalid signer list on checkpoint block";
-pub const ERR_MISMATCHING_CHECKPOINT_SIGNERS: &str = "mismatching signer list on checkpoint block";
-pub const ERR_INVALID_MIX_DIGEST: &str = "non-zero mix digest";
-pub const ERR_INVALID_UNCLE_HASH: &str = "non empty uncle hash";
-pub const ERR_INVALID_DIFFICULTY: &str = "invalid difficulty";
-pub const ERR_WRONG_DIFFICULTY: &str = "wrong difficulty";
-pub const ERR_INVALID_TIMESTAMP: &str = "invalid timestamp";
-pub const ERR_INVALID_VOTING_CHAIN: &str = "invalid voting chain";
-pub const ERR_UNAUTHORIZED_SIGNER: &str = "unauthorized signer";
-pub const ERR_RECENTLY_SIGNED: &str = "recently signed";
 
 
 pub type SignerFn = fn(signer: String, mime_type: &str, message: &[u8]) -> Result<Vec<u8>, Box<dyn Error>>;
 
 
-// ecrecover extracts the Ethereum account address from a signed header.
-pub fn ecrecover(header: &SealedHeader, sigcache: &mut LruCache<H256, Address>) -> Result<Address, &'static str> {
-    // If the signature's already cached, return that
-    let hash = header.hash();
-    if let Some(address) = sigcache.get(&hash) {
-        return Ok(*address);
+#[derive(Debug)]
+pub enum RecoveryError {
+    MissingSignature,
+    InvalidMessage,
+    InvalidRecoveryId,
+    InvalidSignatureFormat,
+    FailedToRecoverPublicKey,
+    EcdsaError(SecpError),
+
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryError::MissingSignature => write!(f, "Missing signature"),
+            RecoveryError::InvalidMessage => write!(f, "Invalid message"),
+            RecoveryError::InvalidRecoveryId => write!(f, "Invalid recovery ID"),
+            RecoveryError::InvalidSignatureFormat => write!(f, "Invalid signature format"),
+            RecoveryError::FailedToRecoverPublicKey => write!(f, "Failed to recover public key"),
+            RecoveryError::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
+        }
     }
+}
+
+impl From<SecpError> for RecoveryError {
+    fn from(err: SecpError) -> RecoveryError {
+        RecoveryError::EcdsaError(err)
+    }
+}
+
+impl std::error::Error for RecoveryError {}
+
+
+// recover_address extracts the Ethereum account address from a signed header.
+pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
+    // If the signature's already cached, return that
+    // let hash = header.hash_slow();
+    // sigcache: &mut schnellru::LruMap<B256, Address>
+    // if let Some(address) = sigcache.get(&hash) {
+    //     return Ok(*address);
+    // }
 
     // Retrieve the signature from the header extra-data
-    if header.extra.len() < EXTRA_SEAL {
-        return Err("Missing signature");
+    if header.extra_data.len() < SIGNATURE_LENGTH {
+        return Err(Box::new(RecoveryError::MissingSignature));
     }
-    let signature = &header.extra_data[header.extra.len() - EXTRA_SEAL..];
+    let signature = &header.extra_data[header.extra_data.len() - SIGNATURE_LENGTH..];
 
-    let secp = Secp256k1::new();
     // Recover the public key and the Ethereum address
-    let message = Message::parse_slice(&seal_hash(header).0).map_err(|_| "Invalid message")?;
-    let recovery_id = RecoveryId::parse(signature[64]).map_err(|_| "Invalid recovery ID")?;
-    let recoverable_sig = RecoverableSignature::from_compact(&signature[0..64], recovery_id).map_err(|_| "Invalid signature format")?;
-    // let pubkey = recover(&message, &signature[..64], &recovery_id).map_err(|_| "Failed to recover public key")?;
-    let pubkey = secp.recover_ecdsa(&message, &recoverable_sig).map_err(|_| "Failed to recover public key")?;
+    let message = Message::from(seal_hash(header));
 
-    let pubkey_serialized = PublicKey::serialize_uncompressed(&pubkey);
+    let signature = RecoverableSignature::from_compact(
+        &signature[..64],
+        RecoveryId::from_i32(signature[64] as i32)?,
+    )?;
 
-    // Compute the Ethereum address
-    let mut signer = [0u8; 20];
-    signer.copy_from_slice(&keccak256(&mut pubkey_serialized[1..])[12..]);
 
-    let address = Address::from(signer);
-
-    // Cache the address
-    sigcache.put(hash, address);
-
-    Ok(address)
+    Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
 }
 
 
 // APos is the proof-of-authority consensus engine proposed to support the
 // Ethereum testnet following the Ropsten attacks.
-pub struct APos {
-    config: Arc<APosConfig>,          // Consensus engine configuration parameters
-    chain_config: Arc<ChainConfig>,    
-    db: Arc<dyn KeyValueDB>,           // Database to store and retrieve snapshot checkpoints        
+pub struct APos<T, Provider>
+where
+    Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
+{
 
-    recents: Arc<RwLock<LruCache<u64, Snapshot>>>,    // Snapshots for recent block to speed up reorgs
-    signatures: Arc<RwLock<LruCache<u64, Vec<u8>>>>,    // Signatures of recent blocks to speed up mining
+    config: Arc<APosConfig>,          // Consensus engine configuration parameters
+    /// Chain spec
+    chain_spec: Arc<ChainSpec>,
+
+    recents: schnellru::LruMap<u64, Snapshot<T>>,    // Snapshots for recent block to speed up reorgs
+    signatures: schnellru::LruMap<u64, Vec<u8>>,    // Signatures of recent blocks to speed up mining
 
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
 
-    signer: Arc<RwLock<Address>>, // Ethereum address of the signing key
+    signer: Address, // Ethereum address of the signing key
     sign_fn: SignerFn,              // Signer function to authorize hashes with
     lock: Arc<RwLock<()>>,               // Protects the signer and proposals fields
 
-   	// The fields below are for testing only
-    fake_diff: bool, 
-
-    // bc: Arc<dyn Blockchain>, 
+    //
+    //  Provider,
+    provider: Provider,
 }
 
 
 // New creates a APos proof-of-authority consensus engine with the initial
 // signers set to the ones provided by the user.
-impl APos{
+impl<T, Provider> APos<T, Provider>
+where
+    Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
+{
     pub fn new(
         	// Set any missing consensus parameters to their defaults
         config: APosConfig,
-        db: Arc<dyn KeyValueDB>,
-        chain_config: Arc<ChainConfig>,
-    ) -> Arc<Engine> {
+        chain_config: ChainConfig,
+    ) -> Arc<dyn Engine> {
         
         let mut conf = config.clone();
         if conf.epoch == 0 {
@@ -186,57 +230,47 @@ impl APos{
         }
 
         // GenesisAlloc the snapshot caches and create the engine
-        let recents = Arc::new(RwLock::new(LruCache::new(INMEMORY_SNAPSHOTS)));
-        let signatures = Arc::new(RwLock::new(LruCache::new(INMEMORY_SIGNATURES)));
+        let recents =schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
+        let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         
         Arc::new(APos {
             config: Arc::new(conf),
-            chain_config,
-            db,
+            chain_spec: chain_config,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: todo!(),
             sign_fn: todo!(),
-            lock: todo!(),
-            fake_diff: todo!(),
         })
     }
 
 
-
+    /// snapshot retrieves the authorization snapshot at a given point in time.
     pub async fn snapshot(
-        &self,
-        chain: Arc<dyn ChainHeaderReader>,
+        &mut self,
         mut number: u64,
-        mut hash: Hash,
-        mut parents: SealedHeader,
-    ) -> Result<Arc<Snapshot>, Box<dyn Error>> {
-        let mut headers: Vec<Box<SealedHeader>> = Vec::new();
-        let mut snap: Option<Arc<Snapshot>> = None;
+        mut hash: B256,
+        mut parents: Option(Vec<Header>),
+    ) -> Result<Snapshot<T>, Box<dyn Error>> {
+        let mut headers: Vec<Header> = Vec::new();
+        let mut snap: Snapshot<T>;
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
-            if let Some(cached_snap) = self.recents.read().unwrap().get(&hash) {
-                snap = Some(cached_snap.clone());
+            if let Some(cached_snap) = self.recents.get(&hash) {
+                snap = cached_snap.clone();
                 break;
             }
 
            //Attempt to obtain a snapshot from the disk
             if number % CHECKPOINT_INTERVAL == 0 {
                 //Load snapshot using database transaction
-                let load_result = self.db.read().unwrap().view(|tx| {
-                    if let Ok(s) = Snapshot::load_snapshot(&self.config, &self.signatures, tx, &hash) {
-                        snap = Some(s);
-                        Ok(())
-                    } else {
-                        Err("Failed to load snapshot from disk".into())
-                    }
-                });
-
-                if load_result.is_ok() {
+                if let Ok(s) = load_snapshot(&self.config, &self.signatures, &hash) {
+                    snap = s;
                     break;
+                } else {
+
                 }
             }
 
@@ -244,34 +278,26 @@ impl APos{
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            let h = chain.get_header_by_number(&(number - 1).into());
-            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || h.is_none())) {
-                if let Some(checkpoint) = chain.get_header_by_number(number.into()) {
-                    let raw_checkpoint = checkpoint.as_any().downcast_ref::<SealedHeader>().unwrap();
-                    let hash = checkpoint.hash();
+            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
+                if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
+                    let hash = checkpoint.hash_slow();
             
                     //Calculate the list of signatories
-                    let extra_data = &raw_checkpoint.extra;
-                    let signers_count = (extra_data.len() - EXTRA_VANITY - EXTRA_SEAL) / ADDRESS_LENGTH;
+                    let signers_count = (checkpoint.extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
+
                     let mut signers = Vec::with_capacity(signers_count);
             
                     for i in 0..signers_count {
-                        let start = EXTRA_VANITY + i * ADDRESS_LENGTH;
-                        let end = start + ADDRESS_LENGTH;
-                        let mut address = [0u8; ADDRESS_LENGTH];
-                        address.copy_from_slice(&extra_data[start..end]);
-                        signers.push(Address::from(address));
+                        let start = EXTRA_VANITY + i * Address::len_bytes();
+                        let end = start + Address::len_bytes();
+                        signers.push(Address::from_slice(&checkpoint.extra_data[start..end]));
                     }
             
                    
-                    let new_snapshot = Snapshot::new(self.config.clone(), self.signatures.clone(), number, hash, signers);
-            
-                    //Store snapshot to database
-                    if let Err(err) = self.db.update(|tx| new_snapshot.store(tx)) {
-                        return Err(err);
-                    }
-            
-                    log::info!(
+                    let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers, F);
+
+                    // new_snapshot.store();
+                    info!(
                         "Stored checkpoint snapshot to disk, number: {}, hash: {}",
                         number,
                         hash
@@ -281,19 +307,20 @@ impl APos{
             }
 
                     
-            let mut header: Box<SealedHeader>;
 
-            //If there is a clear parent node, select from it (enforce)
-            if !parents.is_empty() {
-                //Select from parent node (mandatory execution)
-                header = parents.pop().expect("Parents list is not empty");
-                if header.hash() != hash || header.number64() != number {
+            // No snapshot for this header, gather the header and move backward
+            let header = if parents.is_some() > 0 {
+                // If we have explicit parents, pick from there (enforced)
+                let header = parents.pop().unwrap();
+                if header.hash_slow() != hash || header.number64() != number {
                     return Err(Error::UnknownBlock);
                 }
+                header
             } else {
-               //Without a clear parent node (or no more), retrieve from the database
-                header = chain.get_header(hash, &number.into()).ok_or(Error::UnknownBlock)?;
-            }
+                //Without a clear parent node (or no more), retrieve from the database
+                let header = self.provider.header_by_hash_or_number(hash.into())?;
+                Some(header)
+            };
 
             headers.push(header);
             number -= 1;
@@ -306,25 +333,13 @@ impl APos{
             headers.swap(i, headers.len() - 1 - i);
         }
 
-        let (snap, err) = snap.apply(&headers);
-        if let Err(e) = err {
-            return Err(e);
-        }
+        let snap = snap.apply(&headers)?;
+        self.recents.add(snap.hash, &snap);
 
-        self.recents.add(snap.hash(), snap);
-
-//If a new checkpoint snapshot is generated, save it to disk
+        ///If a new checkpoint snapshot is generated, save it to disk
         if snap.number % CHECKPOINT_INTERVAL == 0 && !headers.is_empty() {
-            if let Err(err) = self.db.update(|tx| {
-                if let Err(e) = snap.store(tx) {
-                    return Err(e);
-                }
-                Ok(())
-            }).await {
-                return Err(err);
-            }
-
-            log::debug!(
+            save_snapshot(&snap)?;
+            debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",
                 snap.number,
                 snap.hash
@@ -334,23 +349,26 @@ impl APos{
         Ok(snap)
     }
 
+    /// verifySeal checks whether the signature contained in the header satisfies the
+    /// consensus protocol requirements. The method accepts an optional list of parent
+    /// headers that aren't yet part of the local blockchain to generate the snapshots
+    /// from.
     pub fn verify_seal(
         self,
-        snap: &Snapshot,
-        h: SealedHeader,
-        parents: SealedHeader,
+        snap: &Snapshot<T>,
+        header: Header,
+        parents: Header,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 检查 genesis block
-        let header = h.as_any().downcast_ref::<SealedHeader>().ok_or(ERR_UNKNOWN_BLOCK)?;
-        let number = header.number.as_u64();
-        if number == 0 {
+
+        // Verifying the genesis block is not supported
+        if header.number == 0 {
             return Err(Box::new(ERR_UNKNOWN_BLOCK));
         }
 
         //Analyze the signer and check if they are in the signer list
-        let signer = ecrecover(header, &self.signatures)?;
-        if !snap.signers.contains_key(&signer) {
-            log::info!("err signer: {}", signer);
+        let signer = recover_address(&header)?;
+        if !snap.signers.contains(&signer) {
+            info!("err signer: {}", signer);
             return Err(Box::new(ERR_UNAUTHORIZED_SIGNER));
         }
 
@@ -359,48 +377,40 @@ impl APos{
             if *recent == signer {
                 //If the signer is in the recent list, ensure that the current block can be removed
                 let limit = (snap.signers.len() as u64 / 2) + 1;
-                if *seen > number - limit {
+                if *seen > header.number - limit {
                     return Err(Box::new(ERR_RECENTLY_SIGNED));
                 }
             }
         }
 
-       //Ensure that the difficulty corresponds to the signer's round
-        if !self.fake_diff {
-            let in_turn = snap.inturn(number, &signer);
-            if in_turn && header.difficulty != *diff_in_turn {
-                return Err(Box::new(ERR_WRONG_DIFFICULTY));
-            }
-            if !in_turn && header.difficulty != *diff_in_turn {
-                return Err(Box::new(ERR_WRONG_DIFFICULTY));
-            }
+       ///Ensure that the difficulty corresponds to the signer's round
+        let in_turn = snap.inturn(header.number, &signer);
+        if in_turn && header.difficulty != *diff_in_turn {
+            return Err(Box::new(ERR_WRONG_DIFFICULTY));
+        }
+        if !in_turn && header.difficulty != *diff_in_turn {
+            return Err(Box::new(ERR_WRONG_DIFFICULTY));
         }
 
         Ok(())
     }
 
-
-    pub fn prepare(
-        &self,
-        chain: &dyn ChainHeaderReader,
-        header: &mut SealedHeader,
+    /// Prepare implements consensus.Engine, preparing all the consensus fields of the
+    /// header for running the transactions on top.
+    pub async fn prepare(
+        &mut self,
+        header: &mut Header,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // let raw_header = header.as_any_mut().downcast_mut::<SealedHeader>().ok_or("Invalid header type")?;
-
-        let raw_header = header;
-
       
        //If the block is not a checkpoint, vote randomly
-        raw_header.coinbase = Address::default();
-        raw_header.nonce = BlockNonce::default();
+        header.beneficiary = Address::default();
+        header.nonce = 0;
 
-        let number = raw_header.number.as_u64();
 
         //Assemble voting snapshots to check which votes are meaningful
-        let snap = self.snapshot(chain, number - 1, raw_header.parent_hash, &[])?;
+        let snap = self.snapshot(header.number - 1, header.parent_hash, None).await.unwrap();
 
-        self.lock.read().unwrap();
-        if number %self.config.epoch != 0 {
+        if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
             let mut addresses: Vec<Address> = self.proposals.iter()
                 .filter(|(address, &authorize)| self.valid_vote(address, authorize))
@@ -409,14 +419,14 @@ impl APos{
             
             //If there are proposals to be voted on, proceed with the vote
             if !addresses.is_empty() {
-                let random_index = rand::thread_rng().gen_range(0..addresses.len());
-                raw_header.coinbase = addresses[random_index];
+                // let mut rng = ;
+                header.beneficiary = addresses.choose(&mut rand::thread_rng());
 
-                if let Some(&authorize) = self.proposals.get(&raw_header.coinbase) {
+                if let Some(&authorize) = self.proposals.get(header.beneficiary) {
                     if authorize {
-                        raw_header.nonce.copy_from_slice(&NONCE_AUTH_VOTE);
+                        header.nonce = NONCE_AUTH_VOTE.clone();
                     } else {
-                        raw_header.nonce.copy_from_slice(&NONCE_DROP_VOTE);
+                        header.nonce = NONCE_DROP_VOTE.clone();
                     }
                 }
             }
@@ -424,39 +434,35 @@ impl APos{
 
         //Copy the signer to prevent data competition
         let signer = self.signer.clone();
-        self.lock.read().unwrap();
 
         //Set the correct difficulty level
-        raw_header.difficulty = calc_difficulty(&snap, &signer);
+        header.difficulty = calc_difficulty(&snap, &signer);
 
         //Ensure that the additional data has all its components
-        if raw_header.extra_data.len() < EXTRA_VANITY {
-            raw_header.extra_data.extend(vec![0x00; EXTRA_VANITY - raw_header.extra.len()]);
+        if header.extra_data.len() < EXTRA_VANITY {
+            header.extra_data.extend(vec![0x00; EXTRA_VANITY - header.extra_data.len()]);
         }
-        raw_header.extra_data.truncate(EXTRA_VANITY);
+        header.extra_data.truncate(EXTRA_VANITY);
 
-        if number % self.config.epoch == 0 {
-            for signer in snap.signers() {
-                raw_header.extra.extend_from_slice(&signer.0);
+        if header.number % self.config.epoch == 0 {
+            for signer in snap.signers {
+                header.extra_data.extend_from_slice(&signer.0);
             }
         }
-        raw_header.extra.extend(vec![0x00; EXTRA_SEAL]);
+        header.extra_data.extend(vec![0x00; SIGNATURE_LENGTH]);
 
-        
-        raw_header.mix_digest = Hash::default();
+
+        header.mix_hash = Default::default();
 
       
         // Ensure the timestamp has the correct delay
-        let parent = chain.get_header(raw_header.parent_hash, raw_header.number - 1.into());
-        if parent.is_none() {
-            return Err("unknown ancestor".into());
-        }
+        let parent = self.provider.header(header.parent_hash)?.ok_or(Err("unknown ancestor".into()))?;
 
         let parent_time = parent.timestamp;
-        raw_header.timestamp = parent_time + self.config.period;
+        header.timestamp = parent_time + self.config.period;
 
-        if raw_header.time < (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME) {
-            raw_header.time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
+        if header.timestamp < (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME) {
+            header.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
         }
 
         Ok(())
@@ -521,48 +527,37 @@ impl APos{
     //     self.sign_fn = Some(sign_fn);
     // }
 
-    fn seal(
-        &self,
-        chain: Arc<dyn ChainHeaderReader>,
-        block: Arc<SealedBlock>,
-        results: Sender<Arc<SealedBlock>>,
-        stop: Receiver<()>,
+    async fn seal(
+        &mut self,
+        block: &Block,
     ) -> Result<(), Box<dyn Error>> {
         
 
         // Sealing the genesis block is not supported
-        let number = block.number.as_u64();
-        if number == 0 {
+        if block.number == 0 {
             return Err(SnapshotError::new(ERR_UNKNOWN_BLOCK))
         }
 
         // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
-        if self.config.period == 0 && block.transactions().is_empty() {
+        if self.config.period == 0 && block.body.is_empty() {
             return Err(SnapshotError::new("sealing paused while waiting for transactions"));
         }
 
-        // Don't hold the signer fields for the entire sealing procedure
-        let (signer, sign_fn) = {
-            let read_lock = self.lock.read().unwrap();
-            (self.signer, self.sign_fn.clone())
-        };
 
         // Bail out if we're unauthorized to sign a block
-        let snap = self.snapshot(chain.clone(), number - 1, block.parent_hash.clone(), None)?;
-        if !snap.signers.contains_key(&signer.unwrap()) {
-            println!("err signer: {}", signer.unwrap());
+        let snap = self.snapshot(block.number - 1, block.parent_hash.clone(), None).await?;
+        if !snap.signers.contains(&self.signer) {
+            error!(target: "consensus::engine", "err signer: {}", self.signer);
             return Err(SnapshotError::new(ERR_UNAUTHORIZED_SIGNER));
         }
 
         // If we're amongst the recent signers, wait for the next block
-        for (&seen, recent) in &self.recents {
-            if recent == signer {
-                let limit = (self.signers.len() as u64 / 2) + 1;
-                if number < limit || seen > number - limit {
-                    return Err(format!(
-                        "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}",
-                        limit, seen, number, signer
-                    ));
+        for (seen, recent) in snap.recents {
+            if recent == self.signer {
+                let limit = (snap.signers.len() as u64 / 2) + 1;
+                if block.number < limit || seen > block.number - limit {
+                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, block.number, self.signer);
+                    return Err(SnapshotError::new(ERR_UNAUTHORIZED_SIGNER));
                 }
             }
         }
@@ -580,48 +575,23 @@ impl APos{
 
             println!(
                 "wiggle {:?}, time {:?}, number {}",
-                wiggle, delay_with_wiggle, block.number.as_u64()
+                wiggle, delay_with_wiggle, block.number
             );
         }
 
         // Beijing hard fork logic (if applicable)
-        if self.chain_config.is_beijing(block.number.as_u64()) {
-            let member = self.count_depositor();
-            let (agg_sign, verifiers, err) = Api::sign_merge(block.clone(), member);
-            if err.is_some() {
-                return Err(err.unwrap());
-            }
+        if self.chain_spec.is_beijing_active_at_block(block.number) {
 
-            let ss: Vec<OtherPublicKey> = verifiers
-                .iter()
-                .map(|p| OtherPublicKey::from_bytes(&p.public_key))
-                .collect::<Result<_, _>>()?;
-
-            let sig = Signature::from_bytes(&agg_sign)?;
-            if !sig.fast_aggregate_verify(true,&ss,&[], block.state_root) {
-                return Err("Aggregate signature verification failed".into());
-            }
-
-            block.signature = agg_sign;
-            block.body_mut().verifiers = verifiers;
         }
 
         // Sign all the things!
-        let sighash = sign_fn.unwrap()(signer.unwrap(), apos_proto(&block))?;
+        let sighash = self.sign_fn(self.signer, seal_hash(&block.header))?;
 
-        block.extra_data[block.extra_data.len() - EXTRA_SEAL..].copy_from_slice(&sighash);
+        block.extra_data[block.extra_data.len() - SIGNATURE_LENGTH..].copy_from_slice(&sighash);
 
         // Wait until sealing is terminated or delay timeout
         println!("Waiting for slot to sign and propagate, delay: {:?}", delay);
-        let results_clone = results.clone();
-        let block_clone = block.clone();
-        std::thread::spawn(move || {
-            if stop.recv_timeout(delay).is_err() {
-                results_clone.send(block_clone.with_seal(block)).unwrap_or_else(|_| {
-                    println!("Sealing result is not read by miner");
-                });
-            }
-        });
+        //
 
         Ok(())
     }
@@ -630,35 +600,22 @@ impl APos{
 // that a new block should have:
 // * DIFF_NOTURN(2) if BLOCK_NUMBER % SIGNER_COUNT != SIGNER_INDEX
 // * DIFF_INTURN(1) if BLOCK_NUMBER % SIGNER_COUNT == SIGNER_INDEX
-    pub fn calc_difficulty(
-        &self,
-        chain: &dyn ChainHeaderReader, // assuming ChainHeaderReader is a trait
-        time: u64,
-        parent: SealedHeader,          // assuming IHeader is a trait
+    pub async fn calc_difficulty(
+        &mut self,
+        parent: Header,          // assuming IHeader is a trait
     ) -> U256 {
-        let snap_result = self.snapshot(
-            chain,
+        let snap = self.snapshot(
             parent.number,
-            parent.hash(),
+            parent.hash_slow(),
             None,
-        );
+        ).await?;
 
-        if let Err(_) = snap_result {
-            return U256::zero();
-        }
-
-        let snap = snap_result.unwrap();
-        let signer = {
-            let signer_lock = self.signer.read().unwrap();
-            signer_lock.clone() // Clone or copy if needed
-        };
-
-        calc_difficulty(&snap, &signer)
+        calc_difficulty(&snap, self.signer)
     }
 
 
     // SealHash returns the hash of a block prior to it being sealed.
-    pub fn seal_hash(&self, header: &SealedHeader) -> H256 {
+    pub fn seal_hash(&self, header: &SealedHeader) -> B256 {
         seal_hash(header)
     }
 
@@ -679,80 +636,132 @@ impl APos{
             authenticated: true,
         }]
     }
-
-
-
-
 }
 
 
  
 
-fn calc_difficulty(snap: &Snapshot, signer: Address) -> &U256 {
+fn calc_difficulty<T>(snap: &Snapshot<T>, signer: Address) -> U256 {
     if snap.inturn(snap.number + 1, &signer) {
-        &DIFF_IN_TURN
+        DIFF_IN_TURN.clone()
     } else {
-        &DIFF_NO_TURN
+        DIFF_NO_TURN.clone()
     }
 }
 
 // SealHash returns the hash of a block prior to it being sealed.
-fn seal_hash(header: &SealedHeader) -> H256 {
-    // Create a new Keccak256 hasher
-    let mut hasher = Keccak256::new();
+fn seal_hash(header: &Header) -> B256 {
 
-    // Encode the header into the hasher
-    encode_sig_header(&mut hasher, header);
+    struct LocalHeader {
+        parent_hash: B256,
+        ommers_hash: B256,
+        beneficiary: Address,
+        state_root: B256,
+        transactions_root: B256,
+        receipts_root: B256,
+        logs_bloom: Bloom,
+        difficulty: U256,
+        number: BlockNumber,
+        gas_limit: u64,
+        gas_used: u64,
+        timestamp: u64,
+        extra_data: Bytes,
+        mix_hash: B256,
+        nonce: u64,
+        base_fee_per_gas: Option<u64>,
+    }
 
-    // Create a buffer to hold the resulting hash
-    let mut hash = H256::zero();
-    
-    // Write the hash result into the buffer
-    hasher.finalize_into(hash.as_mut());
+    impl LocalHeader {
+        fn header_payload_length(&self) -> usize {
+            let mut length = 0;
+            length += self.parent_hash.length(); // Hash of the previous block.
+            length += self.ommers_hash.length(); // Hash of uncle blocks.
+            length += self.beneficiary.length(); // Address that receives rewards.
+            length += self.state_root.length(); // Root hash of the state object.
+            length += self.transactions_root.length(); // Root hash of transactions in the block.
+            length += self.receipts_root.length(); // Hash of transaction receipts.
+            length += self.logs_bloom.length(); // Data structure containing event logs.
+            length += self.difficulty.length(); // Difficulty value of the block.
+            length += U256::from(self.number).length(); // Block number.
+            length += U256::from(self.gas_limit).length(); // Maximum gas allowed.
+            length += U256::from(self.gas_used).length(); // Actual gas used.
+            length += self.timestamp.length(); // Block timestamp.
+            length += self.extra_data.length(); // Additional arbitrary data.
+            length += self.mix_hash.length(); // Hash used for mining.
+            length += B64::new(self.nonce.to_be_bytes()).length(); // Nonce for mining.
 
-    hash
-}
+            if let Some(base_fee) = self.base_fee_per_gas {
+                // Adding base fee length if it exists.
+                length += U256::from(base_fee).length();
+            }
+            length
+        }
+    }
 
 
-fn apos_proto(header: &SealedHeader) -> Vec<u8> {
-    let mut buffer = Cursor::new(Vec::new());
-    encode_sig_header(&mut buffer, header);
-    buffer.into_inner()
-}
+    impl Encodable for LocalHeader {
+        fn encode(&self, out: &mut dyn BufMut) {
+            // Create a header indicating the encoded content is a list with the payload length computed
+            // from the header's payload calculation function.
+            let list_header =
+                alloy_rlp::Header { list: true, payload_length: self.header_payload_length() };
+            list_header.encode(out);
 
+            // Encode each header field sequentially
+            self.parent_hash.encode(out); // Encode parent hash.
+            self.ommers_hash.encode(out); // Encode ommer's hash.
+            self.beneficiary.encode(out); // Encode beneficiary.
+            self.state_root.encode(out); // Encode state root.
+            self.transactions_root.encode(out); // Encode transactions root.
+            self.receipts_root.encode(out); // Encode receipts root.
+            self.logs_bloom.encode(out); // Encode logs bloom.
+            self.difficulty.encode(out); // Encode difficulty.
+            U256::from(self.number).encode(out); // Encode block number.
+            U256::from(self.gas_limit).encode(out); // Encode gas limit.
+            U256::from(self.gas_used).encode(out); // Encode gas used.
+            self.timestamp.encode(out); // Encode timestamp.
+            self.extra_data.encode(out); // Encode extra data.
+            self.mix_hash.encode(out); // Encode mix hash.
+            B64::new(self.nonce.to_be_bytes()).encode(out); // Encode nonce.
 
-fn encode_sig_header<W: Write>(writer: &mut W, header: &SealedHeader) -> io::Result<()> {
-    let header = header.to_header();
+            // Encode base fee.
+            if let Some(ref base_fee) = self.base_fee_per_gas {
+                U256::from(*base_fee).encode(out);
+            }
+        }
 
-    let mut rlp_stream = RlpStream::new();
+        fn length(&self) -> usize {
+            let mut length = 0;
+            length += self.header_payload_length();
+            length += length_of_length(length);
+            length
+        }
+    }
 
-    rlp_stream.append(&header.parent_hash);
-    rlp_stream.append(&header.uncle_hash);
-    rlp_stream.append(&header.coinbase);
-    rlp_stream.append(&header.root);
-    rlp_stream.append(&header.tx_hash);
-    rlp_stream.append(&header.receipt_hash);
-    rlp_stream.append(&header.bloom);
-    rlp_stream.append(&header.difficulty);
-    rlp_stream.append(&header.number);
-    rlp_stream.append(&header.gas_limit);
-    rlp_stream.append(&header.gas_used);
-    rlp_stream.append(&header.time);
+    // 初始化局部结构体
+    let mut sigHeader = LocalHeader {
+        parent_hash: header.parent_hash,
+        ommers_hash: header.ommers_hash,
+        beneficiary: header.beneficiary,
+        state_root: header.state_root,
+        transactions_root: header.transactions_root,
+        receipts_root: header.receipts_root,
+        logs_bloom: header.logs_bloom,
+        difficulty: header.difficulty,
+        number: header.number,
+        gas_limit: header.gas_limit,
+        gas_used: header.gas_used,
+        timestamp: header.timestamp,
+        extra_data: Bytes::new(),
+        mix_hash: header.mix_hash,
+        nonce: header.nonce,
+        base_fee_per_gas: header.base_fee_per_gas,
+    };
 
     // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
-    if header.extra.len() > EXTRA_SEAL {
-        rlp_stream.append(&header.extra[..header.extra.len() - EXTRA_SEAL]);
-    } else {
-        rlp_stream.append(&[] as &[u8]); // Append an empty slice if extra is too short
+    if header.extra_data.len() > SIGNATURE_LENGTH {
+        sigHeader.extra_data = Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH]);
     }
 
-    rlp_stream.append(&header.mix_digest);
-    rlp_stream.append(&header.nonce);
-
-    if let Some(base_fee) = header.base_fee {
-        rlp_stream.append(&base_fee);
-    }
-
-    writer.write_all(rlp_stream.out().as_ref())?;
-    Ok(())
+    keccak256(alloy_rlp::encode(&sigHeader))
 }

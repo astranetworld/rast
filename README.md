@@ -10,12 +10,12 @@
 
 ## Features
 
-- **Decentralized Consensus**: Implements a Proof of Stake (PoS) consensus algorithm, ensuring a secure and energy-efficient network.
-- **Smart Contracts**: Supports smart contracts using WebAssembly (Wasm), allowing developers to write contracts in multiple languages.
-- **High Throughput**: Optimized for high transactions per second (TPS), suitable for large-scale applications.
-- **Interoperability**: Compatible with existing blockchain ecosystems, enabling cross-chain communication.
-- **Security**: Built with Rust to ensure memory safety and prevent common vulnerabilities such as buffer overflows.
-
+- **Decentralized Consensus**: Utilizes a Proof of Stake (PoS) consensus mechanism to provide a secure and energy-efficient network.
+- **Smart Contracts**: Enables smart contracts through WebAssembly (Wasm), allowing developers to write contracts in various programming languages.
+- **High Throughput**: Designed for high transactions per second (TPS), making it ideal for large-scale applications.
+- **Interoperability**: Compatible with current blockchain ecosystems, facilitating cross-chain communication.
+- **Security**: Developed in Rust to ensure memory safety and guard against common vulnerabilities like buffer overflows.
+  
 ## Getting Started
 
 ### Prerequisites
@@ -66,11 +66,11 @@ cargo doc --open
 
 ### Setting Up a Node
 
-To set up a full node, follow these steps:
+To configure a full node, follow these steps:
 
-1. Install Rust and Cargo (if not already installed).
-2. Build the project using the steps outlined above.
-3. Run the node using the provided command.
+1. **Install Rust and Cargo** (if they are not already installed).
+2. **Build the Project** using the instructions provided above.
+3. **Run the Node** using the specified command.
 
 ### Interacting with the Blockchain
 

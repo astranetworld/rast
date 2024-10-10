@@ -14,26 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-//! General error types for use in ethcore.
-
 use std::{fmt, error};
 use std::time::SystemTime;
 
 use derive_more::{Display, From};
-use ethereum_types::{H256, U256, Address, Bloom};
-use ethereum_types::H64;
-// use ethkey::Error as EthkeyError;
-// use ethtrie::TrieError;
+use alloy_primitives::{U256, Address, Bloom, B256, U64};
 use rlp;
-// use crate::traits::InvalidInput;
-// use crate::snapshot::Error as SnapshotError;
-// use types::BlockNumber;
-// use types::transaction::Error as TransactionError;
 use unexpected::{Mismatch, OutOfBounds};
 
-use crate::apos::SnapshotError;
 
-// use crate::voting_error::EngineError;
 
 // pub use executed::{ExecutionError, CallError};
 pub type BlockNumber = u64;
@@ -55,7 +44,7 @@ pub enum BlockError {
 	TooMuchGasUsed(OutOfBounds<U256>),
 	/// Uncles hash in header is invalid.
 	#[display(fmt = "Block has invalid uncles hash: {}", _0)]
-	InvalidUnclesHash(Mismatch<H256>),
+	InvalidUnclesHash(Mismatch<B256>),
 	/// An uncle is from a generation too old.
 	#[display(fmt = "Uncle block is too old. {}", _0)]
 	UncleTooOld(OutOfBounds<BlockNumber>),
@@ -64,22 +53,22 @@ pub enum BlockError {
 	UncleIsBrother(OutOfBounds<BlockNumber>),
 	/// An uncle is already in the chain.
 	#[display(fmt = "Uncle {} already in chain", _0)]
-	UncleInChain(H256),
+	UncleInChain(B256),
 	/// An uncle is included twice.
 	#[display(fmt = "Uncle {} already in the header", _0)]
-	DuplicateUncle(H256),
+	DuplicateUncle(B256),
 	/// An uncle has a parent not in the chain.
 	#[display(fmt = "Uncle {} has a parent not in the chain", _0)]
-	UncleParentNotInChain(H256),
+	UncleParentNotInChain(B256),
 	/// State root header field is invalid.
 	#[display(fmt = "Invalid state root in header: {}", _0)]
-	InvalidStateRoot(Mismatch<H256>),
+	InvalidStateRoot(Mismatch<B256>),
 	/// Gas used header field is invalid.
 	#[display(fmt = "Invalid gas used in header: {}", _0)]
 	InvalidGasUsed(Mismatch<U256>),
 	/// Transactions root header field is invalid.
 	#[display(fmt = "Invalid transactions root in header: {}", _0)]
-	InvalidTransactionsRoot(Mismatch<H256>),
+	InvalidTransactionsRoot(Mismatch<B256>),
 	/// Difficulty is out of range; this can be used as an looser error prior to getting a definitive
 	/// value for difficulty. This error needs only provide bounds of which it is out.
 	#[display(fmt = "Difficulty out of bounds: {}", _0)]
@@ -91,7 +80,7 @@ pub enum BlockError {
 	/// Seal element of type H256 (max_hash for Ethash, but could be something else for
 	/// other seal engines) is out of bounds.
 	#[display(fmt = "Seal element out of bounds: {}", _0)]
-	MismatchedH256SealElement(Mismatch<H256>),
+	MismatchedH256SealElement(Mismatch<B256>),
 	/// Proof-of-work aspect of seal, which we assume is a 256-bit value, is invalid.
 	#[display(fmt = "Block has invalid PoW: {}", _0)]
 	InvalidProofOfWork(OutOfBounds<U256>),
@@ -103,7 +92,7 @@ pub enum BlockError {
 	InvalidGasLimit(OutOfBounds<U256>),
 	/// Receipts trie root header field is invalid.
 	#[display(fmt = "Invalid receipts trie root in header: {}", _0)]
-	InvalidReceiptsRoot(Mismatch<H256>),
+	InvalidReceiptsRoot(Mismatch<B256>),
 	/// Timestamp header field is invalid.
 	#[display(fmt = "Invalid timestamp in header: {}", _0)]
 	InvalidTimestamp(OutOfBoundsTime),
@@ -127,10 +116,10 @@ pub enum BlockError {
 	TooManyTransactions(Address),
 	/// Parent given is unknown.
 	#[display(fmt = "Unknown parent: {}", _0)]
-	UnknownParent(H256),
+	UnknownParent(B256),
 	/// Uncle parent given is unknown.
 	#[display(fmt = "Unknown uncle parent: {}", _0)]
-	UnknownUncleParent(H256),
+	UnknownUncleParent(B256),
 	/// No transition to epoch number.
 	#[display(fmt = "Unknown transition to epoch number: {}", _0)]
 	UnknownEpochTransition(u64),
@@ -333,7 +322,7 @@ pub enum EngineError {
 	/// Missing Parent Epoch
 	MissingParent,
 	/// Checkpoint is missing
-	CliqueMissingCheckpoint(H256),
+	CliqueMissingCheckpoint(B256),
 	/// Missing vanity data
 	CliqueMissingVanity,
 	/// Missing signature
@@ -347,7 +336,7 @@ pub enum EngineError {
 	/// Wrong checkpoint authors recovered
 	CliqueFaultyRecoveredSigners(Vec<String>),
 	/// Invalid nonce (should contain vote)
-	CliqueInvalidNonce(H64),
+	CliqueInvalidNonce(U64),
 	/// The signer signed a block to recently
 	CliqueTooRecentlySigned(Address),
 	/// Custom
