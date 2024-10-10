@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::hash::Hash;
-use reth_primitives::{hex, Header};
+use reth_primitives::{arbitrary, hex, Header};
 
 
 use std::sync::Arc;
@@ -28,6 +28,7 @@ pub enum VotingError {
     UnauthorizedSigner,
     SignerRecentlySigned,
     InvalidVote,
+    GeneralError(String), 
 }
 
 //
@@ -39,6 +40,7 @@ impl std::fmt::Display for VotingError {
             VotingError::UnauthorizedSigner => write!(f, "Unauthorized signer"),
             VotingError::SignerRecentlySigned => write!(f, "Signer recently signed"),
             VotingError::InvalidVote => write!(f, "Invalid vote"),
+            VotingError::GeneralError(_) => todo!(),
         }
     }
 }
@@ -60,7 +62,7 @@ pub struct Tally {
     /// Whether the vote is about authorizing or kicking someone
     pub authorize: bool,
     /// Number of votes until now wanting to pass the proposal
-    pub votes: i32,
+    pub votes: u32,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
 pub struct APosConfig {
@@ -99,7 +101,11 @@ pub struct Snapshot<F>
     pub ecrecover: F,
 }
 
-impl<F> Snapshot<F> {
+impl<F> Snapshot<F> 
+    where 
+        F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+{
+    
 
 	// 创建一个新的 Snapshot
     pub fn new_snapshot(
@@ -121,9 +127,8 @@ impl<F> Snapshot<F> {
         };
 
         for signer in signers {
-            snap.signers.insert(signer);
+            snap.signers.push(signer);
         }
-
         snap
     }
 
@@ -153,7 +158,7 @@ impl<F> Snapshot<F> {
 	 // valid_vote returns whether it makes sense to cast the specified vote in the
      // given snapshot context (e.g. don't try to add an already authorized signer).
 	 pub fn valid_vote(&self, address: Address, authorize: bool) -> bool {
-        if self.signers.get(&address).is_some() {
+        if self.signers.iter().any(|x| x == &address) {
             !authorize
         } else {
             authorize
@@ -204,12 +209,12 @@ impl<F> Snapshot<F> {
 
         //Check the validity of header information
         for i in 0..headers.len() - 1 {
-            if headers[i + 1].number() != headers[i].number() + 1 {
-                return VotingError::InvalidVotingChain;
+            if headers[i + 1].number != headers[i].number + 1 {
+                return Err(VotingError::InvalidVotingChain);
             }
         }
-        if headers[0].number() != self.number + 1 {
-            return VotingError::InvalidVotingChain;
+        if headers[0].number != self.number + 1 {
+            return Err(VotingError::InvalidVotingChain);
         }
 
         //Create a new snapshot
@@ -233,13 +238,14 @@ impl<F> Snapshot<F> {
             }
 
             //Verify the signer and check if they are in the signer list
-            let signer = self.ecrecover(header)?;
+            let signer = self.ecrecover(header.clone())
+        .map_err(|e| VotingError::GeneralError(e.to_string()))?;
             if !snap.signers.contains(&signer) {
-                return VotingError::UnauthorizedSigner;
+                return Err(VotingError::UnauthorizedSigner);
             }
 
             if snap.recents.values().any(|&recent| recent == signer) {
-                return VotingError::SignerRecentlySigned;
+                return Err(VotingError::SignerRecentlySigned);
             }
             snap.recents.insert(number, signer.clone());
 
@@ -248,9 +254,9 @@ impl<F> Snapshot<F> {
 
             //Count new votes
             let authorize = match header.nonce {
-                nonce if hex::encode(nonce) == hex::encode(NONCE_AUTH_VOTE) => true,
-                nonce if hex::encode(nonce) == hex::encode(NONCE_DROP_VOTE) => false,
-                _ => return VotingError::InvalidVote,
+                nonce if hex::encode(nonce.to_be_bytes()) == hex::encode(NONCE_AUTH_VOTE) => true,
+                nonce if hex::encode(nonce.to_be_bytes()) == hex::encode(NONCE_DROP_VOTE) => false,
+                _ => return Err(VotingError::InvalidVote),
             };
 
             if snap.cast(header.beneficiary, authorize) {
@@ -263,12 +269,15 @@ impl<F> Snapshot<F> {
             }
 
             //If the vote is passed, update the list of signatories
-            if let Some(tally) = snap.tally.get(header.beneficiary) {
-                if tally.votes > snap.signers.len() / 2 {
+            if let Some(tally) = snap.tally.get(&header.beneficiary) {
+                if tally.votes > (snap.signers.len() / 2).try_into().unwrap() {
                     if tally.authorize {
-                        snap.signers.insert(header.beneficiary);
+                        snap.signers.push(header.beneficiary);
                     } else {
-                        snap.signers.remove(header.beneficiary);
+                        if let Some(pos) = snap.signers.iter().position(|x| *x == header.beneficiary) {
+                            snap.signers.remove(pos);
+                        }
+                        // snap.signers.remove(header.beneficiary);
 
                         //Reduce the signer list and delete any remaining recent cache
                         if number >= snap.signers.len() as u64 / 2 + 1 {
@@ -281,7 +290,7 @@ impl<F> Snapshot<F> {
 
                     //Discard any previous votes that have just changed the account
                     snap.votes.retain(|vote| vote.address != header.beneficiary);
-                    snap.tally.remove(header.beneficiary);
+                    snap.tally.remove(&header.beneficiary);
                 }
             }
 
