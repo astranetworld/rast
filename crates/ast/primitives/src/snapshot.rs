@@ -28,7 +28,7 @@ pub enum VotingError {
     UnauthorizedSigner,
     SignerRecentlySigned,
     InvalidVote,
-    GeneralError(String), 
+    RecoverError(String),
 }
 
 //
@@ -40,7 +40,7 @@ impl std::fmt::Display for VotingError {
             VotingError::UnauthorizedSigner => write!(f, "Unauthorized signer"),
             VotingError::SignerRecentlySigned => write!(f, "Signer recently signed"),
             VotingError::InvalidVote => write!(f, "Invalid vote"),
-            VotingError::GeneralError(_) => todo!(),
+            VotingError::RecoverError(e) => write!(f, "Recover signer error: {}", e),
         }
     }
 }
@@ -238,8 +238,7 @@ impl<F> Snapshot<F>
             }
 
             //Verify the signer and check if they are in the signer list
-            let signer = self.ecrecover(header.clone())
-        .map_err(|e| VotingError::GeneralError(e.to_string()))?;
+            let signer = self.ecrecover(header.clone()).map_err(|e| VotingError::RecoverError(e.to_string()))?;
             if !snap.signers.contains(&signer) {
                 return Err(VotingError::UnauthorizedSigner);
             }
