@@ -16,7 +16,8 @@ alloy-rlp.workspace = true
 alloy-primitives.workspace = true
 
 # arbitrary utils
-arbitrary = { workspace = true, features = ["derive"], optional = true }
+# arbitrary = { workspace = true, features = ["derive"], optional = true }
+arbitrary.workspace=true
 # serde
 serde.workspace = true
 # log
@@ -24,5 +25,9 @@ tracing.workspace = true
 #
 schnellru.workspace = true
 
+bytes.workspace=true
+
+hashbrown="0.15.0"
+rlp="0.6.1"
 [lints]
 workspace = true
