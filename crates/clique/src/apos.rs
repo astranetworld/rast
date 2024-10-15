@@ -40,6 +40,8 @@ use rand::prelude::SliceRandom;
 use rlp::RlpStream;
 use reth_chainspec::ChainSpec;
 
+use crate::traits::Engine;
+
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
 const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
@@ -88,6 +90,7 @@ pub enum AposError {
     InvalidVotingChain,
     UnauthorizedSigner,
     RecentlySigned,
+    UnTransion,
 }
 
 impl std::fmt::Display for AposError {
@@ -113,6 +116,7 @@ impl std::fmt::Display for AposError {
                 AposError::InvalidVotingChain => "invalid voting chain",
                 AposError::UnauthorizedSigner => "unauthorized signer",
                 AposError::RecentlySigned => "recently signed",
+                AposError::UnTransion => "sealing paused while waiting for transactions",
             }
         )
     }
@@ -313,7 +317,7 @@ where
                 // If we have explicit parents, pick from there (enforced)
                 let header = parents.pop().unwrap();
                 if header.hash_slow() != hash || header.number64() != number {
-                    return Err(Error::UnknownBlock);
+                    return Err(AposError::UnknownBlock);
                 }
                 header
             } else {
@@ -362,14 +366,14 @@ where
 
         // Verifying the genesis block is not supported
         if header.number == 0 {
-            return Err(Box::new(ERR_UNKNOWN_BLOCK));
+            return Err(AposError::UnknownBlock.into());
         }
 
         //Analyze the signer and check if they are in the signer list
         let signer = recover_address(&header)?;
         if !snap.signers.contains(&signer) {
             info!("err signer: {}", signer);
-            return Err(Box::new(ERR_UNAUTHORIZED_SIGNER));
+            return Err(AposError::UnauthorizedSigner.into());
         }
 
        //Check the list of recent signatories
@@ -378,7 +382,7 @@ where
                 //If the signer is in the recent list, ensure that the current block can be removed
                 let limit = (snap.signers.len() as u64 / 2) + 1;
                 if *seen > header.number - limit {
-                    return Err(Box::new(ERR_RECENTLY_SIGNED));
+                    return Err(AposError::RecentlySigned.into());
                 }
             }
         }
@@ -386,10 +390,10 @@ where
        ///Ensure that the difficulty corresponds to the signer's round
         let in_turn = snap.inturn(header.number, &signer);
         if in_turn && header.difficulty != *diff_in_turn {
-            return Err(Box::new(ERR_WRONG_DIFFICULTY));
+            return Err(AposError::WrongDifficulty.into());
         }
         if !in_turn && header.difficulty != *diff_in_turn {
-            return Err(Box::new(ERR_WRONG_DIFFICULTY));
+            return Err(AposError::WrongDifficulty.into());
         }
 
         Ok(())
@@ -535,12 +539,12 @@ where
 
         // Sealing the genesis block is not supported
         if block.number == 0 {
-            return Err(SnapshotError::new(ERR_UNKNOWN_BLOCK))
+            return Err(AposError::UnknownBlock.into());
         }
 
         // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
         if self.config.period == 0 && block.body.is_empty() {
-            return Err(SnapshotError::new("sealing paused while waiting for transactions"));
+            return Err(AposError::UnTransion);
         }
 
 
@@ -548,7 +552,7 @@ where
         let snap = self.snapshot(block.number - 1, block.parent_hash.clone(), None).await?;
         if !snap.signers.contains(&self.signer) {
             error!(target: "consensus::engine", "err signer: {}", self.signer);
-            return Err(SnapshotError::new(ERR_UNAUTHORIZED_SIGNER));
+            return Err(AposError::UnauthorizedSigner)
         }
 
         // If we're amongst the recent signers, wait for the next block
@@ -557,7 +561,7 @@ where
                 let limit = (snap.signers.len() as u64 / 2) + 1;
                 if block.number < limit || seen > block.number - limit {
                     error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, block.number, self.signer);
-                    return Err(SnapshotError::new(ERR_UNAUTHORIZED_SIGNER));
+                    return Err(AposError::UnauthorizedSigner);
                 }
             }
         }
