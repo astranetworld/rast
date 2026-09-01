@@ -88,6 +88,14 @@ done
 # The bench tier, exported so fleet7-env.sh builds the node arguments with it.
 # Declared here and nowhere else, for the reason at the top of fleet7-env.sh.
 export F7_PROFILE=${F7_PROFILE:-bench}
+# Direct push on by default for a bench round: the leader hands the body to
+# every member over its own stream and, with the whole mesh reached, does not
+# publish it on the topic at all. Measured: the follower's transport drain for
+# a body went from ~210 ms (topic delivery plus forwarding six copies from the
+# consensus loop) to ~30 ms, and once yamux's buffer cap matched its window the
+# block cycle's p90 fell from 2.4 s to 2.2 s with no connection drops.
+# F7_DIRECT_PUSH=0 restores topic delivery, which a fleet with gov5 members needs.
+export F7_DIRECT_PUSH=${F7_DIRECT_PUSH:-1}
 # Sized from the gas tier rather than fixed, so the cap never quietly becomes
 # the binding constraint when the tier moves. 8 MB holds a 480M-gas block of
 # transfers (~2.5 MB of RLP) with room to spare, and that ratio is kept: a cap
@@ -213,6 +221,8 @@ mkdir -p "$OUT"
 # datadirs wiped each other's fleets mid-window twice in one evening; the lock
 # is held for the whole round and a second launcher refuses rather than waits,
 # because a round that waited would start on a chain it did not decay itself.
+# fd 9 is closed (9>&-) on everything spawned below, or the nodes that outlive
+# the round would keep the lock and the next round would refuse itself.
 exec 9>"$F7_ROOT/.round.lock"
 if ! flock -n 9; then
   echo "REFUSING: another round holds $F7_ROOT/.round.lock (pgrep -f 'fleet7-benc[h].sh')" >&2
@@ -232,7 +242,7 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
 }
 
-"$HERE/fleet7.sh" up --fresh
+"$HERE/fleet7.sh" up --fresh 9>&-
 
 # Empty blocks until the base fee has actually decayed, rather than for a fixed
 # time.
@@ -306,7 +316,7 @@ if [[ $F7_PRECREATE == 1 ]]; then
     "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
     --senders 6000 --pertx 500 --offset $((OFFSET + 500000)) --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
     --conc "$CONC" --rpcbatch "$RPCBATCH" \
-    > "$OUT/precreate.log" 2>&1 < /dev/null || { echo "REFUSING: the precreate flood failed; see $OUT/precreate.log"; exit 1; }
+    > "$OUT/precreate.log" 2>&1 < /dev/null 9>&- || { echo "REFUSING: the precreate flood failed; see $OUT/precreate.log"; exit 1; }
   read_pending() {
     curl -s --max-time 5 -X POST -H 'content-type: application/json' \
       --data '{"jsonrpc":"2.0","id":1,"method":"txpool_status","params":[]}' \
@@ -329,7 +339,7 @@ setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" 
   "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
   --senders "$SENDERS" --pertx "$PERTX" --offset "$OFFSET" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
   --conc "$CONC" --rpcbatch "$RPCBATCH" $SHARD \
-  > "$OUT/flood.log" 2>&1 < /dev/null &
+  > "$OUT/flood.log" 2>&1 < /dev/null 9>&- &
 FLOOD=$!
 echo "flood        : pid $FLOOD, log $OUT/flood.log"
 
