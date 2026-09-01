@@ -371,6 +371,88 @@ pub fn execution_data_for_block(block_hash: B256, block: &Block<TxEnvelope>) -> 
     execution_data_for_block_with_bal(block_hash, block, None)
 }
 
+/// [`execution_data_for_block_with_bal`] from a header and the transactions'
+/// EIP-2718 bytes, without decoding any of them.
+///
+/// The Engine API carries transactions as exactly these bytes, so a node that
+/// has them -- every follower, straight off the wire -- gains nothing by
+/// parsing 163,000 of them into envelopes and encoding each one back. Measured
+/// on the seven-node fleet as ~200 ms of a follower's critical path, before
+/// the execution layer even saw the block; the execution layer decodes once
+/// on its own side regardless. Produces what the typed path produces, and a
+/// test says so.
+pub fn execution_data_from_raw_parts(
+    block_hash: B256,
+    header: &alloy_consensus::Header,
+    transactions: Vec<alloy_primitives::Bytes>,
+    withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
+    bal: Option<alloy_primitives::Bytes>,
+) -> ExecutionData {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3, ExecutionPayloadV4};
+    // Blob transactions are the one kind whose contents the sidecar needs;
+    // only those are decoded, and on this chain there are none.
+    let versioned_hashes: Vec<B256> = transactions
+        .iter()
+        .filter(|tx| tx.first() == Some(&0x03))
+        .filter_map(|tx| <TxEnvelope as alloy_eips::Decodable2718>::decode_2718(&mut tx.as_ref()).ok())
+        .flat_map(|tx| {
+            alloy_consensus::Transaction::blob_versioned_hashes(&tx).map(<[B256]>::to_vec).unwrap_or_default()
+        })
+        .collect();
+    let v1 = ExecutionPayloadV1 {
+        parent_hash: header.parent_hash,
+        fee_recipient: header.beneficiary,
+        state_root: header.state_root,
+        receipts_root: header.receipts_root,
+        logs_bloom: header.logs_bloom,
+        prev_randao: header.mix_hash,
+        block_number: header.number,
+        gas_limit: header.gas_limit,
+        gas_used: header.gas_used,
+        timestamp: header.timestamp,
+        extra_data: header.extra_data.clone(),
+        base_fee_per_gas: U256::from(header.base_fee_per_gas.unwrap_or_default()),
+        block_hash,
+        transactions,
+        difficulty: header.difficulty,
+        nonce: header.nonce,
+    };
+    let payload = match (header.withdrawals_root.is_some(), header.blob_gas_used) {
+        (false, _) => ExecutionPayload::V1(v1),
+        (true, None) => ExecutionPayload::V2(ExecutionPayloadV2 { payload_inner: v1, withdrawals }),
+        (true, Some(blob_gas_used)) => {
+            let v3 = ExecutionPayloadV3 {
+                payload_inner: ExecutionPayloadV2 { payload_inner: v1, withdrawals },
+                blob_gas_used,
+                excess_blob_gas: header.excess_blob_gas.unwrap_or_default(),
+            };
+            match bal {
+                Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
+                    payload_inner: v3,
+                    block_access_list,
+                    slot_number: header.number,
+                }),
+                None => ExecutionPayload::V3(v3),
+            }
+        }
+    };
+    let sidecar = match header.parent_beacon_block_root {
+        None => ExecutionPayloadSidecar::none(),
+        Some(parent_beacon_block_root) => {
+            let cancun = CancunPayloadFields { parent_beacon_block_root, versioned_hashes };
+            match header.requests_hash {
+                None => ExecutionPayloadSidecar::v3(cancun),
+                Some(hash) if is_empty_requests_hash(hash) => ExecutionPayloadSidecar::v4(
+                    cancun,
+                    PraguePayloadFields { requests: RequestsOrHash::Requests(Requests::default()) },
+                ),
+                Some(hash) => ExecutionPayloadSidecar::v4(cancun, PraguePayloadFields { requests: RequestsOrHash::Hash(hash) }),
+            }
+        }
+    };
+    ExecutionData::new(payload, sidecar)
+}
+
 /// [`execution_data_for_block`], carrying an EIP-7928 access list.
 ///
 /// The list is not decoration: reth executes a block with one in parallel and a
@@ -845,6 +927,39 @@ mod tests {
             "the sealed header must carry EIP-7928's hash, not the conversion's",
         );
         assert_eq!(rebuilt.header.hash_slow(), data.block_hash());
+    }
+
+    /// The raw-parts payload is the typed payload, without the decode.
+    #[test]
+    fn raw_parts_build_the_typed_payload() {
+        use alloy_consensus::{Signed, TxEip1559, TxLegacy};
+        use alloy_eips::Encodable2718;
+        use alloy_primitives::{Address, Signature, TxKind};
+        let txs: Vec<TxEnvelope> = vec![
+            TxEnvelope::Eip1559(Signed::new_unchecked(TxEip1559 { chain_id: 1, nonce: 1, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(2)), value: U256::from(9), ..Default::default() }, Signature::test_signature(), Default::default())),
+            TxEnvelope::Legacy(Signed::new_unchecked(TxLegacy { chain_id: Some(1), nonce: 2, gas_price: 10, gas_limit: 21_000, to: TxKind::Call(Address::repeat_byte(3)), value: U256::from(1), ..Default::default() }, Signature::test_signature(), Default::default())),
+        ];
+        let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(0x42), amount: 5 }];
+        for (requests_hash, bal) in [
+            (None, None),
+            (Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH), None),
+            (Some(B256::repeat_byte(5)), None),
+            (Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH), Some(alloy_primitives::Bytes::from_static(&[0xc0]))),
+        ] {
+            let header = Header {
+                number: 7, gas_limit: 30_000_000, gas_used: 42_000, timestamp: 1_700_000_000, base_fee_per_gas: Some(7),
+                withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH), blob_gas_used: Some(0), excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::repeat_byte(9)), requests_hash,
+                block_access_list_hash: bal.as_ref().map(|_| B256::repeat_byte(6)),
+                transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
+                ..Default::default()
+            };
+            let block = Block { header: header.clone(), body: alloy_consensus::BlockBody { transactions: txs.clone(), ommers: Vec::new(), withdrawals: Some(Withdrawals(withdrawals.clone())) } };
+            let hash = header.hash_slow();
+            let typed = execution_data_for_block_with_bal(hash, &block, bal.clone());
+            let raw = execution_data_from_raw_parts(hash, &header, txs.iter().map(|t| alloy_primitives::Bytes::from(t.encoded_2718())).collect(), withdrawals.clone(), bal);
+            assert_eq!(format!("{raw:?}"), format!("{typed:?}"));
+        }
     }
 
     /// The header-only seal is the general seal, without the decode. Same

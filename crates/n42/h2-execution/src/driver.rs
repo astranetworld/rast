@@ -523,12 +523,22 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let Some(payload) = self.payloads.get(&block_hash).cloned() else {
             return DriverAction::PayloadMissing { block_hash };
         };
-
-        match self
+        let txs = payload.payload.as_v1().transactions.len();
+        let started = std::time::Instant::now();
+        let outcome = self
             .el
             .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload)
-            .await
-        {
+            .await;
+        if txs >= 10_000 {
+            info!(
+                target: "n42.h2.el",
+                block = ?block_hash,
+                txs,
+                import_ms = started.elapsed().as_millis() as u64,
+                "imported a block"
+            );
+        }
+        match outcome {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     self.head = block_hash;

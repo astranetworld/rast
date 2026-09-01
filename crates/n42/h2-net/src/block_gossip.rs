@@ -369,6 +369,101 @@ impl GossipBlock {
     }
 }
 
+/// [`GossipBlock`] with the transactions left as the bytes they arrived as.
+///
+/// What a follower needs: the header to remember and vote on, the bytes to
+/// hand to its execution layer. Decoding 163,000 transactions into envelopes
+/// and encoding them back was ~200 ms on the follower's critical path, and
+/// the transactions-root check that decoding enabled is one the execution
+/// layer repeats before it accepts the block.
+#[derive(Debug, Clone)]
+pub struct RawGossipBlock {
+    /// Keccak of the header RLP, which is the hash the proposal named.
+    pub block_hash: B256,
+    /// The header, exactly as the producer sealed it.
+    pub header: Header,
+    /// Each transaction's EIP-2718 bytes, in block order.
+    pub transactions: Vec<Bytes>,
+    /// gov5's rewards, as sent.
+    pub rewards: Vec<(Address, U256)>,
+    /// The rewards as the withdrawals this node's execution layer credits.
+    pub withdrawals: Vec<Withdrawal>,
+    /// The EIP-7928 block access list, when the producer sent one.
+    pub bal: Option<Bytes>,
+}
+
+impl RawGossipBlock {
+    /// The Engine API form of this block, straight from the bytes.
+    pub fn execution_data(&self) -> ExecutionData {
+        n42_h2_consensus::execution_data_from_raw_parts(
+            self.block_hash,
+            &self.header,
+            self.transactions.clone(),
+            self.withdrawals.clone(),
+            self.bal.clone(),
+        )
+    }
+}
+
+/// [`decode_block_rlp`] without decoding the transactions. See
+/// [`RawGossipBlock`].
+pub fn decode_block_rlp_raw(
+    encoded: &[u8],
+    profile: HeaderProfile,
+) -> Result<RawGossipBlock, BlockGossipError> {
+    let mut payload = encoded;
+    let outer = RlpHeader::decode(&mut payload).map_err(|_| BlockGossipError::InvalidRlp)?;
+    if !outer.list || outer.payload_length != payload.len() {
+        return Err(BlockGossipError::InvalidRlp);
+    }
+    let header_rlp = take_rlp_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
+    let mut header_cursor = header_rlp;
+    let header = Header::decode(&mut header_cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
+    if !header_cursor.is_empty() {
+        return Err(BlockGossipError::InvalidRlp);
+    }
+    validate_header(&header, profile)?;
+
+    let transactions_rlp = take_rlp_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
+    let mut cursor = transactions_rlp;
+    let list = RlpHeader::decode(&mut cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
+    if !list.list || list.payload_length != cursor.len() {
+        return Err(BlockGossipError::InvalidRlp);
+    }
+    let mut transactions = Vec::with_capacity(cursor.len() / 100);
+    while !cursor.is_empty() {
+        let bytes = take_rlp_bytes(&mut cursor).ok_or(BlockGossipError::InvalidRlp)?;
+        if bytes.is_empty() {
+            return Err(BlockGossipError::InvalidRlp);
+        }
+        transactions.push(Bytes::copy_from_slice(bytes));
+    }
+
+    take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
+    let rewards_rlp = take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
+    let rewards = decode_rewards(rewards_rlp)?;
+    let bal = if payload.is_empty() {
+        None
+    } else {
+        take_rlp_bytes(&mut payload)
+            .ok_or(BlockGossipError::InvalidRlp)
+            .map(|bytes| Some(Bytes::copy_from_slice(bytes)))?
+    };
+    if !payload.is_empty() {
+        return Err(BlockGossipError::InvalidRlp);
+    }
+    if profile == HeaderProfile::Gov5H2
+        && let Some(root) = header.withdrawals_root
+        && root != n42_h2_consensus::gov5_rewards_root(rewards.iter().copied())
+        && !(rewards.is_empty() && root == alloy_consensus::EMPTY_ROOT_HASH)
+    {
+        return Err(BlockGossipError::RewardsRootMismatch);
+    }
+    let withdrawals = rewards_to_withdrawals(&rewards)
+        .map_err(|error| BlockGossipError::InvalidRewards(error.to_string()))?;
+    Ok(RawGossipBlock { block_hash: keccak256(header_rlp), header, transactions, rewards, withdrawals, bal })
+}
+
 /// Rebuilds the block a payload describes, under a profile.
 ///
 /// Engine payloads carry neither `ommers_hash` nor `difficulty`; the profile
@@ -604,6 +699,35 @@ mod bal_roundtrip {
         let decoded = decode_block_rlp(&encoded, HeaderProfile::Ethereum)
             .expect("a block with an access list decodes");
         assert_eq!(decoded.bal.as_ref(), Some(&bal), "the access list came back changed");
+    }
+
+    /// The raw decode is the typed decode, minus the decode: same header, the
+    /// same bytes per transaction, the same Engine API form.
+    #[test]
+    fn the_raw_decode_agrees_with_the_typed_one() {
+        use alloy_consensus::{Signed, TxEip1559, TxLegacy};
+        use alloy_eips::Encodable2718;
+        use alloy_primitives::{Signature, TxKind};
+        let txs: Vec<TxEnvelope> = vec![
+            TxEnvelope::Eip1559(Signed::new_unchecked(TxEip1559 { chain_id: 1, nonce: 1, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(2)), value: U256::from(9), ..Default::default() }, Signature::test_signature(), Default::default())),
+            TxEnvelope::Legacy(Signed::new_unchecked(TxLegacy { chain_id: Some(1), nonce: 2, gas_price: 10, gas_limit: 21_000, to: TxKind::Call(Address::repeat_byte(3)), value: U256::from(1), ..Default::default() }, Signature::test_signature(), Default::default())),
+        ];
+        let rewards = vec![(Address::repeat_byte(0x42), U256::from(5_000_000_000u64))];
+        let header = Header {
+            number: 7, base_fee_per_gas: Some(7), blob_gas_used: Some(0), excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(9)),
+            withdrawals_root: Some(n42_h2_consensus::gov5_rewards_root(rewards.iter().copied())),
+            transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
+            ..Default::default()
+        };
+        let encoded = encode_block_rlp_parts(&header, &txs, &rewards);
+        let typed = decode_block_rlp(&encoded, HeaderProfile::Ethereum).expect("typed decodes");
+        let raw = decode_block_rlp_raw(&encoded, HeaderProfile::Ethereum).expect("raw decodes");
+        assert_eq!(raw.block_hash, typed.block_hash);
+        assert_eq!(raw.header, typed.header);
+        assert_eq!(raw.withdrawals, typed.withdrawals);
+        assert_eq!(raw.transactions.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), txs.iter().map(|t| t.encoded_2718()).collect::<Vec<_>>());
+        assert_eq!(format!("{:?}", raw.execution_data()), format!("{:?}", typed.execution_data()));
     }
 
     /// And a producer that sends none stays byte-identical to what it sent

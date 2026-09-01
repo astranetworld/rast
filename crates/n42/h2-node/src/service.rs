@@ -59,7 +59,7 @@ use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
-    compress_block_rlp, decode_block_rlp, decode_tx_batch, decompress_block_gossip,
+    compress_block_rlp, decode_block_rlp_raw, decode_tx_batch, decompress_block_gossip,
     encode_block_rlp, encode_tx_batch,
     encode_block_rlp_parts, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
     TransportEvent, MAX_RANGE_BLOCKS,
@@ -206,6 +206,12 @@ pub struct H2Service<E> {
     /// Hands gossiped transactions to the pool, off this loop. See
     /// [`crate::tx_source::forward_transactions`].
     inbound_forward: Option<mpsc::Sender<Vec<Bytes>>>,
+    /// When each body arrived, for the import timing log.
+    body_arrived: std::collections::HashMap<B256, std::time::Instant>,
+    /// Publish every body on the block topic even when the direct push
+    /// reached every connected member. `N42_BLOCK_TOPIC_ALWAYS=1`; what a
+    /// fleet with gov5 members needs, since they take bodies from the topic.
+    always_publish_topic: bool,
     /// A block just imported, whose successor this node may be about to lead.
     /// Set where imports are observed, which is a sync path, and acted on in
     /// the step, which is not.
@@ -540,6 +546,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             checkpoint: None,
             proposal_deferred: false,
             inbound_forward: None,
+            body_arrived: std::collections::HashMap::new(),
+            always_publish_topic: std::env::var("N42_BLOCK_TOPIC_ALWAYS").is_ok(),
             prepare_on: None,
             prepare_ahead: false,
             defer_reason: None,
@@ -817,7 +825,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             } => {
                 if let Some(batch) = batch {
+                    let count = batch.len();
+                    let at = std::time::Instant::now();
                     self.publish_transactions(batch);
+                    let ms = at.elapsed().as_millis() as u64;
+                    if ms > 30 {
+                        info!(target: "n42.h2.node", count, ms, "slow: publishing the pool's transactions");
+                    }
                 }
             }
             output = self.outputs.recv() => {
@@ -861,12 +875,24 @@ impl<E: ExecutionLayer> H2Service<E> {
         // same mesh: measured at 6,000 senders as a median body arrival of
         // 380 ms against 32 ms at 64 senders, with the execution cost of the
         // block unchanged either way.
-        self.drain_transport(&mut events).await?;
-
+        // Timed in four, at info when a step is slow, because the follower's
+        // import was measured to start ~180 ms after the proposal it needed had
+        // been processed, with nothing logged in between. Whatever holds the
+        // loop for that long is on the fleet's cycle.
+        let at = std::time::Instant::now();
+        let transport_events = self.drain_transport(&mut events).await?;
+        let transport_ms = at.elapsed().as_millis() as u64;
+        let at = std::time::Instant::now();
         self.drain_outputs(&mut events).await?;
+        let outputs_ms = at.elapsed().as_millis() as u64;
+        let at = std::time::Instant::now();
         self.flush_prepare().await;
         self.forward_inbound_transactions();
         self.flush_outbox(&mut events);
+        let flush_ms = at.elapsed().as_millis() as u64;
+        if transport_ms + flush_ms > 30 {
+            info!(target: "n42.h2.node", transport_ms, transport_events, outputs_ms, flush_ms, "slow step");
+        }
         Ok(events)
     }
 
@@ -875,7 +901,8 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Bounded because the transport can always have more: an unbounded drain
     /// under sustained gossip would never return to the engine, which is the
     /// same starvation this fixes, pointed the other way.
-    async fn drain_transport(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+    async fn drain_transport(&mut self, events: &mut Vec<ServiceEvent>) -> Result<usize, ServiceError> {
+        let mut drained = 0;
         for _ in 0..MAX_TRANSPORT_DRAIN {
             let ready = tokio::select! {
                 biased;
@@ -885,12 +912,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                 () = std::future::ready(()) => None,
             };
             match ready {
-                Some(event) => self.handle_transport_event(event)?,
+                Some(event) => {
+                    self.handle_transport_event(event)?;
+                    drained += 1;
+                }
                 None => break,
             }
         }
         let _ = events;
-        Ok(())
+        Ok(drained)
     }
 
     /// Passes gossiped transactions to the forwarder, without waiting for it.
@@ -1031,7 +1061,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // execution layer's verdict, and whether it is *the* block is
                 // consensus's — both check the same hash.
                 let decoded = decompress_block_gossip(&data).and_then(|rlp| {
-                    decode_block_rlp(&rlp, self.header_profile).map(|block| (block, rlp))
+                    decode_block_rlp_raw(&rlp, self.header_profile).map(|block| (block, rlp))
                 });
                 match decoded {
                     Ok((block, rlp)) => {
@@ -1041,11 +1071,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                         }
                         self.remember_body(block_hash, rlp);
                         self.remember_block(block_hash, &block.header);
+                        let convert_at = std::time::Instant::now();
+                        let txs = block.transactions.len();
                         self.driver.cache_payload(block_hash, block.execution_data());
-                        if self.awaiting_bodies.remove(&block_hash) {
-                            self.ready_bodies.push(block_hash);
-                        }
-                        info!(target: "n42.h2.node", ?block_hash, "block body received");
+                        let convert_ms = convert_at.elapsed().as_millis() as u64;
+                        self.import_eagerly(block_hash);
+                        self.body_arrived.insert(block_hash, std::time::Instant::now());
+                        info!(target: "n42.h2.node", ?block_hash, txs, convert_ms, "block body received");
                         self.received_bodies.push(block_hash);
                     }
                     Err(err) => {
@@ -1080,14 +1112,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 Ok(chunk) => {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
-                    match decode_block_rlp(&chunk.rlp, self.header_profile) {
+                    match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
                         Ok(block) if block.block_hash == hash => {
                             self.remember_block(hash, &block.header);
                             self.remember_body(hash, chunk.rlp.to_vec());
                             self.driver.cache_payload(hash, block.execution_data());
-                            if self.awaiting_bodies.remove(&hash) {
-                                self.ready_bodies.push(hash);
-                            }
+                            self.import_eagerly(hash);
                             self.received_bodies.push(hash);
                         }
                         Ok(block) => {
@@ -1110,16 +1140,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Arriving twice — pushed and then gossiped — costs one decode:
                 // everything below is idempotent, and `awaiting_bodies` has
                 // already been emptied by whichever copy came first.
-                match decode_block_rlp(&chunk.rlp, self.header_profile) {
+                match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
                     Ok(block) => {
                         let hash = block.block_hash;
                         if !self.body_store.contains_key(&hash) {
                             self.remember_block(hash, &block.header);
                             self.remember_body(hash, chunk.rlp.to_vec());
                             self.driver.cache_payload(hash, block.execution_data());
-                            if self.awaiting_bodies.remove(&hash) {
-                                self.ready_bodies.push(hash);
-                            }
+                            self.import_eagerly(hash);
                             self.received_bodies.push(hash);
                         }
                     }
@@ -1301,6 +1329,17 @@ impl<E: ExecutionLayer> H2Service<E> {
             debug!(target: "n42.h2.node", view, ?block_hash, "commit for a block the execution layer has not imported; not finalised here");
             return Ok(());
         }
+        // A block the eager import already brought in: the engine asked because
+        // the proposal has arrived, and the answer is already known. Asking the
+        // execution layer again would be a round trip for a block it holds.
+        if let EngineOutput::ExecuteBlock(block_hash) = &output
+            && self.imported.contains(block_hash)
+        {
+            if let Err(err) = self.engine.process_event(ConsensusEvent::BlockImported(*block_hash)) {
+                debug!(target: "n42.h2.node", %err, ?block_hash, "engine rejected an import it had already been told of");
+            }
+            return Ok(());
+        }
         if let EngineOutput::ExecuteBlock(block_hash) = &output
             && (self.far_ahead(*block_hash))
         {
@@ -1312,6 +1351,14 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             debug!(target: "n42.h2.node", ?block_hash, tip = ?self.imported_height, "block runs ahead of the execution layer; held until the pull reaches it");
             return Ok(());
+        }
+        if let EngineOutput::ExecuteBlock(block_hash) = &output
+            && let Some(at) = self.body_arrived.remove(block_hash)
+        {
+            info!(target: "n42.h2.node", ?block_hash, since_body_ms = at.elapsed().as_millis() as u64, "import starting");
+            if self.body_arrived.len() > 256 {
+                self.body_arrived.clear();
+            }
         }
         let action = self.driver.handle_output(&output).await;
         self.apply_driver_action(action, events)?;
@@ -1827,7 +1874,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     break;
                 };
                 budget -= 1;
-                let block = match decode_block_rlp(&chunk.rlp, self.header_profile) {
+                let block = match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
                     Ok(block) => block,
                     Err(err) => {
                         warn!(target: "n42.h2.node", %peer, %err, "peer served a block this node cannot read; catch-up stopped");
@@ -1947,6 +1994,25 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
 
+    /// Starts importing a body the moment it arrives, proposal or no proposal.
+    ///
+    /// The engine asks for a block to be executed when the *proposal* for it
+    /// arrives, and a leader publishes the body before the proposal, so on
+    /// every follower the body sat in the cache while the proposal crossed the
+    /// mesh -- measured on the seven-node fleet as ~240 ms between a body
+    /// arriving and its vote leaving that the execution layer's own import did
+    /// not account for. A body is self-validating; importing it early risks
+    /// nothing but the work, and the vote still waits for the proposal.
+    fn import_eagerly(&mut self, block_hash: B256) {
+        if let Some(at) = self.body_arrived.get(&block_hash) {
+            debug!(target: "n42.h2.node", ?block_hash, waited_ms = at.elapsed().as_millis() as u64, "eager import queued");
+        }
+        self.awaiting_bodies.remove(&block_hash);
+        if !self.imported.contains(&block_hash) && !self.ready_bodies.contains(&block_hash) {
+            self.ready_bodies.push(block_hash);
+        }
+    }
+
     fn remember_imported(&mut self, block_hash: B256) {
         if self.imported.insert(block_hash) {
             self.imported_order.push_back(block_hash);
@@ -2031,6 +2097,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 bal.as_ref(),
             )
         });
+        let mut pushed_to_all = false;
         let data = match own.map(Ok).unwrap_or_else(|| encode_block_rlp(execution, self.header_profile)) {
             Ok(rlp) => {
                 let encoded = started.elapsed();
@@ -2042,10 +2109,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 };
                 let compressed = started.elapsed();
-                self.push_body(&rlp, block_hash);
+                pushed_to_all = self.push_body(&rlp, block_hash);
                 if rlp.len() > 1_000_000 {
                     info!(
                         target: "n42.h2.node",
+                        ?block_hash,
                         bytes = rlp.len(),
                         wire = data.len(),
                         encode_ms = encoded.as_millis() as u64,
@@ -2064,7 +2132,26 @@ impl<E: ExecutionLayer> H2Service<E> {
                 return;
             }
         };
+        // The topic, unless the direct push already reached every member.
+        //
+        // Both used to go out for every block. On a static full mesh the
+        // topic then delivers each body a second time to each member, and
+        // every member forwards the 15 MB message on to its mesh peers -- six
+        // more copies per node per block, read and written on the consensus
+        // loop, because the swarm is polled from it. Measured on the follower
+        // as ~210 ms in the transport drain for one event, the body, before
+        // its import could start. A member that was not pushed to (a gov5
+        // node, or a peer not yet connected) still gets the topic, and any
+        // member can fetch by hash.
+        if pushed_to_all && !self.always_publish_topic {
+            self.remember_topic_skipped(block_hash);
+            return;
+        }
         self.send_body(data, block_hash);
+    }
+
+    fn remember_topic_skipped(&mut self, block_hash: B256) {
+        debug!(target: "n42.h2.node", ?block_hash, "body pushed to every member; topic not used");
     }
 
     /// Hands the body straight to every connected member, alongside the topic.
@@ -2074,12 +2161,16 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// connected to and every gov5 member, which does not speak the protocol.
     /// A body that arrives twice costs one decode and is then recognised as
     /// held.
-    fn push_body(&mut self, rlp: &[u8], block_hash: B256) {
+    /// Pushes the body straight to every connected member. Returns whether
+    /// that reached the whole mesh, so the caller can skip the topic.
+    fn push_body(&mut self, rlp: &[u8], block_hash: B256) -> bool {
         if !self.direct_push {
-            return;
+            return false;
         }
-        let sent = self.transport.push_block_to_all(&rlp);
+        let peers = self.transport.connected_peer_ids().len();
+        let sent = self.transport.push_block_to_all(rlp);
         debug!(target: "n42.h2.node", ?block_hash, peers = sent, "pushed the body to the fleet");
+        sent > 0 && sent == peers
     }
 
     fn send_body(&mut self, data: Vec<u8>, block_hash: B256) {
