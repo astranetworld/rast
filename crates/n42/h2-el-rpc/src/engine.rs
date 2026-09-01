@@ -792,11 +792,23 @@ pub fn built_block_from_parts(
     parent_beacon_block_root: B256,
 ) -> Result<BuiltBlock, ElError> {
     use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
-    let (header, transactions, withdrawals) = split_block_rlp(&block)?;
+    let (mut header, transactions, withdrawals) = split_block_rlp(&block)?;
     // Blob transactions need the blobs bundle, which this path does not carry.
     if transactions.iter().any(|tx| tx.first() == Some(&0x03)) {
         return Err(ElError::new("raw payload path cannot carry blob transactions"));
     }
+    // A V4 payload carries EIP-7843's slot number and every importer writes it
+    // into the header it rebuilds, so the header sealed here has to carry the
+    // same value or no importer reproduces the hash. This chain has no slots
+    // and its builder leaves the field empty; the block number stands in, as
+    // it does on the JSON path.
+    let slot_number = if block_access_list.is_some() {
+        let slot = header.slot_number.unwrap_or(header.number);
+        header.slot_number = Some(slot);
+        slot
+    } else {
+        header.number
+    };
     let hash = header.hash_slow();
     let v1 = ExecutionPayloadV1 {
         parent_hash: header.parent_hash,
@@ -832,7 +844,7 @@ pub fn built_block_from_parts(
                 Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
                     payload_inner: v3,
                     block_access_list,
-                    slot_number: header.number,
+                    slot_number,
                 }),
                 None => ExecutionPayload::V3(v3),
             }
@@ -892,6 +904,43 @@ mod raw_payload_tests {
     fn legacy() -> TxEnvelope {
         let tx = TxLegacy { chain_id: Some(1), nonce: 4, gas_price: 10, gas_limit: 21_000, to: TxKind::Call(Address::repeat_byte(3)), value: U256::from(1), ..Default::default() };
         TxEnvelope::Legacy(alloy_consensus::Signed::new_unchecked(tx, Signature::test_signature(), Default::default()))
+    }
+
+    /// An Amsterdam block over the raw path, sealed from its header, is a block
+    /// a follower reconstructs: the payload's slot number and the sealed
+    /// header's agree, and the access-list hash survives.
+    #[test]
+    fn an_amsterdam_raw_payload_seals_and_reconstructs() {
+        let bal = alloy_primitives::Bytes::from(alloy_rlp::encode(&alloy_eip7928::BlockAccessList::default()));
+        let decoded = <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(&mut bal.as_ref()).unwrap();
+        let txs = vec![typed(), legacy()];
+        let header = Header {
+            number: 3,
+            base_fee_per_gas: Some(7),
+            // As an execution layer would hand it over: the real root, not a
+            // default; a header that disagrees with its own body is not a
+            // block any builder produces.
+            transactions_root: alloy_consensus::proofs::calculate_transaction_root(&txs),
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            block_access_list_hash: Some(alloy_eip7928::compute_block_access_list_hash(decoded.as_slice())),
+            slot_number: None,
+            ..Default::default()
+        };
+        let block = Block { header, body: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(alloy_eips::eip4895::Withdrawals(Vec::new())) } };
+        let rlp = alloy_rlp::encode(&block);
+        let built = built_block_from_parts(rlp.into(), Some(Vec::new()), Some(bal), B256::repeat_byte(7)).expect("builds");
+        let header = built.header.clone().expect("the raw path carries the header");
+        let (sealed_data, sealed_header) =
+            n42_h2_consensus::normalize_to_gov5_h2_from_header(header, &built.execution_data, 9, None).expect("seals");
+        assert_eq!(sealed_data.block_hash(), sealed_header.hash_slow());
+        let rebuilt = n42_h2_consensus::reconstruct_gov5_h2_block::<TxEnvelope>(&sealed_data)
+            .expect("a follower reconstructs the sealed block");
+        assert_eq!(rebuilt.header.hash_slow(), sealed_data.block_hash());
+        assert_eq!(rebuilt.header, sealed_header);
     }
 
     /// The split hands back exactly the bytes `encoded_2718` would, for both a

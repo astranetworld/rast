@@ -30,6 +30,8 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+n42-h2-consensus.workspace = true
+alloy-eip7928.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 async-trait = "0.1"
 alloy-eips = { workspace = true, features = ["serde"] }
