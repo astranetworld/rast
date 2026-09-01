@@ -2569,3 +2569,124 @@ mid-round) -- so it corroborates rather than confirms.
 Against the 160,000 target that is still a factor of 1.8, and the credit for
 moving 65k -> 87k belongs to the raw payload channel, the parallel assembler
 and the single follower decode, not to anything in this section.
+
+## Round 23: the follower, profiled
+
+### What the CPU profile of a follower says
+
+`perf` on node 1 through a measured window, the `profiling` build, read by
+thread. Symbols with `--no-inline`; with inline resolution `perf report` did
+not finish in an hour against this binary's debug info.
+
+| thread | share | what it is doing |
+|---|---:|---|
+| `cpu-NN` x32 (rayon) | ~60% | secp256k1 sender recovery (57% of all samples) and keccak |
+| `tokio-rt` | 9% | RPC, ingest, gossip |
+| `txpool-prewarm` | 7% | pool-side prewarming |
+| **`payload-convert`** | **5.5%** | keccak 51%, RLP decode, trie |
+| `engine` (serial execution) | 5.1% | blake3 15% (QMDB), then revm state/journal spread thin |
+| `receipt-root`, `persistence` | 2-3% | |
+
+Two things fell out of it, one large and one that rewrites an earlier
+conclusion.
+
+**The follower converted every payload three times.** `payload-convert` was as
+busy as the execution thread. This validator's `convert_payload_to_block`
+reconstructed the gov5 block (a full decode with the transactions trie), then
+decoded again to learn the Ethereum-shaped hash, then called reth's validator
+which decoded a third time — all before the block reached the engine, i.e.
+before the "payload -> canonical" phase this file has been measuring. It now
+decodes once and runs reth's field checks (shanghai/cancun/prague) on that
+block; the gov5 reconstruction is header arithmetic on the same block.
+
+**The sender-recovery cache was never wired.** `N42Node`'s executor builder
+created `EthEvmConfig::new(chain_spec)` and stopped; upstream's attaches
+`ctx.sender_recovery_cache()` there, and reth consults the cache *on the EVM
+config* at import. So `--engine.sender-recovery-cache` measured inert twice
+in this file (rounds 18) because the cache did not exist on the path that
+reads it, and the ingest was handed `None` to populate. The "eleventh
+confirmed-but-inert mechanism" was a mechanism that had never been enabled.
+It is attached now, sized at twice the pool (`N42_SENDER_CACHE_MULT=2`,
+4,194,304 slots).
+
+### Measured
+
+| | before (`asm2`) | after (`final`, run by the other session on this tree) |
+|---|---:|---:|
+| follower payload -> canonical, median | 713 ms | **626 ms** |
+| leader's own `newPayload` round trip | 717-849 ms | **646-683 ms** |
+| win2 | 86,930 | 86,931 |
+
+Window 2 is 16 blocks either way — the 30 s window quantises to 12/13/14/15/16
+blocks, which is 65,197 / 70,631 / 76,058 / 81,497 / 86,931 TPS, and every
+number in rounds 22-23 is one of those. The cycle behind 16 is 1.875 s; the
+next step is 17 blocks at 1.765 s, which window 1 of `conv2` reached once
+(82,765, occupancy 89.6%).
+
+### A regression, found by the other session
+
+The raw payload path broke Amsterdam: for a V4 payload the client named the
+block number as EIP-7843's slot while the header the fast seal signed had none,
+and every importer rebuilt a header with the payload's slot and could not
+reproduce the hash. Block 1 refused on every node. Fixed with a unit test that
+takes an Amsterdam block over the raw path, seals it from the header and
+reconstructs it as a follower would (`1b5a77cfe`). The Osaka rounds never saw
+it because only V4 carries a slot.
+
+Two sessions were launching rounds on one fleet root that evening and wiped
+each other twice; `fleet7-bench.sh` now holds `flock` on the root for the
+whole round.
+
+## The window TPS in this file is an integer block count in disguise
+
+Every window recorded above is full blocks of exactly 163,000 transactions over
+30 seconds. So the "TPS" column was never a measurement of throughput; it is
+`blocks x 163,000 / 30`, an integer times a constant:
+
+| blocks | tps | cycle |
+|---:|---:|---:|
+| 12 | 65,200 | 2.500s |
+| 13 | 70,633 | 2.308s |
+| 14 | 76,067 | 2.143s |
+| 15 | 81,500 | 2.000s |
+| 16 | 86,933 | 1.875s |
+| 17 | 92,367 | 1.765s |
+
+Against what this file actually recorded: 65,198, 70,606, 76,058, 81,497,
+86,931. The same numbers. The `osaka-ctl` / `raw1` / `asm1` comparison is
+12/13 vs 14/13 vs 15/15 blocks.
+
+Three consequences, and the third is the one that matters.
+
+**The metric's resolution is one block** -- 5,433 TPS, which is 8.3% at twelve
+blocks and 6.2% at sixteen. This is the mechanism behind the rule already in
+CLAUDE.md that a difference under about 10% between single rounds is invisible.
+It is not sampling noise; below one block the difference is *unrepresentable*.
+A real 5% improvement reports as exactly zero, and a real 1% and a real 6%
+report as the same number.
+
+**The derived cycle is not an escape.** `cycle = 30 / blocks` is the same
+integer wearing different units, and inherits the same resolution.
+
+**"asm1's windows 2 and 3 are identical to the transaction" said nothing.**
+It was recorded above as though the round were unusually reproducible. Both
+windows held 15 blocks; two windows agreeing to the transaction is what
+*always* happens when the block count matches and every block is full. It is
+an artifact of the metric, not a property of the configuration.
+
+### What to measure instead
+
+The interval between consecutive block timestamps, as a mean and a spread over
+the whole round. It is continuous, so a 3% change is a 3% reading; it gives a
+variance for free, so a round can state its own confidence instead of borrowing
+the repeat-script's; and it separates a cycle that got tighter from one whose
+tail got shorter, which a window count cannot express at all.
+
+### The target, in the unit that is continuous
+
+At this block size, 160,000 TPS is a **1.019 s cycle** and today's window 2 is
+1.875 s. The user's 720,000 would be 0.226 s. Stating the goal as "1.8x the
+throughput" hides that the whole remaining distance is 856 ms of cycle, which
+is the same budget the phase breakdown above is already itemising: pool 75,
+execution 230, transactions trie ~110, QMDB root ~100, ~100 between the builder
+finishing and the validator holding the block, and 684 on the follower.

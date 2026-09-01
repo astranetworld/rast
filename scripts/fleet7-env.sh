@@ -315,7 +315,11 @@ f7_el_args() {
       # Memory. The defaults are sized for a mainnet archive node on a
       # dedicated host; each of these is per node, so the figure to read is
       # seven times what it says.
-      --engine.cross-block-cache-size 128   # default 4096 MB
+      # F7_CROSS_BLOCK_CACHE_MB overrides it for a round: at the 163,000-
+      # transaction tier with 2,000,000 recipients the accounts a block reads
+      # do not fit in 128 MB, and a follower's execution reads them from the
+      # state provider instead of the cache.
+      --engine.cross-block-cache-size "${F7_CROSS_BLOCK_CACHE_MB:-128}"   # default 4096 MB
 
       # Worker counts, which are a memory setting in the lean tier and a
       # throughput setting in the bench tier -- the same three numbers, read

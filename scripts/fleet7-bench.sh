@@ -209,6 +209,15 @@ source "$HERE/fleet7-env.sh"
 # a failure that leaves a wrong number.
 OUT=$F7_ROOT/bench-$TAG
 mkdir -p "$OUT"
+# One round at a time on this root. Two sessions launching rounds on the same
+# datadirs wiped each other's fleets mid-window twice in one evening; the lock
+# is held for the whole round and a second launcher refuses rather than waits,
+# because a round that waited would start on a chain it did not decay itself.
+exec 9>"$F7_ROOT/.round.lock"
+if ! flock -n 9; then
+  echo "REFUSING: another round holds $F7_ROOT/.round.lock (pgrep -f 'fleet7-benc[h].sh')" >&2
+  exit 1
+fi
 exec > >(tee -a "$OUT/round.txt") 2>&1
 
 f7_check_binary_fresh || exit 1
