@@ -52,6 +52,7 @@ reth-payload-builder-primitives.workspace = true
 reth-payload-primitives.workspace = true
 reth-basic-payload-builder.workspace = true
 reth-ethereum-payload-builder.workspace = true
+reth-payload-validator.workspace = true
 reth-node-ethereum = { workspace = true, features = ["test-utils"] }
 reth-tracing.workspace = true
 reth-trie-db.workspace = true

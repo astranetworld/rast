@@ -454,11 +454,27 @@ pub fn execution_data_for_block_with_bal(
 pub fn reconstruct_gov5_h2_block<T: alloy_eips::Decodable2718>(
     execution: &ExecutionData,
 ) -> Result<Block<T>, HeaderProfileError> {
-    let expected = execution.block_hash();
-    let mut block = execution
+    let block = execution
         .clone()
         .try_into_block::<T>()
         .map_err(|e| HeaderProfileError::Reconstruction(e.to_string()))?;
+    reconstruct_gov5_h2_block_from(block, execution)
+}
+
+/// [`reconstruct_gov5_h2_block`] for a caller that has already decoded the
+/// payload into its Ethereum-shaped block.
+///
+/// Decoding is the expensive half — 163,000 transactions, a hash each, and
+/// the transactions trie over them — and the follower's validator was doing
+/// it three times per block: once here, once to learn the Ethereum-shaped
+/// hash, and once inside reth's own well-formedness check. Everything this
+/// function does on top is header arithmetic: a handful of candidate headers,
+/// each hashed once.
+pub fn reconstruct_gov5_h2_block_from<T>(
+    mut block: Block<T>,
+    execution: &ExecutionData,
+) -> Result<Block<T>, HeaderProfileError> {
+    let expected = execution.block_hash();
     validate_gov5_h2_header(&block.header)?;
     // Two more fields a payload cannot carry as gov5 wrote them: the
     // withdrawals root, which gov5 fills with its rewards commitment (the

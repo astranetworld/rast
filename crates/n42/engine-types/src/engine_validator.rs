@@ -20,7 +20,7 @@
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes as EthPayloadAttributes, PayloadError};
 use n42_h2_consensus::header_profile::N42HeaderProfile;
-use n42_h2_consensus::reconstruct_gov5_h2_block;
+use n42_h2_consensus::reconstruct_gov5_h2_block_from;
 use n42_qmdb_reth::HotStuffGenesisConfig;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_primitives::{EngineApiValidator, EngineTypes, PayloadValidator};
@@ -51,14 +51,18 @@ pub fn header_profile_for<ChainSpec: EthChainSpec>(chain_spec: &ChainSpec) -> N4
 #[derive(Clone, Debug)]
 pub struct N42EngineValidator<ChainSpec> {
     inner: EthereumEngineValidator<ChainSpec>,
+    /// The same chain spec `inner` holds, for the fork checks this validator
+    /// runs itself.
+    chain_spec: Arc<ChainSpec>,
     profile: N42HeaderProfile,
 }
 
 impl<ChainSpec> N42EngineValidator<ChainSpec> {
     /// A validator for `chain_spec` under `profile`.
-    pub const fn new(chain_spec: Arc<ChainSpec>, profile: N42HeaderProfile) -> Self {
+    pub fn new(chain_spec: Arc<ChainSpec>, profile: N42HeaderProfile) -> Self {
         Self {
-            inner: EthereumEngineValidator::new(chain_spec),
+            inner: EthereumEngineValidator::new(chain_spec.clone()),
+            chain_spec,
             profile,
         }
     }
@@ -88,26 +92,45 @@ where
         }
 
         let expected_hash = payload.block_hash();
-        // The block gov5 hashed: header profile checked, ommers hash and
-        // difficulty restored, hash confirmed.
-        let block = reconstruct_gov5_h2_block::<TransactionSigned>(&payload)
-            .map_err(|err| NewPayloadError::Other(err.into()))?;
 
-        // reth's own checks on the same payload, told the hash of the
-        // Ethereum-shaped header so its hash comparison is against the
-        // header it will build. Its verdict on everything else — blob
-        // hashes, fork fields — is the one that counts.
-        let mut ethereum_shaped = payload;
-        let ethereum_hash = ethereum_shaped
+        // Decoded once. This used to be three full conversions of the same
+        // payload -- the reconstruction, a second to learn the Ethereum-shaped
+        // hash, and a third inside reth's well-formedness check -- each of
+        // them 163,000 transaction decodes, a hash per transaction and the
+        // transactions trie, on the follower's critical path before the block
+        // was even handed to the engine. A CPU profile of a follower showed
+        // the conversion thread as busy as the execution thread.
+        let ethereum_shaped = payload
+            .payload
             .clone()
-            .try_into_block::<TransactionSigned>()?
-            .header
-            .hash_slow();
-        ethereum_shaped.payload.set_block_hash(ethereum_hash);
-        <EthereumEngineValidator<ChainSpec> as PayloadValidator<Types>>::convert_payload_to_block(
-            &self.inner,
-            ethereum_shaped,
+            .try_into_block_with_sidecar::<TransactionSigned>(&payload.sidecar)?;
+        let ethereum_shaped = SealedBlock::seal_slow(ethereum_shaped);
+
+        // reth's checks on the Ethereum-shaped block, the same ones its own
+        // validator runs after converting: fork fields and sidecar shape. Its
+        // verdict on those is the one that counts; the hash comparison is
+        // this validator's, against gov5's header, below.
+        let timestamp = ethereum_shaped.timestamp;
+        reth_payload_validator::shanghai::ensure_well_formed_fields(
+            ethereum_shaped.body(),
+            self.chain_spec.is_shanghai_active_at_timestamp(timestamp),
         )?;
+        reth_payload_validator::cancun::ensure_well_formed_fields(
+            &ethereum_shaped,
+            payload.sidecar.cancun(),
+            self.chain_spec.is_cancun_active_at_timestamp(timestamp),
+        )?;
+        reth_payload_validator::prague::ensure_well_formed_fields(
+            ethereum_shaped.body(),
+            payload.sidecar.prague(),
+            self.chain_spec.is_prague_active_at_timestamp(timestamp),
+        )?;
+
+        // The block gov5 hashed: header profile checked, ommers hash and
+        // difficulty restored, hash confirmed -- header arithmetic on the
+        // block already decoded.
+        let block = reconstruct_gov5_h2_block_from(ethereum_shaped.into_block(), &payload)
+            .map_err(|err| NewPayloadError::Other(err.into()))?;
 
         let sealed = SealedBlock::seal_slow(block);
         if sealed.hash() != expected_hash {

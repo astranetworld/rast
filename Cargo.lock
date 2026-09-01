@@ -7914,6 +7914,7 @@ dependencies = [
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
+ "reth-payload-validator",
  "reth-primitives-traits",
  "reth-provider",
  "reth-revm",

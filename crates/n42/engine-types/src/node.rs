@@ -381,7 +381,17 @@ where
     type EVM = EthEvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(EthEvmConfig::new(ctx.chain_spec()))
+        // The sender-recovery cache, as upstream's Ethereum node attaches it.
+        // This builder never did, which is why `--engine.sender-recovery-cache`
+        // measured inert twice on the seven-node fleet: reth consults the
+        // cache on the EVM config at import, and this config had none, so
+        // every transaction was recovered again on the worker pool -- the
+        // same pool the ingest and the prewarmer recover on.
+        let mut evm_config = EthEvmConfig::new(ctx.chain_spec());
+        if let Some(cache) = ctx.sender_recovery_cache() {
+            evm_config = evm_config.with_sender_recovery_cache(cache.clone());
+        }
+        Ok(evm_config)
     }
 }
 
