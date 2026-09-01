@@ -1011,7 +1011,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         warn!(target: "n42.h2.node", ?block_hash, "block body not available");
                     }
                     ServiceEvent::BodyReceived { block_hash } => {
-                        debug!(target: "n42.h2.node", ?block_hash, "block body received");
+                        info!(target: "n42.h2.node", ?block_hash, "block body received");
                     }
                     _ => {}
                 }
