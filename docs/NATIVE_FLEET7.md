@@ -2690,3 +2690,83 @@ throughput" hides that the whole remaining distance is 856 ms of cycle, which
 is the same budget the phase breakdown above is already itemising: pool 75,
 execution 230, transactions trie ~110, QMDB root ~100, ~100 between the builder
 finishing and the validator holding the block, and 684 on the follower.
+
+## Round 24: the follower's loop, and a continuous cycle
+
+### The instrument first
+
+A 30 s window counts whole blocks, so at this tier its TPS is an integer times
+5,433: 65,197 / 70,631 / 76,058 / 81,497 / 86,931 / 92,363 / 97,776 for 12 to
+18 blocks. A 6% change is one count and a 5% one is invisible, which makes
+every single-round comparison in rounds 22-23 a direction at best. The other
+session pointed this out, and it is right. `scripts/fleet7-cycle.py` reports
+the interval between consecutive full blocks (mean, median, p90) from the
+execution layer's log, and `scripts/fleet7-viewcycle.py` splits each cycle on
+the next leader's clock into four segments that sum to it exactly:
+publish -> receive, receive -> vote, vote -> decide, decide -> publish.
+
+Re-read that way, the day so far (node 0, full-block intervals, mean / median):
+
+| round | change | cycle |
+|---|---|---:|
+| `instr1` | baseline + ingest fix | 2.303 / 2.310 s |
+| `raw1` | raw getPayload, header seal | 2.166 / 2.159 |
+| `asm1` | parallel assembler | 1.973 / 1.947 |
+| `raw2` | loopback payload channel | 2.068 / 2.031 |
+| `conv1` | one follower decode, sender cache wired | 1.878 / 1.852 |
+| `cache4g` | cross-block cache 4096 MB | 1.871 / 1.865 (no effect) |
+| `ahead1` | + build-ahead | 2.171 / 1.957 (worse; stays off) |
+| `rawnp1` | raw newPayload | 1.868 / 1.837 (no effect on its own) |
+| `direct2` | direct push, topic skipped | 1.842 / 1.834 |
+| `rawbody1` | body handed over undecoded | 2.411 / **1.650** (p90 7.3 s) |
+| **`yamuxbuf1`** | yamux buffer cap = window | **1.654 / 1.544 (p90 2.21)** |
+
+### What the follower's loop was doing
+
+`cache4g`, on the next leader's clock (medians): publish -> receive 248 ms,
+**receive -> vote 922 ms**, vote -> decide 7 ms, decide -> publish 579 ms. The
+execution layer's own import inside the 922 was 637. Timing the loop's stages
+found the rest:
+
+* **~210 ms handling the body event.** With the block topic carrying bodies,
+  each member received a 15 MB message and, as a gossipsub mesh member,
+  forwarded it to six peers — from the consensus loop, because the swarm is
+  polled there. Direct push was off in every bench round (`F7_DIRECT_PUSH`
+  defaulted to 0); on, and with the topic skipped once the push reached every
+  member, the same event costs ~30 ms.
+* **The body was decoded and re-encoded.** 163,000 transactions parsed into
+  envelopes, the transactions root checked, every one encoded back for the
+  payload — ~200 ms — and the execution layer decodes once more regardless.
+  The body is now split into header and transaction bytes and the payload
+  built from those (`execution_data_from_raw_parts`, tested equal to the
+  typed path).
+* **The JSON `newPayload` was not the cost it looked.** Replacing it with the
+  loopback channel (5-13 ms to decode on the execution layer) moved the
+  receive -> vote median by 30 ms. It stays, because it is strictly less
+  work, but the ~285 ms it was supposed to explain was the two items above.
+* **Importing on body arrival rather than proposal arrival** changed nothing
+  measurable: the proposal follows the body by ~25 ms.
+
+### The tail was yamux closing connections
+
+Every recent round had 18-36 `yamux::connection: buffer of stream grows beyond
+limit` per node, each followed by `dial failed`. The 16 MiB receive window
+was set in round 18; yamux 0.12's separate 1 MiB per-stream buffer cap was not,
+and it closes the whole connection when unread data passes it. A validator
+that awaits a 700 ms import does not poll its swarm meanwhile, so a peer
+sending into the window filled the cap in that time. When the dropped
+connection carried a proposal or a quorum's votes, the view timed out at six
+seconds — the p90 of 2.4 s and the p99 of 7 s. With the cap at the window:
+zero drops, p90 2.21 s, and windows of 19/18/17 blocks.
+
+### Where the cycle is now
+
+`yamuxbuf1`: median 1.544 s, mean 1.654 s. The next leader's clock, from the
+last decomposable round (`cache4g`, before the follower fixes) and the
+follower's own timings after them: receive -> vote is now ~730 ms of which the
+execution layer's import is ~700; decide -> publish ~580-640 of which the
+build is ~500; publish -> receive ~250-300 for a 13-15 MB body across loopback,
+which at 50 MB/s is the next thing that does not look like a floor.
+
+160,000 TPS at this block size is a 1.019 s cycle. From 1.544: the import
+(700), the build (500) and the transfer (250-300) each have to give.
