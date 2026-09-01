@@ -2518,3 +2518,54 @@ holding the block. On the follower: 684 ms from payload to canonical, of
 which execution is ~584 — 2.5x what the builder spends executing the same
 transactions. That ratio is the next thing to explain, with a profile rather
 than a guess.
+
+## Retraction: "gate 9" was not a header-reconstruction defect, and the Amsterdam round that "proved" it was misconfigured
+
+Two things recorded above are withdrawn.
+
+**The defect.** What this file calls gate 9 -- an Amsterdam header that would
+not round-trip through a payload, isolated into the `#[ignore]`d test
+`a_header_with_an_access_list_hash_is_reconstructible` -- was not in
+`header_profile.rs` at all. On the raw-payload path a V4 payload was given
+`slot_number = block number` while the EL-built header the fast seal signs
+carried `slot_number: None`, so block 1 failed with "no gov5 header variant
+hashes". Fixed in `crates/n42/h2-el-rpc/src/engine.rs` (`1b5a77cfe`), with an
+Amsterdam round-trip test, by the other session working this tree. The
+candidate-dimension work I added to `reconstruct_gov5_h2_block` was aimed at a
+field that was never wrong.
+
+**The round that seemed to confirm it.** The Amsterdam round reported here as
+"the chain is not making empty blocks" was run without `F7_AMSTERDAM=1`. That
+flag is what sets `F7_TX_GAS=210000` *and* runs the precreate flood; without it
+no recipient exists, every transfer creates its account at ~205,000 gas, and
+the senders are funded for 21,000. I had meanwhile added a competing `--gas`
+to the bench script -- duplicating `F7_TX_GAS`, already committed in
+`7f5be619e`, and putting two `--gas` flags on the precreate command line. The
+round measured that misconfiguration. It says nothing about the chain, and the
+edit is reverted.
+
+The shared lesson is not about Amsterdam. Both errors are the same move:
+**reading a dirty or unfamiliar tree as my own and acting before running
+`git log`.** The same move committed another session's working tree as
+`ab98225dc`, and launched fleet rounds that destroyed two of its measurements
+mid-window. One tree and one fleet root need one writer at a time: take
+`flock /data/blockchain/rust-fleet7-bench/.round.lock`, or at minimum check
+`pgrep -f 'fleet7-benc[h].sh'`, before any round.
+
+One residual, unfixed because the file belongs to the other session: the
+`--gasceil` tier sizing computes `blk=$(( GASCEIL / 21000 ))` before
+`F7_TX_GAS` is defaulted, so an Amsterdam round still sizes its pool and ingest
+gate from 21,000 -- about ten times what a 210,000-gas block holds.
+
+### Where the number actually stands
+
+On the default Osaka path, on the tree including the other session's
+raw-payload and parallel-assembler work: win1 32,599 / **win2 86,931** / win3
+65,198 TPS, 100% occupancy and full(>=95%) in every window, win2 cycle 1.875 s.
+This reproduces that session's independently measured 87k. Its provenance is
+imperfect -- the round overlapped a rebuild of `h2_validator` (binary mtime
+mid-round) -- so it corroborates rather than confirms.
+
+Against the 160,000 target that is still a factor of 1.8, and the credit for
+moving 65k -> 87k belongs to the raw payload channel, the parallel assembler
+and the single follower decode, not to anything in this section.
