@@ -20,18 +20,30 @@
 //! # Wire
 //!
 //! ```text
-//! request  := u64 payload id (the Engine API's 8 bytes, little-endian)
-//! reply    := u8 status            0 = unknown build, 1 = block follows, 2 = error (u32 len + message)
-//!             u32 len, block RLP   [header, transactions, ommers, withdrawals]
-//!             u8 has_requests, [u32 n, n x (u32 len, bytes)]
-//!             u8 has_bal, [u32 len, bytes]
+//! request  := u8 kind (n42_h2_execution::raw_engine::request), then:
+//!   GET_PAYLOAD: u64 payload id (the Engine API's 8 bytes, little-endian)
+//!   reply    := u8 status            0 = unknown build, 1 = block follows, 2 = error (u32 len + message)
+//!               u32 len, block RLP   [header, transactions, ommers, withdrawals]
+//!               u8 has_requests, [u32 n, n x (u32 len, bytes)]
+//!               u8 has_bal, [u32 len, bytes]
+//!   NEW_PAYLOAD: u32 len, encoded ExecutionData (raw_engine::encode_execution_data)
+//!   reply    := u8 status            1 = payload status follows, 2 = error (u32 len + message)
+//!               u32 len, encoded PayloadStatus
 //! ```
+//!
+//! `NEW_PAYLOAD` is the follower's half: the same `engine_newPayload`, handed
+//! to the engine as the [`ExecutionData`] it wants without 39 MB of hex on the
+//! way. Measured before it existed: ~285 ms between a body arriving at the
+//! validator and its vote that the execution layer's own import (637 ms) did
+//! not account for.
 
 use std::net::SocketAddr;
 
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::Encodable2718;
 use alloy_rlp::Encodable;
+use n42_h2_execution::raw_engine::{self, request};
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::EthBuiltPayload;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
@@ -90,10 +102,14 @@ where
     out
 }
 
-/// Serves built blocks on `addr` until the process ends.
-pub async fn serve<T>(addr: SocketAddr, payloads: PayloadBuilderHandle<T>) -> std::io::Result<()>
+/// Serves built blocks and imports on `addr` until the process ends.
+pub async fn serve<T>(
+    addr: SocketAddr,
+    payloads: PayloadBuilderHandle<T>,
+    engine: ConsensusEngineHandle<T>,
+) -> std::io::Result<()>
 where
-    T: PayloadTypes<BuiltPayload = EthBuiltPayload> + 'static,
+    T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
     info!(target: "n42.payload_serve", %addr, "raw payload channel listening");
@@ -106,25 +122,83 @@ where
             }
         };
         let payloads = payloads.clone();
+        let engine = engine.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(stream, payloads).await {
+            if let Err(err) = serve_connection(stream, payloads, engine).await {
                 debug!(target: "n42.payload_serve", %peer, %err, "raw payload connection ended");
             }
         });
     }
 }
 
-async fn serve_connection<T>(mut stream: TcpStream, payloads: PayloadBuilderHandle<T>) -> std::io::Result<()>
+async fn serve_connection<T>(
+    mut stream: TcpStream,
+    payloads: PayloadBuilderHandle<T>,
+    engine: ConsensusEngineHandle<T>,
+) -> std::io::Result<()>
 where
-    T: PayloadTypes<BuiltPayload = EthBuiltPayload> + 'static,
+    T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     stream.set_nodelay(true)?;
     loop {
-        let id = match stream.read_u64_le().await {
-            Ok(id) => id,
+        let kind = match stream.read_u8().await {
+            Ok(kind) => kind,
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
+        if kind == request::NEW_PAYLOAD {
+            let len = stream.read_u32_le().await? as usize;
+            if len > 256 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload frame too large"));
+            }
+            let mut frame = vec![0u8; len];
+            stream.read_exact(&mut frame).await?;
+            let started = std::time::Instant::now();
+            let mut out: Vec<u8> = Vec::with_capacity(96);
+            match raw_engine::decode_execution_data(&frame) {
+                Err(err) => {
+                    out.push(2);
+                    out.extend_from_slice(&(err.len() as u32).to_le_bytes());
+                    out.extend_from_slice(err.as_bytes());
+                }
+                Ok(data) => {
+                    let decoded = started.elapsed();
+                    let number = data.payload.block_number();
+                    let txs = data.payload.as_v1().transactions.len();
+                    match engine.new_payload(data).await {
+                        Ok(status) => {
+                            if txs > 10_000 {
+                                info!(
+                                    target: "n42.payload_serve",
+                                    number,
+                                    txs,
+                                    decode_ms = decoded.as_millis() as u64,
+                                    engine_ms = started.elapsed().saturating_sub(decoded).as_millis() as u64,
+                                    status = ?status.status,
+                                    "raw newPayload"
+                                );
+                            }
+                            let encoded = raw_engine::encode_payload_status(&status);
+                            out.push(1);
+                            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                            out.extend_from_slice(&encoded);
+                        }
+                        Err(err) => {
+                            let message = err.to_string();
+                            out.push(2);
+                            out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                            out.extend_from_slice(message.as_bytes());
+                        }
+                    }
+                }
+            }
+            stream.write_all(&out).await?;
+            continue;
+        }
+        if kind != request::GET_PAYLOAD {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("request kind {kind}")));
+        }
+        let id = stream.read_u64_le().await?;
         let id = alloy_rpc_types_engine::PayloadId::new(id.to_le_bytes());
         let started = std::time::Instant::now();
         let resolved = payloads.resolve_kind(id, PayloadKind::WaitForPending).await;

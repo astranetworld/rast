@@ -92,6 +92,9 @@ pub struct EngineApiClient<T> {
     /// The loopback channel this repo's execution layer serves built blocks
     /// on as bytes (`payload_serve`), once its address has been asked for.
     raw_channel: tokio::sync::Mutex<RawChannel>,
+    /// A second connection to the same channel for imports, so a build being
+    /// collected never waits behind a block being executed.
+    raw_import: tokio::sync::Mutex<RawChannel>,
 }
 
 /// State of the raw payload channel. See `payload_serve` in `bin/n42`.
@@ -112,6 +115,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             fcu_rung: std::sync::atomic::AtomicUsize::new(0),
             raw_payloads: std::sync::atomic::AtomicBool::new(true),
             raw_channel: tokio::sync::Mutex::new(RawChannel::default()),
+            raw_import: tokio::sync::Mutex::new(RawChannel::default()),
         }
     }
 
@@ -465,6 +469,10 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
     }
 
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
+        // The loopback channel first; any failure falls through to JSON.
+        if let Some(status) = self.new_payload_over_channel(&payload).await {
+            return Ok(status);
+        }
         let (method, params) = new_payload_call(&payload)?;
         debug!(target: "n42.h2.el", method, "newPayload");
         self.call(method, params).await.map_err(ElError::new)
@@ -610,18 +618,8 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 }
 
 impl<T: JsonRpcTransport> EngineApiClient<T> {
-    /// Collects a build over the raw payload channel.
-    ///
-    /// `None` means "not this way": no channel, a channel that failed, or an
-    /// execution layer that does not serve one — the caller then uses the
-    /// JSON forms. `Some(None)` is the channel saying the build is unknown.
-    async fn resolve_over_channel(
-        &self,
-        id: PayloadId,
-        beacon_root: B256,
-    ) -> Option<Option<Result<BuiltBlock, ElError>>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut channel = self.raw_channel.lock().await;
+    /// Learns the raw channel's address once, from `n42Engine_payloadEndpoint`.
+    async fn raw_endpoint(&self, channel: &mut RawChannel) -> Option<std::net::SocketAddr> {
         if channel.endpoint.is_none() {
             let found = match self.transport.call("n42Engine_payloadEndpoint", vec![]).await {
                 Ok(Value::String(addr)) => addr.parse::<std::net::SocketAddr>().ok(),
@@ -635,7 +633,82 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             debug!(target: "n42.h2.el", ?found, "raw payload endpoint");
             channel.endpoint = Some(found);
         }
-        let addr = (*channel.endpoint.as_ref()?)?;
+        (*channel.endpoint.as_ref()?)
+    }
+
+    /// Hands a payload to the execution layer over the raw channel.
+    ///
+    /// `None` means "not this way" and the caller uses JSON.
+    async fn new_payload_over_channel(&self, payload: &ExecutionData) -> Option<PayloadStatus> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut channel = self.raw_import.lock().await;
+        let addr = self.raw_endpoint(&mut channel).await?;
+        let started = std::time::Instant::now();
+        let frame = n42_h2_execution::raw_engine::encode_execution_data(payload);
+        let encoded = started.elapsed();
+        let attempt: std::io::Result<PayloadStatus> = async {
+            if channel.stream.is_none() {
+                let stream = tokio::net::TcpStream::connect(addr).await?;
+                stream.set_nodelay(true)?;
+                channel.stream = Some(stream);
+            }
+            let stream = channel.stream.as_mut().expect("just connected");
+            stream.write_u8(n42_h2_execution::raw_engine::request::NEW_PAYLOAD).await?;
+            stream.write_u32_le(frame.len() as u32).await?;
+            stream.write_all(&frame).await?;
+            match stream.read_u8().await? {
+                1 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut buf = vec![0u8; len];
+                    stream.read_exact(&mut buf).await?;
+                    n42_h2_execution::raw_engine::decode_payload_status(&buf)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                }
+                2 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut message = vec![0u8; len];
+                    stream.read_exact(&mut message).await?;
+                    Err(std::io::Error::other(String::from_utf8_lossy(&message).into_owned()))
+                }
+                other => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
+            }
+        }
+        .await;
+        match attempt {
+            Ok(status) => {
+                if frame.len() > 1_000_000 {
+                    debug!(
+                        target: "n42.h2.el",
+                        bytes = frame.len(),
+                        encode_ms = encoded.as_millis() as u64,
+                        round_trip_ms = started.elapsed().as_millis() as u64,
+                        status = ?status.status,
+                        "raw newPayload"
+                    );
+                }
+                Some(status)
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.el", %err, "raw newPayload channel failed; using JSON for this block");
+                channel.stream = None;
+                None
+            }
+        }
+    }
+
+    /// Collects a build over the raw payload channel.
+    ///
+    /// `None` means "not this way": no channel, a channel that failed, or an
+    /// execution layer that does not serve one — the caller then uses the
+    /// JSON forms. `Some(None)` is the channel saying the build is unknown.
+    async fn resolve_over_channel(
+        &self,
+        id: PayloadId,
+        beacon_root: B256,
+    ) -> Option<Option<Result<BuiltBlock, ElError>>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut channel = self.raw_channel.lock().await;
+        let addr = self.raw_endpoint(&mut channel).await?;
         let started = std::time::Instant::now();
         let attempt: std::io::Result<Option<Result<BuiltBlock, ElError>>> = async {
             if channel.stream.is_none() {
@@ -644,6 +717,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 channel.stream = Some(stream);
             }
             let stream = channel.stream.as_mut().expect("just connected");
+            stream.write_u8(n42_h2_execution::raw_engine::request::GET_PAYLOAD).await?;
             stream.write_all(&id.0 .0).await?;
             match stream.read_u8().await? {
                 0 => Ok(None),

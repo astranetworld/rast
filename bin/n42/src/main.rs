@@ -213,8 +213,9 @@ fn main() {
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
                         let payloads = node.payload_builder_handle.clone();
+                        let engine = node.add_ons_handle.beacon_engine_handle.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = n42::payload_serve::serve(addr, payloads).await {
+                            if let Err(err) = n42::payload_serve::serve(addr, payloads, engine).await {
                                 error!(target: "reth::cli", %err, "raw payload channel stopped");
                             }
                         });

@@ -23,5 +23,6 @@ metrics.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 n42-h2-primitives.workspace = true

@@ -19,6 +19,7 @@ pub mod driver;
 pub mod el;
 pub mod execution_path;
 pub mod mock;
+pub mod raw_engine;
 
 pub use driver::{DriverAction, ExecutionDriver};
 pub use el::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ResolveKind};
