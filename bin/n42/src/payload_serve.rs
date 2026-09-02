@@ -355,6 +355,13 @@ where
     T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     stream.set_nodelay(true)?;
+    // Buffers retained across frames. A newPayload frame is ~19 MB at the
+    // bench tier and a served payload the same; allocated fresh per block
+    // they are fresh pages first-touched on every block on every node --
+    // measured as the followers' page-fault rate doubling in a round and
+    // their runtime threads' time going to the kernel. Grown once, reused.
+    let mut frame: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
     loop {
         let kind = match stream.read_u8().await {
             Ok(kind) => kind,
@@ -366,10 +373,11 @@ where
             if len > 256 << 20 {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload frame too large"));
             }
-            let mut frame = vec![0u8; len];
-            stream.read_exact(&mut frame).await?;
+            frame.clear();
+            frame.resize(len, 0);
+            stream.read_exact(&mut frame[..]).await?;
             let started = std::time::Instant::now();
-            let mut out: Vec<u8> = Vec::with_capacity(96);
+            out.clear();
             match raw_engine::decode_execution_data(&frame) {
                 Err(err) => {
                     out.push(2);
@@ -459,7 +467,7 @@ where
         let started = std::time::Instant::now();
         let resolved = payloads.resolve_kind(id, PayloadKind::WaitForPending).await;
         let waited = started.elapsed();
-        let mut out: Vec<u8> = Vec::new();
+        out.clear();
         match resolved {
             None => out.push(0),
             Some(Err(err)) => {

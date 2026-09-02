@@ -354,6 +354,13 @@ where
     // Nagle would batch the acknowledgements into the next read's latency, and
     // the point of this path is that nothing waits for a round trip.
     stream.set_nodelay(true)?;
+    // Reads go through a buffer: a frame is a 4-byte count and then, per
+    // transaction, a 4-byte length and ~110 bytes, and tokio's TcpStream
+    // makes a read(2) of each -- two syscalls a transaction, 400,000 a second
+    // a node at the flood's rate. Writes stay direct; an answer is 8 bytes
+    // and must not wait for company.
+    let (read_half, mut write_half) = stream.into_split();
+    let mut stream = tokio::io::BufReader::with_capacity(1 << 20, read_half);
     loop {
         let count = match stream.read_u32_le().await {
             Ok(count) => count,
@@ -434,14 +441,14 @@ where
             if admit_tx.send(recovering).await.is_err() {
                 return Ok(());
             }
-            stream.write_u32_le(offered).await?;
-            stream.write_u32_le(pending).await?;
+            write_half.write_u32_le(offered).await?;
+            write_half.write_u32_le(pending).await?;
             continue;
         }
         let accepted = admit(&pool, raws, cache.clone()).await;
         let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
-        stream.write_u32_le(accepted).await?;
-        stream.write_u32_le(pending).await?;
+        write_half.write_u32_le(accepted).await?;
+        write_half.write_u32_le(pending).await?;
     }
 }
 
