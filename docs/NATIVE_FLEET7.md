@@ -3232,3 +3232,21 @@ third. The ceiling is now demonstrated at the block size the target was
 set for; what remains is why a round does not hold it -- the leader's
 execution drift over a tenure, and the supply stalls of round 30 -- and
 both are instrumented and assigned.
+
+### The spread is two experiments, not one variance
+
+gov5's session, on the 59%: a ceiling demonstrated once and held once in
+three runs was where their rig stood at 41,495, and what made it
+repeatable was not a fix but finding that two "measurements" had been
+taken under conditions nobody had recorded. Run 1 of the pinned three has
+its conditions in the flood's line: the generator fell from 203,657/s to
+1,140/s at +35 s and stayed at 25,000-47,000/s for twenty seconds with
+the deepest pool at 418,000-425,000 against a gate of 407,500 -- the
+round-30 stall, a follower's stale count closing the gate while the chain
+ran 2.7 s cycles -- and then did 177,716/s and a 162,900 window once the
+pool drained. Runs 2 and 3 held ~200,000/s from the first second. So the
+59% is one experiment in which the gate closed early and two in which it
+did not, and the per-window figure to log next to the TPS is the
+generator's rate and the deepest pool. A rule, from the same source: "the
+machine is idle" is an average; a synchronised fleet's instantaneous core
+demand is seven times its profile's.
