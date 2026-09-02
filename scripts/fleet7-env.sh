@@ -421,6 +421,14 @@ f7_el_args() {
       # reaches the cache.
       $( [[ ${F7_NO_SENDER_CACHE:-0} == 1 ]] || echo --engine.sender-recovery-cache )
       $( [[ ${F7_NO_TXPOOL_PREWARM:-0} == 1 ]] || echo --engine.txpool-prewarming )
+      # Block prewarming off by default here. reth's prewarmer executes the
+      # block's transactions on the worker pool ahead of the serial loop to
+      # warm the state cache; at 163,000 transfers a block that is the same
+      # work twice against the same cache, and the serial loop measured
+      # faster without it (execution 584 -> 365-500 ms; windows 17/16 ->
+      # 18/18 blocks). Pool-side prewarming stays: without it, 15/15.
+      # F7_PREWARM=1 puts it back for a comparison.
+      $( [[ ${F7_PREWARM:-0} == 1 ]] || echo --engine.disable-prewarming )
       # F7_EL_EXTRA: any further execution-layer flags, for a single-variable
       # round (e.g. --engine.disable-prewarming). Word-split on purpose.
       ${F7_EL_EXTRA:-}

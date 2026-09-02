@@ -92,6 +92,8 @@ where
         }
 
         let expected_hash = payload.block_hash();
+        let started = std::time::Instant::now();
+        let tx_count = payload.payload.as_v1().transactions.len();
 
         // Decoded once. This used to be three full conversions of the same
         // payload -- the reconstruction, a second to learn the Ethereum-shaped
@@ -100,11 +102,45 @@ where
         // transactions trie, on the follower's critical path before the block
         // was even handed to the engine. A CPU profile of a follower showed
         // the conversion thread as busy as the execution thread.
-        let ethereum_shaped = payload
+        // The transactions root and the transaction decodes are independent,
+        // and both are over the same bytes: the root goes on the header, the
+        // decodes into the body. Sequentially that was 160-200 ms of a
+        // follower's import at the 163,000-transaction tier; here the root is
+        // computed while the decodes run on the worker pool.
+        let raw_transactions = payload.payload.as_v1().transactions.clone();
+        let (transactions_root, decoded_transactions) = rayon::join(
+            || {
+                alloy_trie::root::ordered_trie_root_with_encoder(&raw_transactions, |tx, buf| {
+                    buf.extend_from_slice(tx)
+                })
+            },
+            || {
+                use rayon::prelude::*;
+                raw_transactions
+                    .par_iter()
+                    .map(|tx| {
+                        <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(tx.as_ref())
+                            .map_err(alloy_rlp::Error::from)
+                            .map_err(PayloadError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            },
+        );
+        let decoded_transactions = decoded_transactions?;
+        let raw_block = payload
             .payload
             .clone()
-            .try_into_block_with_sidecar::<TransactionSigned>(&payload.sidecar)?;
+            .into_block_with_sidecar_raw_with_transactions_root(&payload.sidecar, transactions_root)?;
+        let ethereum_shaped = alloy_consensus::Block {
+            header: raw_block.header,
+            body: alloy_consensus::BlockBody {
+                transactions: decoded_transactions,
+                ommers: raw_block.body.ommers,
+                withdrawals: raw_block.body.withdrawals,
+            },
+        };
         let ethereum_shaped = SealedBlock::seal_slow(ethereum_shaped);
+        let decoded = started.elapsed();
 
         // reth's checks on the Ethereum-shaped block, the same ones its own
         // validator runs after converting: fork fields and sidecar shape. Its
@@ -129,10 +165,22 @@ where
         // The block gov5 hashed: header profile checked, ommers hash and
         // difficulty restored, hash confirmed -- header arithmetic on the
         // block already decoded.
+        let checked = started.elapsed();
         let block = reconstruct_gov5_h2_block_from(ethereum_shaped.into_block(), &payload)
             .map_err(|err| NewPayloadError::Other(err.into()))?;
 
         let sealed = SealedBlock::seal_slow(block);
+        if tx_count >= 10_000 {
+            tracing::info!(
+                target: "n42::engine_validator",
+                number = sealed.number,
+                txs = tx_count,
+                decode_ms = decoded.as_millis() as u64,
+                checks_ms = checked.saturating_sub(decoded).as_millis() as u64,
+                reconstruct_ms = started.elapsed().saturating_sub(checked).as_millis() as u64,
+                "payload converted"
+            );
+        }
         if sealed.hash() != expected_hash {
             // Cannot happen after reconstruction confirmed the hash; kept
             // so a future change to either side fails loudly.
