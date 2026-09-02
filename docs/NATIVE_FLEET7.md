@@ -2770,3 +2770,89 @@ which at 50 MB/s is the next thing that does not look like a floor.
 
 160,000 TPS at this block size is a 1.019 s cycle. From 1.544: the import
 (700), the build (500) and the transfer (250-300) each have to give.
+
+## Round 25: every block is executed twice on the critical path, and a leader tenure
+
+### The structure the phase table was hiding
+
+Read from `yamuxbuf1`'s logs rather than from the earlier phase table: the
+leader's `payload build phases` says `exec_ms=530` for 163,000 transfers, and
+the follower's `raw newPayload` says `engine_ms=600-750`, of which the QMDB
+root is 65-130. Both sides execute the same block at ~3.3 µs a transaction,
+which is gov5's 3.135. The "follower executes 2.5x slower than the builder"
+question this file carried was a comparison of two tiers; there is nothing
+to explain.
+
+What the numbers do say is structural. A block is executed **twice on the
+critical path**: once by the leader that builds it, and once by the *next*
+leader, which has to import it before it can build on it (and by every
+follower, whose import-gated votes the quorum waits for). Two executions of
+530-600 ms already exceed the 1.019 s cycle the target needs, before the
+transfer and everything else. So either execution itself gets faster (round
+21 says reth's parallel executor is at parity for this workload) or the
+second execution leaves the critical path.
+
+### Leader tenure
+
+`hotstuff.leaderTenure` in the genesis (default 1): the leader of view `v` is
+validator `(v / tenure) % n`. Tenure 1 is gov5's round-robin, byte for byte,
+and the only value a mixed fleet can run -- the v4 shadow verifier and
+`h2_finality` check the rule, so this is a chain parameter, not a node
+option. With a tenure the same node leads consecutive views; it already
+holds the state of the block it just built (`import_ms=1`) and can build
+the next one while the fleet is importing this one. The cycle becomes
+`max(build, transfer + import + vote)` instead of their sum -- on the
+current numbers about 0.9-0.95 s, which is under the target. The price is
+liveness: a leader that stops proposing costs up to `tenure` view timeouts,
+because a timeout advances the view by one. `F7_LEADER_TENURE=<views>`
+derives a bench genesis; `F7_INGEST_FORWARD=1` is needed with it (below).
+
+### What the first tenure round found (tenure 16): three defects, none in the idea
+
+`tenure16`: cycle mean 2.841 s against a 1.654 baseline, windows of 14/9/7
+blocks, blocks not full. All three causes were found in the logs.
+
+**1. reth's engine deadlocks against a long-lived payload job.** Every
+leader timeout ("proposed; the votes did not arrive", seven in the round)
+sat at a tenure boundary and was preceded by 8 seconds of silence on the
+new leader: its execution layer's engine took no message at all -- not the
+commit forkchoice, not the next `newPayload` -- until the validator's 8 s
+RPC timeout fired. reth 2.5.1's engine tree (`tree/mod.rs`,
+`wait_for_event`) blocks its whole message loop from the moment a
+persistence completes until **every open payload job's build lease is
+released**, and a lease is released when the job is resolved. Round-robin
+never noticed: a job lives ~800 ms, from `forkchoiceUpdated` to
+`getPayload`. Build-ahead holds one open across the whole view, and the
+loop that would resolve it was itself waiting on the blocked engine. This
+is also the mechanism behind "build-ahead measured worse" in rounds 22-24.
+Fix: the prepared build is a task that resolves its payload the moment the
+first build is done; the job lives for one build. (`tenure16b`: one
+leader timeout, zero transport errors.)
+
+**2. The pool is stale when the ahead build starts.** The pool learns of
+a canonical block a little after the execution layer has it. A build
+started the moment its parent was imported found all 163,000 of the
+parent's transactions still pending (`txs=326288` per build) and executed
+each one to fail on the nonce: `exec_ms` 1,134-3,157 instead of 530, and
+one build of `txs=82652 gas=0`. Fix: the builder reads the sender's account
+nonce from the state it is about to execute against (cached after the
+first transaction of each sender) and skips a transaction below it before
+executing. `tenure16b`: `stale=163000` skipped per ahead build, `exec_ms`
+back to normal.
+
+**3. A leader that builds every block has to refill its pool every block.**
+The flood gives each node's ingest one seventh of the senders; the other
+six sevenths reach a pool by gossip, and the gossip forwarder was JSON
+`eth_sendRawTransaction` in batches of 1,000 with a queue of four and the
+excess dropped -- tens of thousands a second at best. Round-robin needed
+163,000 per seven cycles from that; a tenure needs 163,000 per cycle.
+`tenure16b` shows it directly: occupancy 80-84%, blocks not full, at
+1.77-2.0 s. Fix: `--el-ingest` hands gossiped transactions to the same
+binary ingest the flood uses (parallel sender recovery, pool gate by
+delayed reply), on four connections.
+
+The rounds' numbers are **perturbed**, both ways: the other session's
+rebuilds replaced binaries under `tenure16b`, and mine under its round 1.
+Both fleets measure on one root; the numbers above are cited for the
+mechanisms they exposed, not as results. The clean measurement is the next
+round: tenure 16 with all three fixes, on an idle root.
