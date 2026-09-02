@@ -81,6 +81,23 @@ const MAX_FRAME_TXS: u32 = 10_000;
 /// block's demand: the length of the pool stall it is meant to cover.
 const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
 
+/// How many frames may be in sender recovery at once, node-wide:
+/// `N42_TX_INGEST_RECOVER_PARALLEL`, unlimited by default. Unlimited, 64
+/// connections with 8 frames in flight each are 512 blocking threads of
+/// secp256k1 on a node pinned to 16 cores, and the builder's thread -- and
+/// the engine's import -- get a slice of a core while the generator is busy.
+fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let permits = std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS);
+        std::sync::Arc::new(tokio::sync::Semaphore::new(permits))
+    })
+}
+
 /// Largest single transaction, in bytes.
 const MAX_TX_BYTES: u32 = 1 << 20;
 
@@ -302,7 +319,14 @@ where
             let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
             let cache = cache.clone();
-            let recovering = tokio::task::spawn_blocking(move || decode_and_recover::<P>(raws, cache.as_ref()));
+            let slot = std::sync::Arc::clone(recovery_slots())
+                .acquire_owned()
+                .await
+                .expect("the recovery semaphore is never closed");
+            let recovering = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                decode_and_recover::<P>(raws, cache.as_ref())
+            });
             // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
             // waiting for the pool: the answer waits for a slot, as before.
             if admit_tx.send(recovering).await.is_err() {
@@ -360,7 +384,16 @@ where
     // on that thread, and the pool's own futures, waited behind them. Blocking
     // threads are for exactly this.
     let started = std::time::Instant::now();
-    let decoded = match tokio::task::spawn_blocking(move || decode_and_recover::<P>(raws, cache.as_ref())).await {
+    let slot = std::sync::Arc::clone(recovery_slots())
+        .acquire_owned()
+        .await
+        .expect("the recovery semaphore is never closed");
+    let decoded = match tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        decode_and_recover::<P>(raws, cache.as_ref())
+    })
+    .await
+    {
         Ok(decoded) => decoded,
         Err(err) => {
             warn!(target: "n42.tx_ingest", %err, "sender recovery task failed");
