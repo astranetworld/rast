@@ -2856,3 +2856,67 @@ rebuilds replaced binaries under `tenure16b`, and mine under its round 1.
 Both fleets measure on one root; the numbers above are cited for the
 mechanisms they exposed, not as results. The clean measurement is the next
 round: tenure 16 with all three fixes, on an idle root.
+
+## Round 26: the follower's import, taken apart with reth's own metrics
+
+`F7_METRICS_BASE=<port>` puts each execution layer's Prometheus metrics on
+loopback; one round of them (node 1, 155 blocks, 8.7M transactions) says what
+a full block's import is made of, per block at 163,000 transactions:
+
+| piece | per block | source |
+|---|---:|---|
+| payload conversion (decode + transactions trie) | 160-200 ms -> 80-114 -> **30-49** | `n42::engine_validator` log |
+| transaction iterator wait | **81 ms** (0.50 µs/tx) | `transaction_wait_histogram` |
+| EVM execution | **349 ms** (2.14 µs/tx) | `transaction_execution_histogram` |
+| of which state reads from the provider | 63 ms (32k fetches at 1.96 µs) | `state_provider_account_fetch_latency` |
+| QMDB root | ~95 ms -> **~39** | `state_root_histogram` |
+| persistence, off the critical path in principle | 365 ms per batch of ~3 blocks | `persistence_duration` |
+
+Four things moved.
+
+**Prewarming off** (`--engine.disable-prewarming`, bench default): reth's
+prewarmer executes the block's transactions on the worker pool to warm the
+state cache while the serial loop runs; at this block size it is the same
+work twice against the same cache. Execution 584 -> 365-500 ms; windows 17/16
+-> 18/18. Pool-side prewarming stays: without it, 15/15.
+
+**The conversion in parallel**: the transactions root over the payload's
+bytes and the decodes into envelopes were sequential; now the root is
+computed while the decodes run on the pool, and the trie itself is built in
+parallel (`parallel_ordered_trie_root`: groups of up to 256 leaves by key
+prefix, each a `HashBuilder`, joined into the top-level builder as branches —
+checked equal to alloy's at twenty sizes). The same trie is the leader's
+assembly. 160-200 -> 30-49 ms on the follower; assembly 104-139 -> 41-65 on
+the leader (with the root below).
+
+**The QMDB root batched**: the compat tree hashed as it went, about fifteen
+blake3 calls per operation in sequence. It now hashes the leaves on the pool,
+makes the structural writes without hashing, and rehashes each touched twig
+once, in parallel. ~95 -> ~39 ms per block; gov5's fixtures unchanged.
+
+**Persistence every eight blocks** (`--engine.persistence-threshold 8
+--engine.memory-block-buffer-target 6`): the engine loop stops taking
+messages while a batch hands off, and with 163,000-transaction blocks a
+batch is ~365 ms. Fewer of them:
+
+| round | persistence | cycle mean / median / p90 |
+|---|---|---:|
+| `qmdb1` | every 2 (default) | 1.752 / 1.603 / 2.139 s |
+| `persist86` | every 8 | **1.386 / 1.376 / 1.712** |
+| `persist20` | every 20 | 1.445 / 1.373 / 1.885 |
+| `persist86b` | every 8 | 1.596 / 1.437 / 2.120 (one 5.5 s timeout) |
+
+Windows of 25/21/20 blocks — **130,057 TPS in window 1 of `persist86`**, the
+first six-figure window on the comparable workload.
+
+Two negatives, recorded: forwarding gossiped transactions through the binary
+ingest so the sender cache is populated for every transaction
+(`F7_INGEST_FORWARD=1`) left `transaction_wait` at 0.56 µs/tx — the wait is
+the iterator's channel receive, not recovery; and `--engine.disable-state-cache`
+cannot be combined with pool-side prewarming.
+
+What is left in the import: execution at 2.1 µs a transaction (~350 ms), of
+which the provider's reads are 63 ms; the iterator's ~80 ms; the root ~40. On
+the leader, execution ~200 ms of a ~350-400 ms build, with excursions to
+400-700 that coincide with persistence. Between them, a 13-15 MB body across
+loopback in ~250-300 ms.

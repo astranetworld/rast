@@ -429,9 +429,21 @@ f7_el_args() {
       # 18/18 blocks). Pool-side prewarming stays: without it, 15/15.
       # F7_PREWARM=1 puts it back for a comparison.
       $( [[ ${F7_PREWARM:-0} == 1 ]] || echo --engine.disable-prewarming )
+      # Persist every eight blocks rather than every two. reth's engine loop
+      # stops taking messages while a persistence batch hands off, and at
+      # 163,000 transactions a block a batch is ~365 ms; four times fewer of
+      # them measured as a block cycle median of 1.60-1.65 s -> 1.37-1.44 s
+      # (three rounds, thresholds 8 and 20 alike). The buffer target must not
+      # exceed the threshold. Memory: eight executed blocks held in memory.
+      --engine.persistence-threshold "${F7_PERSIST_THRESHOLD:-8}"
+      --engine.memory-block-buffer-target "${F7_BLOCK_BUFFER_TARGET:-6}"
       # F7_EL_EXTRA: any further execution-layer flags, for a single-variable
       # round (e.g. --engine.disable-prewarming). Word-split on purpose.
       ${F7_EL_EXTRA:-}
+      # F7_METRICS_BASE=<port>: Prometheus metrics on 127.0.0.1:<port + i>, for
+      # a diagnostic round; reth's transaction_wait / transaction_execution
+      # histograms and the state provider's per-call latencies live there.
+      ${F7_METRICS_BASE:+--metrics 127.0.0.1:$((F7_METRICS_BASE + i))}
     )
   fi
 
