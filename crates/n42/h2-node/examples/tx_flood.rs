@@ -151,6 +151,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let sent = Arc::new(AtomicU64::new(0));
     let rejected = Arc::new(AtomicU64::new(0));
+    // A line every five seconds, because the round kills this process before
+    // it could sum up, and a generator that cannot say its own rate leaves
+    // "the chain was starved" and "the generator was slow" indistinguishable.
+    // The three clocks say where a worker's time went: signing (CPU, this
+    // process), sending (socket writes), waiting (the node's answer).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (sent, rejected, stop) = (Arc::clone(&sent), Arc::clone(&rejected), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut last = (Instant::now(), 0u64);
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                let now = Instant::now();
+                let total = sent.load(Ordering::Relaxed);
+                let rate = (total - last.1) as f64 / now.duration_since(last.0).as_secs_f64();
+                eprintln!(
+                    "flood +{:>4}s: sent {} ({:.0}/s), rejected {}, sign {}s, send {}s, wait {}s, deepest pool {}",
+                    started.elapsed().as_secs(),
+                    total,
+                    rate,
+                    rejected.load(Ordering::Relaxed),
+                    SIGN_NS.load(Ordering::Relaxed) / 1_000_000_000,
+                    SEND_NS.load(Ordering::Relaxed) / 1_000_000_000,
+                    WAIT_NS.load(Ordering::Relaxed) / 1_000_000_000,
+                    DEEPEST.load(Ordering::Relaxed),
+                );
+                last = (now, total);
+            }
+        });
+    }
     // One thread owns a disjoint set of senders, so a sender's nonces are
     // produced in order by one place. Sharing a sender across threads is how a
     // flood generates its own nonce holes.
@@ -257,6 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     });
+    stop.store(true, Ordering::Relaxed);
 
     let elapsed = started.elapsed().as_secs_f64();
     let (sent, rejected) = (sent.load(Ordering::Relaxed), rejected.load(Ordering::Relaxed));
@@ -307,6 +338,13 @@ fn signed(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, ga
     alloy_primitives::hex::encode_prefixed(envelope.encoded_2718())
 }
 
+/// Time all workers spent signing, sending frames, and waiting for answers,
+/// in nanoseconds; and the deepest pool any answer reported.
+static SIGN_NS: AtomicU64 = AtomicU64::new(0);
+static SEND_NS: AtomicU64 = AtomicU64::new(0);
+static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static DEEPEST: AtomicU64 = AtomicU64::new(0);
+
 /// Floods one worker's senders over a binary ingest connection.
 ///
 /// Round-robin across the senders, one frame in flight per sender, and a bound
@@ -350,15 +388,19 @@ fn flood_over_ingest(
             }
             let upto = (from + args.rpc_batch as u64).min(args.per_tx);
             batch.clear();
+            let at = Instant::now();
             batch.extend(
                 (from..upto).map(|n| {
                     let to = recipient(args.recipients, index as u64 * args.per_tx + n);
                     signed_raw(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
                 }),
             );
+            SIGN_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let at = Instant::now();
             if conn.send(index, &batch).is_err() {
                 return;
             }
+            SEND_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
             inflight[index] = true;
             wrote = true;
         }
@@ -369,9 +411,13 @@ fn flood_over_ingest(
             }
             return;
         }
-        match conn.recv() {
+        let at = Instant::now();
+        let answer = conn.recv();
+        WAIT_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        match answer {
             Ok(Some((index, offered, accepted, pending))) => {
                 deepest = deepest.max(pending);
+                DEEPEST.fetch_max(pending as u64, Ordering::Relaxed);
                 inflight[index] = false;
                 sent.fetch_add(accepted as u64, Ordering::Relaxed);
                 rejected.fetch_add((offered - accepted) as u64, Ordering::Relaxed);

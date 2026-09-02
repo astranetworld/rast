@@ -176,6 +176,9 @@ pub struct H2Service<E> {
     transport: H2V4Transport,
     engine: ConsensusEngine,
     driver: ExecutionDriver<E>,
+    /// Our own blocks as the execution layer takes them, from the driver's
+    /// spawned import; each one is the parent of the next build ahead.
+    own_imports: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
     outputs: mpsc::Receiver<EngineOutput>,
     identity: H2V4ChainIdentity,
     /// The size the signer bitmaps on the wire are read against. A message
@@ -530,7 +533,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub fn new(
         transport: H2V4Transport,
         engine: ConsensusEngine,
-        driver: ExecutionDriver<E>,
+        mut driver: ExecutionDriver<E>,
         outputs: mpsc::Receiver<EngineOutput>,
         validator_count: usize,
     ) -> Self {
@@ -538,6 +541,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         Self {
             transport,
             engine,
+            own_imports: driver.take_own_imports(),
             driver,
             outputs,
             identity,
@@ -829,6 +833,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         tokio::pin!(timeout);
         let outbound = self.outbound_transactions.as_mut();
         let body_rx = self.body_rx.as_mut();
+        let own_imports = self.own_imports.as_mut();
 
         tokio::select! {
             body = async {
@@ -868,6 +873,18 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Err(ServiceError::OutputChannelClosed);
                 };
                 self.handle_output(output, &mut events).await?;
+            }
+            imported = async {
+                match own_imports {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Our own block is in the execution layer: the parent the
+                // next build ahead wants. Flushed at the end of this step.
+                if let Some(hash) = imported {
+                    self.prepare_on = Some(hash);
+                }
             }
             () = &mut timeout => {
                 // A view that produced nothing advances only because of this.
@@ -1523,6 +1540,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         }
         let Some(header) = self.block_headers.get(&parent).cloned() else {
+            info!(target: "n42.h2.node", ?parent, next, "no build ahead: the parent's header is not remembered");
             return;
         };
         let context = ProposalContext {
@@ -1536,10 +1554,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         // The builder declines while pacing; that is a "not yet", not a "no",
         // and the proposal will ask again. Nothing to prepare in that case.
         let Some(attrs) = build_attributes(context) else {
+            info!(target: "n42.h2.node", ?parent, next, "no build ahead: the attributes builder declined");
             return;
         };
+        info!(target: "n42.h2.node", ?parent, next, "build ahead requested");
         if let Err(err) = self.driver.prepare_build_on(parent, attrs).await {
-            debug!(target: "n42.h2.node", %err, ?parent, "could not start a build ahead of leading");
+            warn!(target: "n42.h2.node", %err, ?parent, "could not start a build ahead of leading");
         }
     }
 

@@ -156,6 +156,13 @@ pub struct ExecutionDriver<E> {
     /// A build started before this node needed the block. See
     /// [`Self::prepare_build_on`].
     prepared: Option<AheadBuild>,
+    /// Where [`Self::spawn_import_own_block`] reports a block the execution
+    /// layer has taken, for the loop to build ahead on: a leader's own block
+    /// raises no `BlockImported` -- that event belongs to the follower path
+    /// -- and with a tenure the next build waits for exactly this.
+    own_imports: tokio::sync::mpsc::UnboundedSender<B256>,
+    /// The receiving end, until the loop takes it.
+    own_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
@@ -175,10 +182,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// Builds a driver whose head and finalised block are `genesis`.
     pub fn new(el: E, genesis: B256) -> Self {
+        let (own_imports_tx, own_imports_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             el: std::sync::Arc::new(el),
             normalizer: None,
             prepared: None,
+            own_imports: own_imports_tx,
+            own_imports_rx: Some(own_imports_rx),
             payloads: HashMap::new(),
             head: genesis,
             finalized: genesis,
@@ -283,7 +293,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let el = std::sync::Arc::clone(&self.el);
         let state = self.forkchoice(parent);
         let task_attrs = attrs.clone();
-        debug!(target: "n42.h2.el", ?parent, "starting a build ahead of leading");
+        info!(target: "n42.h2.el", ?parent, "starting a build ahead of leading");
         let task = tokio::spawn(async move {
             let started = std::time::Instant::now();
             let updated = el
@@ -365,6 +375,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
             }
             Some(prepared) => {
+                info!(
+                    target: "n42.h2.el",
+                    prepared_on = ?prepared.parent,
+                    asked = ?parent,
+                    same_parent = prepared.parent == parent,
+                    same_attrs = prepared.attrs == attrs,
+                    "a build prepared ahead does not match the proposal; discarded"
+                );
                 prepared.task.abort();
                 None
             }
@@ -476,16 +494,22 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let el = std::sync::Arc::clone(&self.el);
         let payload = built.execution_data.clone();
         let hash = built.hash;
+        let imported = self.own_imports.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             match el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload).await {
-                Ok(status) => info!(
-                    target: "n42.h2.el",
-                    block = ?hash,
-                    import_ms = started.elapsed().as_millis() as u64,
-                    status = ?status.status,
-                    "imported our own block"
-                ),
+                Ok(status) => {
+                    info!(
+                        target: "n42.h2.el",
+                        block = ?hash,
+                        import_ms = started.elapsed().as_millis() as u64,
+                        status = ?status.status,
+                        "imported our own block"
+                    );
+                    if status.status.is_valid() {
+                        let _ = imported.send(hash);
+                    }
+                }
                 Err(err) => warn!(
                     target: "n42.h2.el",
                     block = ?hash, %err,
@@ -496,6 +520,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     }
 
     /// Imports a block this node built and waits for the verdict.
+    /// The channel [`Self::spawn_import_own_block`] reports on, once.
+    pub fn take_own_imports(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<B256>> {
+        self.own_imports_rx.take()
+    }
+
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
         let started = std::time::Instant::now();
         let status = self

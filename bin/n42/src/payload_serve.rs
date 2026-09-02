@@ -150,29 +150,37 @@ where
         v1.gas_used,
     )?;
     let started = std::time::Instant::now();
-    // The sealed block as the engine would see it: the same conversion, so
-    // the header is the one that hashes to the hash consensus voted on.
-    let sealed = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&reuse.validator, data.clone()) {
-        Ok(sealed) => sealed,
-        Err(err) => {
-            debug!(target: "n42.payload_serve", %err, "own build's payload did not convert; importing it the ordinary way");
-            return None;
+    let expected_hash = data.payload.block_hash();
+    // The sealed header, first from the fields alone: the payload carries
+    // everything the seal may have changed, the build carries everything it
+    // cannot, and the hash says whether the pairing is right. That is a
+    // few microseconds; the full conversion below decodes 163,000
+    // transactions to reach the same header, 50-100 ms, and is kept for the
+    // day a profile changes a field this does not expect.
+    let sealed_header = match sealed_header_from_fields(data, built.block.header()) {
+        Some(header) if header.hash() == expected_hash => header,
+        _ => {
+            let sealed = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&reuse.validator, data.clone()) {
+                Ok(sealed) => sealed,
+                Err(err) => {
+                    debug!(target: "n42.payload_serve", %err, "own build's payload did not convert; importing it the ordinary way");
+                    return None;
+                }
+            };
+            if sealed.hash() != expected_hash
+                || sealed.header().transactions_root != built.block.header().transactions_root
+                || sealed.body().transactions.len() != built.block.body().transactions.len()
+            {
+                return None;
+            }
+            sealed.split_sealed_header_body().0
         }
     };
     let converted = started.elapsed();
-    let sealed_hash = sealed.hash();
-    if sealed_hash != data.payload.block_hash() {
+    let sealed_hash = sealed_header.hash();
+    if v1.transactions.len() != built.block.body().transactions.len() {
         return None;
     }
-    // Same transactions, in the same order, as the build: the state and
-    // receipts roots pin them, and the transactions root of the sealed
-    // header does too.
-    if sealed.header().transactions_root != built.block.header().transactions_root
-        || sealed.body().transactions.len() != built.block.body().transactions.len()
-    {
-        return None;
-    }
-    let (sealed_header, _) = sealed.split_sealed_header_body();
     let body = built.block.body().clone();
     let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(
         SealedBlock::from_sealed_parts(sealed_header, body),
@@ -214,6 +222,31 @@ where
             None
         }
     }
+}
+
+/// The sealed header a payload describes, given the build it came from: the
+/// payload's fields where the seal may have touched them, the build's where it
+/// cannot. `None` if the shapes disagree; the caller checks the hash.
+fn sealed_header_from_fields(
+    data: &alloy_rpc_types_engine::ExecutionData,
+    built: &alloy_consensus::Header,
+) -> Option<reth_primitives_traits::SealedHeader> {
+    let v1 = data.payload.as_v1();
+    if v1.block_number != built.number || v1.parent_hash != built.parent_hash {
+        return None;
+    }
+    let mut header = built.clone();
+    header.beneficiary = v1.fee_recipient;
+    header.state_root = v1.state_root;
+    header.receipts_root = v1.receipts_root;
+    header.logs_bloom = v1.logs_bloom;
+    header.mix_hash = v1.prev_randao;
+    header.gas_limit = v1.gas_limit;
+    header.gas_used = v1.gas_used;
+    header.timestamp = v1.timestamp;
+    header.extra_data = v1.extra_data.clone();
+    header.base_fee_per_gas = Some(v1.base_fee_per_gas.try_into().ok()?);
+    Some(reth_primitives_traits::SealedHeader::seal_slow(header))
 }
 
 pub async fn serve<T>(
