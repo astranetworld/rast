@@ -3559,3 +3559,34 @@ Held over for a quiet box: the followers now import at ~4.5 µs/tx from
 the first full block (1.3-1.4 s full-block cycle, 120-125k in windows 2-3)
 where the s64 legs showed 2.0-2.6 before their collapse -- neighbour or
 ours is the open question, and it needs the datc job gone.
+
+### Addendum 6: the cross-block cache, bookended, and the block-size cost
+
+The gov5 session found the same neighbour costs its client 5% and ours
+2.5x, and the candidate was reth's cross-block cache: this fleet sets it to
+128 MB (round 22, inert on a quiet box), too small for a 2M-account working
+set, so every block reads ~326k accounts from MDBX's mmap, which a 100 GB
+scan can evict. A-B-A under the neighbour on purpose (direct configuration,
+the EL's argument checked per leg, conditions every 5 s):
+
+| leg | cache | win1 | win2 | win3 | follower full / mid µs/tx | leaders µs/tx |
+| --- | --- | --- | --- | --- | --- | --- |
+| c128a | 128 MB | 152,668 | 119,195 | 119,493 | 4.27 / 2.33 | 3.0-3.8 |
+| c4096 | 4,096 MB | 137,669 | 114,032 | 114,027 | 4.12 / 2.24 | 3.0-4.1 |
+| c128b | 128 MB | 151,324 | 119,478 | 119,458 | 4.17 / 2.19 | 3.3-3.7 |
+
+Bookends agree; the middle leg is within 5%. The cache size is not this
+client's exposure. (The 5%-vs-2.5x contrast itself was then withdrawn by
+the gov5 session: its generator wrote every transfer to one sink address,
+1,201 accounts a block against our 163,000, so its per-transaction numbers
+describe a workload ours does not run and every cross-client comparison
+built on them is void until re-measured.)
+
+What the three legs show that does not depend on any other rig: within one
+round, a follower imports 30-150k-transaction blocks at 2.2-2.3 µs/tx and
+163k blocks at 4.1-4.3 -- the per-transaction cost nearly doubles with
+block size. That is why window 1 (55k blocks at the pacing floor) runs
+150-195k TPS while full blocks give 120k at a 1.37 s cycle. Whether it is
+the working set outgrowing the L3 slices or something per-block that is
+quadratic (revm's State cache, the bundle, the hashed-state build) is open;
+the lever is testable either way: gas ceiling 3.42G / 1.5G / 3.42G.
