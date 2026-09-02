@@ -375,7 +375,7 @@ f7_el_args() {
     pool_mb=$F7_BENCH_POOL_MB
     # One sender may have a whole window's worth of transactions in flight.
     account_slots=4096
-    validation_tasks=4
+    validation_tasks=${F7_VALIDATION_TASKS:-4}
     # A block of this tier is worth more than the lean cache holds, and the
     # measurement reads every block back.
     cache_blocks=256

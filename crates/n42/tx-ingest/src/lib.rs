@@ -60,6 +60,7 @@
 //! bound to loopback.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::Bytes;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
@@ -98,6 +99,40 @@ fn high_water() -> usize {
 /// One task per connection, and each connection is independent: a generator
 /// gets its parallelism by opening several rather than by this doing anything
 /// clever with one.
+/// Prints the ingest's rate and time split every five seconds, once.
+fn spawn_stats_reporter() {
+    tokio::spawn(async move {
+        let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let now = std::time::Instant::now();
+            let (frames, txs, recover, pool) = (
+                STATS.frames.load(Ordering::Relaxed),
+                STATS.txs.load(Ordering::Relaxed),
+                STATS.recover_ns.load(Ordering::Relaxed),
+                STATS.pool_ns.load(Ordering::Relaxed),
+            );
+            let dframes = frames - last.1;
+            if dframes > 0 {
+                let dtxs = txs - last.2;
+                let secs = now.duration_since(last.0).as_secs_f64();
+                info!(
+                    target: "n42.tx_ingest",
+                    frames = dframes,
+                    txs = dtxs,
+                    rate = (dtxs as f64 / secs) as u64,
+                    recover_ms_per_frame = (recover - last.3) / dframes / 1_000_000,
+                    pool_ms_per_frame = (pool - last.4) / dframes / 1_000_000,
+                    recover_us_per_tx = (recover - last.3) / dtxs.max(1) / 1_000,
+                    pool_us_per_tx = (pool - last.4) / dtxs.max(1) / 1_000,
+                    "ingest"
+                );
+            }
+            last = (now, frames, txs, recover, pool);
+        }
+    });
+}
+
 pub async fn serve<P>(
     addr: SocketAddr,
     pool: P,
@@ -106,6 +141,7 @@ pub async fn serve<P>(
 where
     P: TransactionPool + Clone + 'static,
 {
+    spawn_stats_reporter();
     let listener = TcpListener::bind(addr).await?;
     info!(target: "n42.tx_ingest", %addr, "binary transaction ingest listening");
     loop {
@@ -191,6 +227,26 @@ where
 /// connection: one malformed transaction in a batch says nothing about the
 /// next one, and a generator that sends one is not an attacker, it is a
 /// generator with a bug.
+/// Where the ingest's time goes, summed over every connection, and printed
+/// every five seconds by [`serve`]: a generator whose workers wait 76% of
+/// their time for this server's answer needs the server to say which half
+/// of the answer -- recovering the senders, or the pool taking them -- it
+/// was waiting for.
+struct IngestStats {
+    frames: AtomicU64,
+    txs: AtomicU64,
+    recover_ns: AtomicU64,
+    pool_ns: AtomicU64,
+}
+
+static STATS: IngestStats = IngestStats {
+    frames: AtomicU64::new(0),
+    txs: AtomicU64::new(0),
+    recover_ns: AtomicU64::new(0),
+    pool_ns: AtomicU64::new(0),
+};
+
+
 async fn admit<P>(
     pool: &P,
     raws: Vec<Bytes>,
@@ -205,6 +261,7 @@ where
     // used to run on the runtime's worker thread, where every other connection
     // on that thread, and the pool's own futures, waited behind them. Blocking
     // threads are for exactly this.
+    let started = std::time::Instant::now();
     let decoded = match tokio::task::spawn_blocking(move || decode_and_recover::<P>(raws, cache.as_ref())).await {
         Ok(decoded) => decoded,
         Err(err) => {
@@ -218,7 +275,13 @@ where
     // `External`, the same origin `eth_sendRawTransaction` uses for a
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
+    let recovered_at = started.elapsed();
+    let count = decoded.len() as u64;
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
+    STATS.frames.fetch_add(1, Ordering::Relaxed);
+    STATS.txs.fetch_add(count, Ordering::Relaxed);
+    STATS.recover_ns.fetch_add(recovered_at.as_nanos() as u64, Ordering::Relaxed);
+    STATS.pool_ns.fetch_add((started.elapsed() - recovered_at).as_nanos() as u64, Ordering::Relaxed);
     // Accepted, for a sender that advances its nonce on the answer: the pool
     // took it, or already had it, or the chain already mined it. The last two
     // arrive when the same frame reaches every node (`tx_flood --ingest-all`)
