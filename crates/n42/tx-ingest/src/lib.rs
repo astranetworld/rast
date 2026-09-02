@@ -151,6 +151,12 @@ const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// count includes a block's transactions until the pool's maintenance hears
 /// of the block, which at this block size is long after the builder took
 /// them; the queue's count is what the next build can still use.
+/// `N42_TX_INGEST_DIRECT`, read once.
+fn direct_to_queue() -> bool {
+    static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIRECT.get_or_init(|| std::env::var("N42_TX_INGEST_DIRECT").is_ok())
+}
+
 fn queue_depth<P: TransactionPool + 'static>(pool: &P) -> usize
 where
     P::Transaction: 'static,
@@ -451,11 +457,32 @@ where
     if decoded.is_empty() {
         return 0;
     }
+    let recovered_at = started.elapsed();
+    let count = decoded.len() as u64;
+    // N42_TX_INGEST_DIRECT=1: straight into the builder's queue, past the
+    // pool. At a 0.3 s block the pool's maintenance -- a block's removals
+    // under the write lock, 200-300 ms at 163,000 -- holds the lock most of
+    // the time, `add_transactions` starves behind it, and the generator's
+    // rate collapses in step with the chain's speed: the faster the chain,
+    // the less it is fed. The queue is nonce-ordered per sender, deduplicated,
+    // pruned by every canonical block on every node, and the pool then
+    // carries only RPC traffic. What is skipped is the pool's validation --
+    // balance and fee -- which the builder's execution catches by dropping;
+    // right for a generator that funds every sender, and the reason this is
+    // opt-in.
+    if direct_to_queue() {
+        if let Some(queue) = n42_tx_queue::global::<P::Transaction>() {
+            queue.push(decoded);
+            STATS.frames.fetch_add(1, Ordering::Relaxed);
+            STATS.txs.fetch_add(count, Ordering::Relaxed);
+            STATS.recover_ns.fetch_add(recovered_at.as_nanos() as u64, Ordering::Relaxed);
+            STATS.pool_ns.fetch_add((started.elapsed() - recovered_at).as_nanos() as u64, Ordering::Relaxed);
+            return u32::try_from(count).unwrap_or(u32::MAX);
+        }
+    }
     // `External`, the same origin `eth_sendRawTransaction` uses for a
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
-    let recovered_at = started.elapsed();
-    let count = decoded.len() as u64;
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
     STATS.frames.fetch_add(1, Ordering::Relaxed);
     STATS.txs.fetch_add(count, Ordering::Relaxed);
