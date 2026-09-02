@@ -2920,3 +2920,52 @@ which the provider's reads are 63 ms; the iterator's ~80 ms; the root ~40. On
 the leader, execution ~200 ms of a ~350-400 ms build, with excursions to
 400-700 that coincide with persistence. Between them, a 13-15 MB body across
 loopback in ~250-300 ms.
+
+## Round 27: tenure against round-robin, paired, and what starves a tenure
+
+Same binaries (the other session's 01:19 build, with rounds 25-26 in it),
+same supply, idle root, back to back.
+
+| | tenure 1 (`base1d`) | tenure 16 (`tenure16d`) |
+|---|---:|---:|
+| cycle mean / median / p90 | **1.445 / 1.404 / 1.803 s** | 2.569 / 2.413 / 4.361 |
+| windows (blocks) | 23 / 21 / 20, all full | 21 / 14 / 11 |
+| occupancy | 94-100% | 72-81% |
+| window TPS | 117,401 / 114,039 / 108,636 | 92,414 / 59,487 / 43,235 |
+| leader timeouts / transport errors | 1 / 0 | 1 / 0 |
+
+Round-robin at 1.40 s median is the round-26 result reproduced. The tenure
+is worse -- and the reason is not the tenure.
+
+**The ahead build works, and it is fast.** Node 1's first six blocks in its
+tenure: cycle ~1.5 s, leader `exec_ms` 250-270 against the round-robin
+leader's 400-900, `stale=163000` skipped per build at ~40 ms. Then:
+
+**The tenure starves.** From the seventh block the leader's `exec_ms`
+climbs (533, 817, 874, 928), the cycle stretches to 2.3-2.9 s, and at the
+thirteenth its pool is empty -- a build of `txs=155004 gas=0`, every
+transaction stale. Over the same seconds every *follower* pool sits at the
+407k ingest gate (the flood's "deepest pool seen 408k"), and the leader's
+goes 395k -> 245k -> 350k -> 0. The generator is gated by the fullest
+pool, which is a follower's.
+
+The mechanism: each node's ingest receives one seventh of the senders and
+the rest arrives by gossip through the forwarder. Whatever the leader's
+forwarder dropped under load -- and it drops at `INBOUND_TX_CAP` when its
+lanes are stalled by the gate -- leaves that sender's later nonces
+unbuildable *on the leader* for the whole tenure, while the followers,
+which have the missing nonce, hold them as pending. Round-robin never
+shows this: the next leader has what this one lacks. A single leader for
+sixteen views has no such cover. The forwarder over the binary ingest
+(round 25) raised the rate but not the guarantee; what the tenure needs is
+every pool holding the same transactions without gossip, which is how gov5
+floods (every transaction to every node) and now `tx_flood --ingest-all`
+(`F7_INGEST_ALL=1`, with `F7_NO_TX_GOSSIP=1`). Measured next.
+
+**`exec_ms` grows over a round in both modes.** The round-robin leader's
+builds, in chain order (blocks 103-166): 220-300 ms with excursions that
+get more frequent -- 547 at #124, 689 at #152, 899 at #166 -- roughly every
+six to eight blocks, which is the persistence cadence, over a slow drift
+from state growth (two million recipients being created). A tenure leader
+meets every persistence, so it sees the excursions compressed: 250 -> 928
+in twenty seconds. Not a tenure defect; the same curve, faster.
