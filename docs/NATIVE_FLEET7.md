@@ -2969,3 +2969,75 @@ six to eight blocks, which is the persistence cadence, over a slow drift
 from state growth (two million recipients being created). A tenure leader
 meets every persistence, so it sees the excursions compressed: 250 -> 928
 in twenty seconds. Not a tenure defect; the same curve, faster.
+
+## Round 28: bodies over plain TCP, and what the leader's slowdown is
+
+### The transfer
+
+`scripts/fleet7-viewcycle.py` put publish -> receive at 248-307 ms for a
+13-15 MB body on the same host: the libp2p push writes each copy through Noise
+and yamux from the leader's swarm, polled on its consensus loop, and the
+receiver reads it the same way. `crate::body_channel` carries the same bytes
+over a plain socket of their own — one persistent connection per peer on the
+member's libp2p port plus 1000, a length-prefixed frame per body, a task per
+peer to write and a task per connection to read — and the libp2p push stays
+as the fallback for a peer the channel does not reach.
+
+| | before (`persist86`) | `body1` |
+|---|---:|---:|
+| publish -> receive, median | 248 ms | **28 ms** |
+| decode on arrival | — | 12-18 ms |
+| receive -> vote | 922 -> 700 ms (after round 26) | 699 ms |
+| vote -> decide | 7 ms | 60 ms |
+| decide -> publish | 579 ms | 675 ms |
+| cycle, median | 1.376 s | 1.529 s (view) / 1.480 (intervals) |
+
+The transfer is gone from the cycle and the cycle did not move by that
+much: what the followers gained at the front, the leader lost at the back.
+
+### The leader slows down inside a round
+
+The other session measured a leader's build execution growing from 271 to
+527 ms across its nine builds in one round, and a tenure leader from 250 to
+928 ms within twenty seconds; this file's three-round repeats degrade the same
+way (1.476, 1.564, 1.650 s medians in `rep-b`). The mechanism is the state
+model: the QMDB compat tree is append-only and in memory, as gov5's is, so a
+round of 163,000-transaction blocks adds ~326,000 entries — a new `Entry`, a
+map insertion, a retired slot — to every node per block, tens of millions per
+round, and every state read that misses the execution cache walks a map that
+size. The builder reads more of them than the follower (it selects from a
+pool of 400,000 as well as executing), which is why it shows first. That is a
+storage-engine project, not a tuning knob; recorded here so the next
+measurement is not misread as noise.
+
+`--engine.suppress-persistence-during-build` (`suppress1`) did not change the
+excursions (leader execution median 290, p90 516, max 1,000 ms; cycle 1.514 s
+median) and is not adopted.
+
+### What remains, in one place
+
+Per full block on the follower: EVM execution ~350 ms at 2.1 µs a transaction
+(the builder does the same transactions at 1.3 µs with a warm `CachedReads`;
+the difference is reth's cached state provider and the per-transaction
+receipt and index bookkeeping in the serial loop), the iterator's channel
+~80 ms, the root ~40, conversion ~35. On the leader: execution ~200-290 ms
+growing with the round, pool selection ~75, assembly ~50. The transfer is
+~30. Consensus itself — vote to decide, decide to build start — is under
+100 ms. At a 1.4-1.5 s cycle the target of 1.019 s needs the two executions
+to give, and every follower still executes every block.
+
+### The record, three rounds
+
+`rep-c`, the configuration as committed at `7c2c15e8b` (direct push, body
+channel, no block prewarming, persistence every eight, parallel conversion
+and assembly, batched QMDB root), three consecutive rounds:
+
+| | median | min | max | spread |
+|---|---:|---:|---:|---:|
+| win1 TPS | **114,584** | 113,747 | 118,553 | 4% |
+| win2 TPS | 108,615 | 103,177 | 108,630 | 5% |
+| win3 TPS | 97,762 | 97,760 | 103,171 | 6% |
+| full-block cycle, median per round | 1.544 / 1.420 / 1.417 s | | | |
+
+Against the day's start (`rep-a` at the same block size: win1 93,379, cycle
+medians 1.73-1.81 s) and the file's first comparable figure (65,197 at 2.5 s).
