@@ -116,6 +116,21 @@ pub struct OwnBlockReuse {
     pub qmdb: Option<n42_qmdb_reth::QmdbNodeState>,
     /// Into the engine loop.
     pub inserts: tokio::sync::mpsc::UnboundedSender<reth_node_builder::executed_inserts::ExecutedInsert>,
+    /// Takes the block's transactions out of the pool the moment the block is
+    /// in the tree, so the next build does not select them again. Opt-in.
+    ///
+    /// The pool learns of a canonical block through its maintenance task,
+    /// asynchronously, and at 163,000 transactions a block that lags behind
+    /// a leader that builds every view: a tenure leader's builder was
+    /// measured pulling 327,000 transactions a build of which 163,000 were
+    /// the previous block's, paying the pool iteration twice and an account
+    /// read per stale transaction. Pruning here made `stale` zero and the
+    /// round slower: reth removes transactions one at a time under the
+    /// pool's write lock, 260-293 ms for a block's worth, and that is the
+    /// same cost the maintenance pays later -- so on the import path it is
+    /// on the critical path instead of beside it. The pool's per-transaction
+    /// removal is the wall, not when it happens.
+    pub prune_pool: Option<std::sync::Arc<dyn Fn(Vec<alloy_primitives::B256>) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for OwnBlockReuse {
@@ -208,6 +223,23 @@ where
     }
     match tokio::time::timeout(std::time::Duration::from_secs(2), handed).await {
         Ok(Ok(true)) => {
+            if let Some(prune) = reuse.prune_pool.clone() {
+                let hashes: Vec<alloy_primitives::B256> =
+                    built.block.body().transactions().map(|tx| *tx.tx_hash()).collect();
+                let count = hashes.len();
+                let pruned_at = std::time::Instant::now();
+                // Synchronous, on a blocking thread: the removal holds the
+                // pool's write lock, and it has to be done before this returns
+                // so the next build, armed by this import, starts on a pool
+                // without them.
+                let _ = tokio::task::spawn_blocking(move || prune(hashes)).await;
+                info!(
+                    target: "n42.payload_serve",
+                    count,
+                    prune_ms = pruned_at.elapsed().as_millis() as u64,
+                    "own block's transactions taken out of the pool"
+                );
+            }
             info!(
                 target: "n42.payload_serve",
                 number = v1.block_number,
@@ -354,8 +386,42 @@ where
                         Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
                         None => false,
                     };
+                    // The transactions' bytes, kept for the prune below; the
+                    // payload itself goes to the engine.
+                    let raw_transactions = data.payload.as_v1().transactions.clone();
                     match engine.new_payload(data).await {
                         Ok(status) => {
+                            // A block this node now holds: its transactions
+                            // leave the pool at once rather than when the
+                            // pool's maintenance gets to them. On a follower
+                            // that is what keeps `pending` honest -- the
+                            // ingest gate reads it, and a block's 163,000
+                            // still counted as pending after the block was
+                            // imported is what stalled the whole fleet's
+                            // supply for the length of one node's maintenance.
+                            if status.status == alloy_rpc_types_engine::PayloadStatusEnum::Valid
+                                && !reused
+                                && let Some(prune) = reuse.as_ref().and_then(|r| r.prune_pool.clone())
+                            {
+                                let pruned_at = std::time::Instant::now();
+                                let count = raw_transactions.len();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    use rayon::prelude::*;
+                                    let hashes: Vec<B256> =
+                                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect();
+                                    prune(hashes);
+                                })
+                                .await;
+                                if count > 10_000 {
+                                    info!(
+                                        target: "n42.payload_serve",
+                                        number,
+                                        count,
+                                        prune_ms = pruned_at.elapsed().as_millis() as u64,
+                                        "imported block's transactions taken out of the pool"
+                                    );
+                                }
+                            }
                             if txs > 10_000 {
                                 info!(
                                     target: "n42.payload_serve",

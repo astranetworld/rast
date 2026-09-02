@@ -225,6 +225,18 @@ fn main() {
                                 ),
                                 qmdb: qmdb_for_startup.clone(),
                                 inserts: reth_node_builder::executed_inserts::sender(),
+                                // Opt-in (N42_PRUNE_POOL_ON_IMPORT=1), measured and not
+                                // adopted: removing a block's 163,000 transactions from
+                                // reth's pool costs 260-293 ms under its write lock -- the
+                                // same per-transaction removal the pool's own maintenance
+                                // pays later -- so doing it on the import path moves the
+                                // cost onto the critical path rather than removing it.
+                                prune_pool: (std::env::var("N42_PRUNE_POOL_ON_IMPORT").is_ok()).then(|| {
+                                    let pool = node.pool.clone();
+                                    std::sync::Arc::new(move |hashes: Vec<alloy_primitives::B256>| {
+                                        let _ = reth_transaction_pool::TransactionPool::remove_transactions(&pool, hashes);
+                                    }) as std::sync::Arc<dyn Fn(Vec<alloy_primitives::B256>) + Send + Sync>
+                                }),
                             }
                         });
                         tokio::spawn(async move {
