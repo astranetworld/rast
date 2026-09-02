@@ -3530,3 +3530,32 @@ the slope is ours. `MALLOC_CONF` in jem1/jem2: the supply session's environ
 dump was of its own legs, not those rounds; f7_spawn is a plain
 setsid/exec, so the variable very probably arrived and those two rounds
 stand as ordinary negatives, by inference.
+
+### Addendum 5: the collapse, named
+
+The supply session's A-B-A on the ingest's read buffer (one binary,
+f0f6f7bdb, the switch verified in the EL's environ per leg, direct
+configuration, conditions every 5 s):
+
+| leg | ingest reads | win1 | win2 | win3 | follower µs/tx | machine major faults/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| bufA1 | 1 MiB buffer | 169,233 | 119,435 | 119,486 | 3.8-5.1 flat | 32-35k |
+| bufB1 | unbuffered | 190,445 | 97,765 | 84,932 | 5.9-8.1 | 87-112k |
+| bufA2 | 1 MiB buffer | 194,753 | 123,149 | 124,889 | 4.0-5.2 flat | 33-36k |
+
+Bookends agree; the middle leg does what the prediction said. The
+within-round collapse every direct-path round showed was the ingest reading
+each transaction with two `read(2)` calls -- a 4-byte length and a ~110-byte
+body -- on tokio's unbuffered `TcpStream`: ~400,000 syscalls a second per
+node on the runtime workers, on the cores the follower imports on, under a
+box taking 20-100k major faults a second from a neighbour. That is what
+"sixteen workers at 92% system time, running, one hot kernel address"
+was, and why it appeared only when the generator outran the chain (more
+frames in flight, more reads) and never in the cap-6 round. The fix is the
+1 MiB `BufReader` on the ingest's read half (0a8a64097, cherry-picked
+here). The body store cut (addendum 4) is a separate, bookended win.
+
+Held over for a quiet box: the followers now import at ~4.5 µs/tx from
+the first full block (1.3-1.4 s full-block cycle, 120-125k in windows 2-3)
+where the s64 legs showed 2.0-2.6 before their collapse -- neighbour or
+ours is the open question, and it needs the datc job gone.
