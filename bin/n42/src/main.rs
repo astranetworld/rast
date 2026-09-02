@@ -214,8 +214,21 @@ fn main() {
                     Ok(addr) => {
                         let payloads = node.payload_builder_handle.clone();
                         let engine = node.add_ons_handle.beacon_engine_handle.clone();
+                        // Our own sealed blocks go in with the build's execution
+                        // rather than being executed again; see payload_serve.
+                        let reuse = (std::env::var("N42_NO_OWN_BLOCK_REUSE").is_err()).then(|| {
+                            let chain_spec = node.chain_spec();
+                            let profile = n42_engine_types::engine_validator::header_profile_for(&chain_spec);
+                            n42::payload_serve::OwnBlockReuse {
+                                validator: std::sync::Arc::new(
+                                    n42_engine_types::engine_validator::N42EngineValidator::new(chain_spec, profile),
+                                ),
+                                qmdb: qmdb_for_startup.clone(),
+                                inserts: reth_node_builder::executed_inserts::sender(),
+                            }
+                        });
                         tokio::spawn(async move {
-                            if let Err(err) = n42::payload_serve::serve(addr, payloads, engine).await {
+                            if let Err(err) = n42::payload_serve::serve(addr, payloads, engine, reuse).await {
                                 error!(target: "reth::cli", %err, "raw payload channel stopped");
                             }
                         });

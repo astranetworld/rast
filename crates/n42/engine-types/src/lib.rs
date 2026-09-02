@@ -19,6 +19,7 @@ pub use node::N42Node;
 
 mod payload;
 pub mod assembler;
+pub mod built_executions;
 //mod job_generator;
 //mod job;
 //mod metrics;

@@ -633,7 +633,8 @@ where
             execution_result,
             block,
             block_access_list,
-            ..
+            hashed_state,
+            trie_updates,
         },
         qmdb_prepared,
         finish_took,
@@ -651,18 +652,15 @@ where
             let prepared = match qmdb_root.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 Some(Ok(prepared)) => prepared,
                 Some(Err(err)) => return Err(PayloadBuilderError::other(std::io::Error::other(err))),
-                None => {
-                    let bundle = db.take_bundle();
-                    state
-                        .compute(
-                            parent_header.hash(),
-                            &changes_from_execution(
-                                &bundle,
-                                chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
-                            ),
-                        )
-                        .map_err(PayloadBuilderError::other)?
-                }
+                None => state
+                    .compute(
+                        parent_header.hash(),
+                        &changes_from_execution(
+                            &db.bundle_state,
+                            chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+                        ),
+                    )
+                    .map_err(PayloadBuilderError::other)?,
             };
             (outcome, Some(prepared), finish_took, root_at.elapsed())
         }
@@ -676,7 +674,14 @@ where
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
-        .then_some(execution_result.requests);
+        .then(|| execution_result.requests.clone());
+    // The bundle and the receipts, kept for the sealed block's import. Taken
+    // here, after the QMDB changes were read from it, and moved rather than
+    // cloned: 163,000 receipts are not free to copy on the build's own path.
+    let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
+        state: db.take_bundle(),
+        result: execution_result,
+    });
 
     // Blob sidecars, in whichever variant the pool holds them. Kept as the
     // variant and not flattened to EIP-4844: the Osaka `getPayload` envelope
@@ -706,7 +711,7 @@ where
     };
     header.transactions_root = block.header().transactions_root;
     header.receipts_root = if hotstuff {
-        crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_result.receipts).0
+        crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_output.result.receipts).0
     } else {
         block.header().receipts_root
     };
@@ -747,10 +752,17 @@ where
     }
     let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
 
-    let recovered = Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(
-        sealed_block,
-        senders,
-    ));
+    let recovered: Arc<reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>> =
+        Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
+    crate::built_executions::remember(
+        block_hash,
+        crate::built_executions::BuiltExecution {
+            block: recovered.clone(),
+            execution_output,
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
+        },
+    );
 
     // The EIP-7928 access list, RLP-encoded, when the builder made one.
     //

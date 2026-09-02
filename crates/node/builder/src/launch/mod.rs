@@ -1,6 +1,7 @@
 //! Abstraction for launching a node.
 
 pub mod common;
+pub mod executed_inserts;
 mod exex;
 pub mod invalid_block_hook;
 

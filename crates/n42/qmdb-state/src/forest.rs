@@ -299,6 +299,51 @@ impl QmdbForest {
         self.records.get(block_hash).map(|record| record.root)
     }
 
+    /// Files a computed block under a different hash.
+    ///
+    /// A builder computes a block's root before consensus seals its header,
+    /// and the seal changes the hash; when the sealed block is imported with
+    /// the builder's execution rather than re-executed, the record filed
+    /// under the builder's hash is the sealed block's record. Moved, not
+    /// copied: a record's undo describes what is applied on the tree, and two
+    /// records claiming the same application would apply it twice. A rename
+    /// onto a hash already filed, or of the head, is refused; renaming a hash
+    /// that is not filed is an error naming it.
+    pub fn rename(&mut self, from: B256, to: B256) -> Result<(), StateError> {
+        if from == to {
+            return Ok(());
+        }
+        let from_root = self.root_of(&from).ok_or(StateError::UnknownBlock(from))?;
+        if let Some(existing) = self.root_of(&to) {
+            // Already filed under the sealed hash -- by an earlier rename, or by
+            // a validation that computed it -- with the same root: nothing to do.
+            // A different root under that hash is a block this is not.
+            return if existing == from_root { Ok(()) } else { Err(StateError::UnknownBlock(to)) };
+        }
+        let record = self.records.remove(&from).ok_or(StateError::UnknownBlock(from))?;
+        self.records.insert(to, record);
+        // Every reference to the old hash follows it: the tip the tree stands
+        // at, the canonical head, the parent of pending work, and the parent
+        // of any block already computed on it.
+        if self.tip == from {
+            self.tip = to;
+        }
+        if self.head.1 == from {
+            self.head.1 = to;
+        }
+        if let Some((parent, _)) = self.pending.as_mut() {
+            if *parent == from {
+                *parent = to;
+            }
+        }
+        for child in self.records.values_mut() {
+            if child.parent == from {
+                child.parent = to;
+            }
+        }
+        Ok(())
+    }
+
     /// The state root at the canonical head.
     pub fn root(&self) -> B256 {
         self.root_of(&self.head.1).unwrap_or_default()
@@ -682,6 +727,26 @@ mod tests {
 
     fn h(byte: u8) -> B256 {
         B256::repeat_byte(byte)
+    }
+
+    #[test]
+    fn a_renamed_block_keeps_its_root_and_serves_as_a_parent() {
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        // Filed under the builder's hash, as a build does.
+        let root_built = forest.apply(GENESIS, h(0x0A), 1, &changes(1)).unwrap();
+        // Consensus sealed it under another hash.
+        forest.rename(h(0x0A), h(0xAA)).unwrap();
+        assert_eq!(forest.root_of(&h(0x0A)), None);
+        assert_eq!(forest.root_of(&h(0xAA)), Some(root_built));
+        // The next block builds on the sealed hash.
+        let root_next = forest.apply(h(0xAA), h(0xAB), 2, &changes(2)).unwrap();
+        let mut linear = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        linear.apply(GENESIS, h(0x0A), 1, &changes(1)).unwrap();
+        assert_eq!(linear.apply(h(0x0A), h(0xA2), 2, &changes(2)).unwrap(), root_next);
+        // Renaming again onto a hash that already holds the same root is nothing.
+        assert!(forest.rename(h(0xAB), h(0xAB)).is_ok());
+        // Renaming a hash that is not filed names it.
+        assert!(matches!(forest.rename(h(0x77), h(0x78)), Err(StateError::UnknownBlock(_))));
     }
 
     #[test]

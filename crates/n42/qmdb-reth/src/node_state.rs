@@ -453,6 +453,12 @@ impl QmdbNodeState {
     }
 
     /// The root after `block_hash`, if its tree is held.
+    /// Files a computed block under the hash consensus sealed it with. See
+    /// `QmdbForest::rename`.
+    pub fn rename(&self, from: B256, to: B256) -> Result<(), NodeStateError> {
+        self.with_forest(|forest| forest.rename(from, to))
+    }
+
     pub fn root_of(&self, block_hash: &B256) -> Option<B256> {
         self.lock().as_ref()?.root_of(block_hash)
     }

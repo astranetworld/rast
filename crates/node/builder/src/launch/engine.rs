@@ -323,6 +323,8 @@ impl EngineNodeLauncher {
 
             let mut res = Ok(());
             let mut shutdown_rx = shutdown_rx.fuse();
+            // N42: blocks the node executed itself, to insert without re-executing.
+            let mut executed_inserts = super::executed_inserts::take_receiver();
 
             // advance the chain and await payloads built locally to add into the engine api
             // tree handler to prevent re-execution if that block is received as payload from
@@ -380,6 +382,27 @@ impl EngineNodeLauncher {
                         if let Some(executed_block) = payload.executed_block() {
                             debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
+                        }
+                    }
+                    insert = async {
+                        match executed_inserts.as_mut() {
+                            Some(receiver) => receiver.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match insert {
+                            Some(insert) => {
+                                let handed = match insert.block.downcast() {
+                                    Ok(block) => {
+                                        orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(*block).into());
+                                        true
+                                    }
+                                    Err(_) => false,
+                                };
+                                let _ = insert.done.send(handed);
+                            }
+                            // Every sender gone: nothing more will come this way.
+                            None => executed_inserts = None,
                         }
                     }
                     shutdown_req = &mut shutdown_rx => {

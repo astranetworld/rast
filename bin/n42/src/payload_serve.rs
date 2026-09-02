@@ -40,6 +40,7 @@
 use std::net::SocketAddr;
 
 use alloy_consensus::BlockHeader as _;
+use alloy_primitives::B256;
 use alloy_eips::Encodable2718;
 use alloy_rlp::Encodable;
 use n42_h2_execution::raw_engine::{self, request};
@@ -103,10 +104,123 @@ where
 }
 
 /// Serves built blocks and imports on `addr` until the process ends.
+/// What importing our own sealed block without re-executing it needs: the
+/// validator that turns a payload into the sealed block, the QMDB state the
+/// builder filed the block's root in (under the builder's hash), and the way
+/// into the engine loop. See `n42_engine_types::built_executions`.
+#[derive(Clone)]
+pub struct OwnBlockReuse {
+    /// Converts a payload into the sealed block, exactly as the engine would.
+    pub validator: std::sync::Arc<n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec>>,
+    /// The QMDB state, on a chain that declares one.
+    pub qmdb: Option<n42_qmdb_reth::QmdbNodeState>,
+    /// Into the engine loop.
+    pub inserts: tokio::sync::mpsc::UnboundedSender<reth_node_builder::executed_inserts::ExecutedInsert>,
+}
+
+impl std::fmt::Debug for OwnBlockReuse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnBlockReuse").field("qmdb", &self.qmdb.is_some()).finish_non_exhaustive()
+    }
+}
+
+/// Imports a payload that is one of our own builds under consensus's seal by
+/// handing the engine the build's execution, so `newPayload` for it finds
+/// the block already in the tree.
+///
+/// Returns `Some(built hash)` when the block went in that way. `None` means
+/// the payload is not a build this node kept, or the sealed header did not
+/// hash to the payload's hash, or the engine refused it -- and the caller
+/// imports it the ordinary way, so nothing here can make a block invalid,
+/// only slow.
+async fn reuse_own_build<T>(
+    reuse: &OwnBlockReuse,
+    data: &alloy_rpc_types_engine::ExecutionData,
+) -> Option<B256>
+where
+    T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    use reth_engine_primitives::PayloadValidator as _;
+    let v1 = data.payload.as_v1();
+    let (built_hash, built) = n42_engine_types::built_executions::find(
+        v1.parent_hash,
+        v1.block_number,
+        v1.state_root,
+        v1.receipts_root,
+        v1.gas_used,
+    )?;
+    let started = std::time::Instant::now();
+    // The sealed block as the engine would see it: the same conversion, so
+    // the header is the one that hashes to the hash consensus voted on.
+    let sealed = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&reuse.validator, data.clone()) {
+        Ok(sealed) => sealed,
+        Err(err) => {
+            debug!(target: "n42.payload_serve", %err, "own build's payload did not convert; importing it the ordinary way");
+            return None;
+        }
+    };
+    let converted = started.elapsed();
+    let sealed_hash = sealed.hash();
+    if sealed_hash != data.payload.block_hash() {
+        return None;
+    }
+    // Same transactions, in the same order, as the build: the state and
+    // receipts roots pin them, and the transactions root of the sealed
+    // header does too.
+    if sealed.header().transactions_root != built.block.header().transactions_root
+        || sealed.body().transactions.len() != built.block.body().transactions.len()
+    {
+        return None;
+    }
+    let (sealed_header, _) = sealed.split_sealed_header_body();
+    let body = built.block.body().clone();
+    let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(
+        SealedBlock::from_sealed_parts(sealed_header, body),
+        built.block.senders().to_vec(),
+    );
+    if let Some(qmdb) = &reuse.qmdb {
+        if let Err(err) = qmdb.rename(built_hash, sealed_hash) {
+            warn!(target: "n42.payload_serve", %err, %built_hash, %sealed_hash, "could not file the build's QMDB root under the sealed hash; importing the ordinary way");
+            return None;
+        }
+    }
+    let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<reth_ethereum_primitives::EthPrimitives> {
+        recovered_block: std::sync::Arc::new(recovered),
+        execution_output: built.execution_output,
+        hashed_state: built.hashed_state,
+        trie_updates: built.trie_updates,
+    };
+    let (done, handed) = tokio::sync::oneshot::channel();
+    if reuse
+        .inserts
+        .send(reth_node_builder::executed_inserts::ExecutedInsert { block: Box::new(executed), done })
+        .is_err()
+    {
+        return None;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(2), handed).await {
+        Ok(Ok(true)) => {
+            info!(
+                target: "n42.payload_serve",
+                number = v1.block_number,
+                convert_ms = converted.as_millis() as u64,
+                total_ms = started.elapsed().as_millis() as u64,
+                "own block handed to the engine as executed"
+            );
+            Some(built_hash)
+        }
+        other => {
+            warn!(target: "n42.payload_serve", ?other, "the engine did not take our executed block; importing the ordinary way");
+            None
+        }
+    }
+}
+
 pub async fn serve<T>(
     addr: SocketAddr,
     payloads: PayloadBuilderHandle<T>,
     engine: ConsensusEngineHandle<T>,
+    reuse: Option<OwnBlockReuse>,
 ) -> std::io::Result<()>
 where
     T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -123,8 +237,9 @@ where
         };
         let payloads = payloads.clone();
         let engine = engine.clone();
+        let reuse = reuse.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(stream, payloads, engine).await {
+            if let Err(err) = serve_connection(stream, payloads, engine, reuse).await {
                 debug!(target: "n42.payload_serve", %peer, %err, "raw payload connection ended");
             }
         });
@@ -135,6 +250,7 @@ async fn serve_connection<T>(
     mut stream: TcpStream,
     payloads: PayloadBuilderHandle<T>,
     engine: ConsensusEngineHandle<T>,
+    reuse: Option<OwnBlockReuse>,
 ) -> std::io::Result<()>
 where
     T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -165,6 +281,12 @@ where
                     let decoded = started.elapsed();
                     let number = data.payload.block_number();
                     let txs = data.payload.as_v1().transactions.len();
+                    // One of ours, sealed: hand the engine the build's execution
+                    // first, and the newPayload below finds the block known.
+                    let reused = match &reuse {
+                        Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
+                        None => false,
+                    };
                     match engine.new_payload(data).await {
                         Ok(status) => {
                             if txs > 10_000 {
@@ -175,6 +297,7 @@ where
                                     decode_ms = decoded.as_millis() as u64,
                                     engine_ms = started.elapsed().saturating_sub(decoded).as_millis() as u64,
                                     status = ?status.status,
+                                    reused,
                                     "raw newPayload"
                                 );
                             }

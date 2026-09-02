@@ -283,6 +283,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let el = std::sync::Arc::clone(&self.el);
         let state = self.forkchoice(parent);
         let task_attrs = attrs.clone();
+        debug!(target: "n42.h2.el", ?parent, "starting a build ahead of leading");
         let task = tokio::spawn(async move {
             let started = std::time::Instant::now();
             let updated = el
