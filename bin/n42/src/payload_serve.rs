@@ -331,7 +331,15 @@ where
     T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
-    info!(target: "n42.payload_serve", %addr, "raw payload channel listening");
+    // Said at start-up so a round can grep that its switch reached this
+    // process: a variable that is set but never arrived measures nothing.
+    info!(
+        target: "n42.payload_serve",
+        %addr,
+        fresh_buffers = fresh_buffers(),
+        own_block_reuse = reuse.is_some(),
+        "raw payload channel listening"
+    );
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
