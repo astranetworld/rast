@@ -3432,3 +3432,35 @@ block 253: 74k at 2.4). A round needs a quiet box in memory as well as in
 cores; `free -g` and `ps` by RSS join the pre-round checks. Also learned:
 `fleet7-bench.sh` leaves the fleet up, and `fleet7.sh down`'s SIGTERM did not
 stop these nodes — verify with `pgrep` after every down.
+
+### Addendum 2: what the round-position collapse is not, and what the profile says
+
+Every direct-path round (direct2-5, cache8, dwarf1-3) reaches 175-196k TPS in
+window 1 at a third of occupancy and then falls to 80-120k from about 35-45 s
+into the flood: the followers' import goes from 2.0 µs/tx to 4-12, the queue
+backs up to the gate on the slowest node, and the generator throttles. Ruled
+out, one round each, same configuration: the recovery budget (cap 8 + nice
+10 is in every round), persistence interval, jemalloc purging (disabled: TLB
+shootdowns 11/s, collapse unchanged), the queue's lock (inbox: unchanged),
+the sender-recovery cache (x4: unchanged; x1/32, every sender recovered on
+import: 184,918 / **121,727** / 73,825 -- the best second window, and the
+collapse 20 s later). The cap-6 round (generator 128k/s, below the chain's
+rate, no backlog) stayed flat through 11M transactions, so the trigger is
+the backlog forming, not the state's size.
+
+The profile (node 6, a follower, 88k dwarf samples at flood+45 s): 80% of
+samples are tokio runtime threads 17 kernel frames deep with no user frame
+the unwinder could recover, spinning on one kernel address (87.8% of the
+frame-pointer capture in prof3 too, entered through libc's `syscall()`
+wrapper, which is what std, parking_lot and tokio use for futex -- and
+what the ingest's sockets use for nothing). The engine thread's samples
+enter the kernel from `mdbx_get -> cursor_seek -> tree_search_finalize`
+into a 34-frame page-fault chain that passes through a filesystem module:
+MDBX's mmap pages are not in the page cache when the importer reads them.
+A 33.5 GB process that is not ours (`n42-datc-25m-hi4.bin`) was on the box
+for every one of these rounds, and the gov5 session measured no such
+collapse on its client (22,857-transaction blocks, QMDB, 3m45s flat).
+
+Naming the 17 kernel frames needs `/proc/kallsyms` or `System.map`, both
+root-only on this box. That is the open item; the fix depends on which
+syscall it is.
