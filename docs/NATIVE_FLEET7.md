@@ -3402,3 +3402,33 @@ Confirm a build succeeded before reading a round: queue5 ran queue3's binary
 (a missing dependency, a grep that hid the error, `F7_SKIP_STALE_CHECK`
 letting the round go) and would have been read as "ordered admission changes
 nothing". The launchers now abort when the binary is older than the source.
+
+### Addendum: the parallel trie's partial last group, and the direct path
+
+Round direct1 (the other branch's `N42_TX_INGEST_DIRECT=1`: after recovery a
+frame goes straight into the builder's queue and never touches the pool; the
+pool's share of an ingest answer went from 20-400 to 4-9 µs/tx) reached
+**190,102 TPS** in window 1 at the pacing floor and a third of occupancy, then
+fell to 80k. The fall was mine: block 319 (8,200 transactions) sealed a
+transactions root no follower could reproduce, nobody voted, and the leader —
+whose own import does not re-validate its own block — kept proposing for the
+rest of its tenure.
+
+The parallel trie (round 26) hands each 256-leaf group's subtrie root to the
+top-level builder as a branch node at the group's prefix. When the item count
+is 2 to 16 past a multiple of 256, the last group's members all share their
+next nibble, the subtrie's root is an extension node, and the parent puts a
+second extension in front of it. Full blocks of 163,000 (residue 184) never
+hit it; the test list (4,097; 65,537; 163,000) never did either. Fixed in
+84202bb47 — such a group's members go up as leaves — with a test over every
+residue modulo 256 at three- and four-byte keys, which reproduced 8,194
+before the fix.
+
+direct2 (direct path + fix): 0 root mismatches, no mid-round timeouts,
+175,079 / 99,733 / 113,458. Windows 2-3 are not readable: a 33.5 GB process
+that was not ours was on the box with the 7 GB swap fully used, and node 3's
+follower import went from 2.1 µs/tx to 4-7 in bursts (block 240: 49k at 7.0;
+block 253: 74k at 2.4). A round needs a quiet box in memory as well as in
+cores; `free -g` and `ps` by RSS join the pre-round checks. Also learned:
+`fleet7-bench.sh` leaves the fleet up, and `fleet7.sh down`'s SIGTERM did not
+stop these nodes — verify with `pgrep` after every down.
