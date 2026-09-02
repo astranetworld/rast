@@ -7874,6 +7874,7 @@ name = "n42-engine-types"
 version = "0.0.0"
 dependencies = [
  "alloy-consensus 2.4.1",
+ "alloy-eip7928 0.4.8",
  "alloy-eips 2.4.1",
  "alloy-genesis",
  "alloy-network 2.4.1",
@@ -8323,6 +8324,7 @@ version = "2.1.5"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives 1.7.1",
+ "libc",
  "n42-tx-queue",
  "reth-evm",
  "reth-transaction-pool",
