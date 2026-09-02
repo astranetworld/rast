@@ -337,6 +337,9 @@ where
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
     Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
 {
+    // From the very top: the state provider and the cached reads are fetched
+    // before anything is executed, and were outside every earlier timing.
+    let build_started = std::time::Instant::now();
     let BuildArguments {
         mut cached_reads,
         config,
@@ -452,9 +455,9 @@ where
     // Rust client's breakdown at the same tier says otherwise: EVM 229 ms,
     // pool 57, block assembly 162. Which of those this builder spends its time
     // on decides what to fix, and guessing has been wrong before.
-    let build_started = std::time::Instant::now();
     let mut pool_ns: u128 = 0;
     let mut exec_ns: u128 = 0;
+    let setup_took = build_started.elapsed();
     let mut stale_txs: u64 = 0;
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
@@ -470,6 +473,10 @@ where
             .blob_gasprice()
             .map(|gasprice| gasprice as u64),
     ));
+    // Tried and measured inert: `best_txs.no_updates()`, dropping the
+    // iterator's live feed of new transactions. The pool phase stayed at
+    // 66-82 ms a block either way, so the cost is the ordered sets
+    // themselves, not what arrives during the build.
     let mut tx_count = 0u64;
     let mut total_fees = U256::ZERO;
 
@@ -787,6 +794,7 @@ where
             txs = tx_count,
             gas = cumulative_gas_used,
             stale = stale_txs,
+            setup_ms = setup_took.as_millis() as u64,
             pool_ms = (pool_ns / 1_000_000) as u64,
             exec_ms = (exec_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,

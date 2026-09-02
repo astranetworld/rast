@@ -2159,39 +2159,52 @@ impl<E: ExecutionLayer> H2Service<E> {
             )
         });
         let mut pushed_to_all = false;
-        let data = match own.map(Ok).unwrap_or_else(|| encode_block_rlp(execution, self.header_profile)) {
-            Ok(rlp) => {
-                let encoded = started.elapsed();
-                let data = match compress_block_rlp(&rlp) {
-                    Ok(data) => data,
-                    Err(err) => {
-                        warn!(target: "n42.h2.node", %err, ?block_hash, "cannot compress our own block");
-                        return;
-                    }
-                };
-                let compressed = started.elapsed();
-                pushed_to_all = self.push_body(&rlp, block_hash);
-                if rlp.len() > 1_000_000 {
-                    info!(
-                        target: "n42.h2.node",
-                        ?block_hash,
-                        bytes = rlp.len(),
-                        wire = data.len(),
-                        encode_ms = encoded.as_millis() as u64,
-                        compress_ms = compressed.saturating_sub(encoded).as_millis() as u64,
-                        push_ms = started.elapsed().saturating_sub(compressed).as_millis() as u64,
-                        "block body prepared"
-                    );
-                }
-                self.remember_body(block_hash, rlp);
-                data
-            }
+        let rlp = match own.map(Ok).unwrap_or_else(|| encode_block_rlp(execution, self.header_profile)) {
+            Ok(rlp) => rlp,
             Err(err) => {
                 // A block nobody else can receive is a block nobody else can
                 // vote on: the view is going to time out, and this is why.
                 warn!(target: "n42.h2.node", %err, ?block_hash, "cannot encode our own block for the fleet");
                 return;
             }
+        };
+        let encoded = started.elapsed();
+        pushed_to_all = self.push_body(&rlp, block_hash);
+        let pushed = started.elapsed();
+        // Compressed only for the topic: when the push reached every member
+        // the topic is not used, and snappy over 19 MB is ~15 ms of the
+        // leader's path for nothing.
+        let topic = !(pushed_to_all && !self.always_publish_topic);
+        let data = if topic {
+            match compress_block_rlp(&rlp) {
+                Ok(data) => Some(data),
+                Err(err) => {
+                    warn!(target: "n42.h2.node", %err, ?block_hash, "cannot compress our own block");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if rlp.len() > 1_000_000 {
+            info!(
+                target: "n42.h2.node",
+                ?block_hash,
+                bytes = rlp.len(),
+                wire = data.as_ref().map_or(0, Vec::len),
+                encode_ms = encoded.as_millis() as u64,
+                push_ms = pushed.saturating_sub(encoded).as_millis() as u64,
+                compress_ms = started.elapsed().saturating_sub(pushed).as_millis() as u64,
+                "block body prepared"
+            );
+        }
+        self.remember_body(block_hash, rlp);
+        let Some(data) = data else {
+            if topic {
+                return;
+            }
+            self.remember_topic_skipped(block_hash);
+            return;
         };
         // The topic, unless the direct push already reached every member.
         //
@@ -2204,10 +2217,6 @@ impl<E: ExecutionLayer> H2Service<E> {
         // its import could start. A member that was not pushed to (a gov5
         // node, or a peer not yet connected) still gets the topic, and any
         // member can fetch by hash.
-        if pushed_to_all && !self.always_publish_topic {
-            self.remember_topic_skipped(block_hash);
-            return;
-        }
         self.send_body(data, block_hash);
     }
 
