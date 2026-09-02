@@ -237,6 +237,7 @@ where
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         let started = std::time::Instant::now();
         let parent_hash = args.config.parent_header.hash();
+    let block_number = args.config.parent_header.number + 1;
         let result = default_n42_payload(
             self.evm_config.clone(),
             self.client.clone(),
@@ -703,6 +704,12 @@ where
         state: db.take_bundle(),
         result: execution_result,
     });
+    // How scattered the block is: accounts the bundle created against
+    // accounts it updated (a round's per-transaction cost was found to move
+    // with the block's shape, not its size).
+    let (created, updated) = execution_output.state.state.values().fold((0u64, 0u64), |(c, u), account| {
+        if account.original_info.is_none() { (c + 1, u) } else { (c, u + 1) }
+    });
 
     // Blob sidecars, in whichever variant the pool holds them. Kept as the
     // variant and not flattened to EIP-4844: the Osaka `getPayload` envelope
@@ -805,9 +812,12 @@ where
     if tx_count >= 1000 {
         tracing::info!(
             target: "payload_builder",
+            number = block_number,
             txs = tx_count,
             gas = cumulative_gas_used,
             stale = stale_txs,
+            created,
+            updated,
             setup_ms = setup_took.as_millis() as u64,
             pool_ms = (pool_ns / 1_000_000) as u64,
             exec_ms = (exec_ns / 1_000_000) as u64,
