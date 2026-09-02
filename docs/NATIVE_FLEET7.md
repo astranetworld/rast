@@ -3109,3 +3109,60 @@ written off as stalled -- `tenure16g`'s 1,500-transaction blocks); the
 ingest now counts already-known and already-mined as accepted, which is
 what a re-send could not change. And `deepest pool` is reported across
 the nodes, so the gated one is visible.
+
+## Round 30: the supply side, taken apart, and what still gates it
+
+Once a tenure leader builds at a ~1 s cycle the chain asks for 163,000
+transactions a second, and the question moved to whether the generator, the
+ingest and the pool can deliver them. Five rounds, each with one change, and
+two instruments added on the way: the flood's line every five seconds
+(rate, and its workers' time split into signing / sending / waiting) and
+the ingest's (rate, and its answer split into recovering senders / the pool
+taking the batch).
+
+| round | change | win1 / win2 / win3 | occupancy | flood, sustained |
+|---|---|---|---|---|
+| `tenure16k` | flood instrumented | 129,562 / 94,401 / 101,253 | 77 / 44 / 67% | 195k/s peak, 50-177k swinging |
+| `tenure16l` | pool 1.47M, gate 1.3M | 103,901 / 121,335 / 103,135 | 62 / 97 / 100% | same swing, gate never reached |
+| `tenure16m` | pool 978k, gate 815k, ingest instrumented, 32 validation tasks | 121,738 / 107,975 / 108,613 | 80 / 99 / 100% | pool 20 -> 400 us/tx at block cadence |
+| `tenure16n` | pool 652k, gate 489k | 114,854 / 70,463 / 100,856 | 88 / 100 / 60% | one 7 s timeout |
+| `tenure16o` | `N42_TX_INGEST_ASYNC=1`, pool 489k | 131,365 / 101,198 / 93,354 | 97 / 98 / 91% | gate engaged (438k) |
+| `tenure16p` | async + pool 652k, gate 489k | 134,273 / 73,790 / 92,299 | 99 / 76 / 100% | gate engaged (522k) |
+
+Three findings, in the order they were forced.
+
+**The generator is not the limit.** Signing is 23% of its workers' time;
+76% is waiting for the ingest's answer. It reaches 195,000/s in the first
+five seconds of every round, while the pools are empty, and every later
+figure is the server's.
+
+**The ingest's answer is the pool's write lock.** Recovering senders holds
+at 45-79 µs a transaction; the pool's `add_transactions` swings between 20
+and 400 µs a transaction, at block cadence, on every node. The lock is
+held for a block's maintenance (removing 163,000 mined transactions) and
+for the builder's snapshot (`PendingPool::best` clones the pending set;
+650,000 entries at the larger pools), and with every frame answered by all
+seven nodes, one node's stall is every worker's. `N42_TX_INGEST_ASYNC=1`
+answers a frame once it is past the gate and admits it in a task, eight
+frames in flight per connection: ~51,000 transactions buffered per node,
+the length of one stall. Blocks fuller (16o: 97/98/91%), the swing not
+gone -- because of the third thing.
+
+**The gate counts the wrong thing.** The ingest holds a frame while
+`pending` is at the high-water mark, and `pending` counts a block's
+transactions until the pool hears the block is canonical -- a follower that
+has just imported holds its 163,000 as pending through its maintenance.
+Every configuration that reached full blocks reported the deepest pool at
+or above the gate (413k against 407k; 522k against 489k), i.e. the
+generator was being throttled by a follower's stale count while the
+leader's pool ran short. Raising the gate with the pool (16l, 16m) removes
+the stall and slows the chain instead: the builder's snapshot and the
+maintenance both scale with the pool, and the cycle went from 1.0-1.2 s to
+1.3-1.6. The pool size is a trade between the two, and none of the sizes
+tried is clearly best on one round each.
+
+What the supply side needs next is a gate that counts what a leader can
+build -- pending less the last block's not-yet-maintained transactions --
+or, on a chain with a tenure, supply that is aimed at the leader rather
+than at seven pools. Both are the generator's and the ingest's business,
+not the chain's.
