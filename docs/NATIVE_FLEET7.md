@@ -3305,3 +3305,100 @@ slower (node 0 median 260 ms, nodes 2-4 413-485). The box is one NUMA node
 with sixteen L3 instances, so that is not locality; it is consistent with
 the state growing through the round (round 28), and is the reason a leader-
 side number needs the round position it was taken at.
+
+## Round 33: the leader drift was 512 threads, and the first two windows over 150,000
+
+Branch `feat/tenure-leader` (403c934ca), tenure 16, 250 ms pacing, `--ingest-all`,
+async ingest, whole physical cores. Everything below is from single rounds
+unless it says otherwise; the spread rule of round 27 stands.
+
+### The builder-side queue
+
+`crates/n42/tx-queue` (`N42_TX_QUEUE=1`): validated, recovered transactions per
+sender in nonce order, senders in arrival order, fed from the pool's own
+new-transaction listener, pruned on every node by canonical blocks, drained
+by the payload builder in place of the pool's iterator; a build on the same
+parent gets the previous build's transactions back. Builder pool phase
+116-220 ms -> 66-88 ms. The ingest's gate reads the queue's depth when one is
+installed (the pool's pending count carries a block's transactions until its
+maintenance hears of the block).
+
+Two supply defects surfaced immediately, both breaches of the one invariant a
+supply path has, per-sender nonce order:
+
+- **The async ingest reordered a sender's frames.** One task per frame,
+  eight in flight per connection: frame k+1 reached the pool before frame k,
+  the pool parked the gapped ones in `queued`, and a builder reading in nonce
+  order stopped that sender at the hole for the whole build. Rounds queue3/4:
+  115,730 queued, 58,569 built; 129,500 queued, 54,064 built. Fix: recovery
+  still parallel, one in-order admitter per connection (the bounded channel
+  is the back-pressure). After it a queue of 39,122 built a block of 39,665.
+- **The pool's listener drops on a full channel (1,024) and never resends**,
+  so a lane can miss a nonce for good. The builder now reports a nonce above
+  the account's as `NonceNotConsistent` (reth reports every refusal as
+  `TxTypeNotSupported`); the queue records the hole and the feed looks the
+  pool up for it.
+
+Persistence every 8 blocks against every 2: identical (queue3 vs queue4, win1
+130,583 vs 129,854), which removed persistence from the drift list.
+
+### The drift
+
+Since round 28 a leader's execution per transaction rose through a round —
+node 0 at 1.6 µs, the nodes leading later at 4-6 — and the state's growth was
+the standing explanation. It is not. The same binary in a round with a weak,
+erratic generator (prof2: 40% occupancy, a 7.5 s stall) gave every leader
+1.31-1.46 µs, late tenures included; stale counts are ~0 in all rounds. The
+cost tracks the generator, not the state.
+
+The ingest recovered senders with one `spawn_blocking` per frame and no
+bound: 64 connections x 8 frames in flight = up to 512 blocking threads of
+secp256k1 on a node pinned to 16 physical cores. The builder's thread got a
+slice of a core exactly when the generator pushed hardest, which is late in a
+round. `N42_TX_INGEST_RECOVER_PARALLEL=<n>` (a node-wide semaphore) and
+`N42_TX_INGEST_RECOVER_NICE=<n>` (recovery threads at a lower priority):
+
+| round | recovery | win1 | win2 | win3 | total | leaders µs/tx |
+| --- | --- | --- | --- | --- | --- | --- |
+| queue6 | unlimited | 119,752 (63%) | 81,779 | 80,031 | 8.46M | 1.5 → 5.0 |
+| queue7 | cap 6 | 140,898 (23%) | 117,147 | 110,646 | 11.06M | 1.37-1.50 flat |
+| rp10 | cap 10 | 184,661 (33%) | 89,244 | 75,029 | 10.47M | 1.4-4.0 |
+| rp14 | cap 14 | **203,051** (50%) | 89,021 | 85,245 | 11.33M | 1.4-3.7 |
+| rpnice | unlimited, nice 10 | 143,262 (40%) | 98,133 | 104,983 | 10.44M | 1.5-3.5 |
+| rp8nice | cap 8, nice 10 | **167,692** (28%) | **152,731** (29%) | 84,015 | **12.14M** | 1.3-1.4, node 0's 2nd tenure 3.6 |
+
+(occupancy in parentheses; 250 ms pacing, so 110 blocks in a window is the
+floor.) With the cap at 6 every leader is flat and the chain runs at the
+pacing floor at a quarter occupancy: the leader is idle most of the time and
+the generator, 128k/s, is the whole wall. Raising the cap raises the first
+window (203,051 is the first window over 200,000, at half occupancy) and
+brings the drift back, on the leader and — the part that matters — on the
+followers' import, whose engine thread shares the same cores: a follower that
+imports late prunes late, its queue reaches the gate, and the generator waits
+for the slowest node. Cap 8 with nice 10 held two consecutive windows above
+150,000 at 28% occupancy.
+
+Part of round 31's +26% from physical-core pinning was this contention;
+re-measure pinning after the budget lands. The follower's "700 ms import"
+carries the same signature and should be re-read under the budget too.
+
+### What the third window is
+
+Not the gate and not the state. Post-prune queue depth on every node stayed
+under 252k; the flood's rate fell from 167k/s (t = 20-35 s) to 147k (50 s),
+73k (65 s), 58k (80 s) while the queues held 40-110k and the workers spent
+90% of their time waiting for the ingest's answer. That is `add_transactions`
+starving on the pool's write lock: at 0.3 s blocks the pool's maintenance (a
+block's removals, 200-300 ms at 163,000) holds the lock most of the time, and
+the faster the chain the less admission gets — the collapse is the speed's
+own doing. Also `--pertx 2500 x 6000 senders = 15M` is within a round's reach
+now (12.8M sent). The remedy is the other branch's: feed the queue from the
+ingest directly (`TxQueue::push` builds the pool's `ValidPoolTransaction`
+itself) and let the pool carry RPC traffic only.
+
+### Practice
+
+Confirm a build succeeded before reading a round: queue5 ran queue3's binary
+(a missing dependency, a grep that hid the error, `F7_SKIP_STALE_CHECK`
+letting the round go) and would have been read as "ordered admission changes
+nothing". The launchers now abort when the binary is older than the source.
