@@ -22,5 +22,6 @@ pub mod persistence;
 pub mod service;
 pub mod tx_source;
 
+pub mod body_channel;
 pub use persistence::{ConsensusCheckpoint, ConsensusStore, FileVoteLog, StoreError};
 pub use service::{H2Service, ServiceError, ServiceEvent, ProposalContext};

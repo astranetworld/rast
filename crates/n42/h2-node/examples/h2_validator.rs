@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut worker_threads: Option<usize> = None;
     let mut block_interval_ms: Option<u64> = None;
     let mut direct_push = false;
+    let mut body_port_offset: u16 = 1000;
     let mut base_timeout_ms: Option<u64> = None;
     let mut max_timeout_ms: Option<u64> = None;
     let mut period_secs: u64 = 1;
@@ -118,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--el-ingest" => el_ingest = Some(args.next().ok_or("--el-ingest needs an address")?),
             "--jwt" => jwt_path = Some(args.next().ok_or("--jwt needs a path")?),
             "--peer" => peers.push(args.next().ok_or("--peer needs a multiaddr")?),
+            "--body-port-offset" => body_port_offset = args.next().ok_or("--body-port-offset needs a number")?.parse()?,
             "--listen" => listen.push(args.next().ok_or("--listen needs a multiaddr")?),
             "--fault-tolerance" => {
                 fault_tolerance =
@@ -454,6 +456,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // from the pacing rather than left at its production default.
             service = service.with_block_pacing(Duration::from_millis(period_ms));
             service = service.with_direct_block_push(direct_push);
+            // The plain TCP body channel, on every member's libp2p port plus
+            // the offset; 0 leaves bodies to libp2p alone.
+            if direct_push && body_port_offset > 0 {
+                let mine = listen.iter().find_map(|addr| n42_h2_node::body_channel::address_for(addr, body_port_offset));
+                let theirs: Vec<std::net::SocketAddr> =
+                    peers.iter().filter_map(|addr| n42_h2_node::body_channel::address_for(addr, body_port_offset)).collect();
+                if let Some(mine) = mine {
+                    let (tx, rx) = tokio::sync::mpsc::channel(8);
+                    match n42_h2_node::body_channel::listen(mine, tx).await {
+                        Ok(()) => {
+                            let pushers = n42_h2_node::body_channel::BodyPushers::connect(theirs);
+                            service = service.with_body_channel(rx, pushers);
+                        }
+                        Err(err) => eprintln!("body channel: cannot listen on {mine}: {err}; bodies go over libp2p"),
+                    }
+                }
+            }
             // Building ahead is what a tenure is for: the leader of the next
             // view is this node again, and it learns the parent the moment it
             // imports its own block. With round-robin it stays behind the
@@ -712,6 +731,7 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --el <url>                Engine API auth endpoint (reth --authrpc.port, 8551)
   --jwt <path>              the execution layer's JWT secret file
   --peer <multiaddr>        fleet member to dial (repeatable)
+  --body-port-offset <n>    plain TCP body channel on each member's libp2p port + n (default 1000; 0 = off)
   --listen <multiaddr>      address to listen on (repeatable)
   --propose                 build blocks when leader (default: vote only)
   --mobile <addr>           serve the mobile_* endpoint here (e.g. 127.0.0.1:9545)

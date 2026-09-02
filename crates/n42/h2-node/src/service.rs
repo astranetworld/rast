@@ -208,6 +208,10 @@ pub struct H2Service<E> {
     inbound_forward: Option<mpsc::Sender<Vec<Bytes>>>,
     /// When each body arrived, for the import timing log.
     body_arrived: std::collections::HashMap<B256, std::time::Instant>,
+    /// Bodies arriving over the plain TCP channel. See [`crate::body_channel`].
+    body_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// The channel's senders, one per peer, for this node's own bodies.
+    body_pushers: Option<crate::body_channel::BodyPushers>,
     /// Publish every body on the block topic even when the direct push
     /// reached every connected member. `N42_BLOCK_TOPIC_ALWAYS=1`; what a
     /// fleet with gov5 members needs, since they take bodies from the topic.
@@ -547,6 +551,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             proposal_deferred: false,
             inbound_forward: None,
             body_arrived: std::collections::HashMap::new(),
+            body_rx: None,
+            body_pushers: None,
             always_publish_topic: std::env::var("N42_BLOCK_TOPIC_ALWAYS").is_ok(),
             prepare_on: None,
             prepare_ahead: false,
@@ -822,8 +828,19 @@ impl<E: ExecutionLayer> H2Service<E> {
         let timeout = self.engine.pacemaker().timeout_sleep();
         tokio::pin!(timeout);
         let outbound = self.outbound_transactions.as_mut();
+        let body_rx = self.body_rx.as_mut();
 
         tokio::select! {
+            body = async {
+                match body_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(body) = body {
+                    self.handle_direct_body(body);
+                }
+            }
             event = self.transport.next_event() => {
                 let Some(event) = event else {
                     return Err(ServiceError::TransportEnded);
@@ -1459,6 +1476,18 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// execution layer for a payload on a block the fleet has not committed
     /// costs far more than the wait it saves, and until that is understood
     /// this is not a default.
+    /// Sends and receives bodies over the plain TCP channel, with the libp2p
+    /// push kept for any peer the channel does not reach.
+    pub fn with_body_channel(
+        mut self,
+        rx: mpsc::Receiver<Vec<u8>>,
+        pushers: crate::body_channel::BodyPushers,
+    ) -> Self {
+        self.body_rx = Some(rx);
+        self.body_pushers = Some(pushers);
+        self
+    }
+
     pub const fn with_build_ahead(mut self, enabled: bool) -> Self {
         self.prepare_ahead = enabled;
         self
@@ -2175,14 +2204,52 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// held.
     /// Pushes the body straight to every connected member. Returns whether
     /// that reached the whole mesh, so the caller can skip the topic.
+    ///
+    /// The TCP channel first: if every one of its peers took the body, the
+    /// libp2p push is not used either. Otherwise the libp2p push covers
+    /// everyone, at the cost of a duplicate to the peers the channel reached,
+    /// which the receiver's body store absorbs.
     fn push_body(&mut self, rlp: &[u8], block_hash: B256) -> bool {
         if !self.direct_push {
             return false;
+        }
+        if let Some(pushers) = &self.body_pushers
+            && !pushers.is_empty()
+        {
+            let taken = pushers.push(std::sync::Arc::new(rlp.to_vec()));
+            debug!(target: "n42.h2.node", ?block_hash, taken, peers = pushers.len(), "offered the body to the channel");
+            if taken == pushers.len() {
+                return true;
+            }
         }
         let peers = self.transport.connected_peer_ids().len();
         let sent = self.transport.push_block_to_all(rlp);
         debug!(target: "n42.h2.node", ?block_hash, peers = sent, "pushed the body to the fleet");
         sent > 0 && sent == peers
+    }
+
+    /// A body that came over the TCP channel: the same decode and the same
+    /// bookkeeping as a pushed one, identified by what it decodes to.
+    fn handle_direct_body(&mut self, rlp: Vec<u8>) {
+        let started = std::time::Instant::now();
+        match decode_block_rlp_raw(&rlp, self.header_profile) {
+            Ok(block) => {
+                let hash = block.block_hash;
+                if !self.body_store.contains_key(&hash) {
+                    let txs = block.transactions.len();
+                    self.remember_block(hash, &block.header);
+                    self.driver.cache_payload(hash, block.execution_data());
+                    self.remember_body(hash, rlp);
+                    self.import_eagerly(hash);
+                    self.body_arrived.insert(hash, std::time::Instant::now());
+                    self.received_bodies.push(hash);
+                    info!(target: "n42.h2.node", block_hash = ?hash, txs, decode_ms = started.elapsed().as_millis() as u64, "block body received");
+                }
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.node", %err, "a body from the channel could not be read");
+            }
+        }
     }
 
     fn send_body(&mut self, data: Vec<u8>, block_hash: B256) {
