@@ -3496,3 +3496,37 @@ no collapse (22,857-transaction blocks, 3m45s flat), and the cap-6 round
 (generator below the chain's rate, no backlog) stayed flat through 11M
 transactions. Whatever the kernel function is, it is reached only when this
 client is pushed past its rate.
+
+### Addendum 4: the validator's body store, bookended
+
+The supply session's A-B-A of its frame reuse (three legs, all flat at
+~4.3 µs/tx on the followers, windows 2-3 at 120-125k) had one thing in every
+leg that no collapsing round had: e3eca2e95 -- the body channel's pooled
+receive buffers and the validator's body store cut from 4,096 remembered
+bodies to 64. Bookended here with `N42_H2_REMEMBERED_BODIES` on this tree
+(without the supply session's ingest `BufReader`), direct configuration,
+conditions sampled every 5 s, read in the declared order:
+
+| leg | store | win1 | win2 | win3 | follower µs/tx | collapse | datc / available GB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| s64a | 64 | 186,219 | 84,449 | 100,030 | 2.0-2.3 → 7-10 | +34 s | 89→32 / 75→33 |
+| s4096 | 4,096 | 105,940 | 71,469 | 83,281 | 2.1 → 4.5 → 9.2 | +24 s | 33 / 89→42 |
+| s64b | 64 | 188,980 | 75,635 | 81,297 | 1.8-2.3 → 7-10 | +37 s | 35-39 / 87→35 |
+
+The bookends agree; the middle leg is 43% lower in window 1 and collapses
+ten seconds earlier under the best memory conditions of the three. The
+store cut is real and large. The collapse is not the store: both s64 legs
+have it. What the flat legs had and these lack is the 1 MiB `BufReader` on
+the ingest's read half -- two `read(2)` per transaction at 190k/s is
+~400k syscalls/s per node on the runtime workers, and the earlier magnitude
+argument priced a syscall uncontended, which under 20-60k major faults/s it
+is not. That is the supply session's A-B-A, next.
+
+Also from the conditions log: the fourteen node processes take 20-30 GB of
+the box's available memory within the first 30 s of every flood (QMDB's
+append-only entries, the pool, the caches), and the collapse came at 44-59
+GB available -- no single threshold, so not a memory cliff by itself, but
+the slope is ours. `MALLOC_CONF` in jem1/jem2: the supply session's environ
+dump was of its own legs, not those rounds; f7_spawn is a plain
+setsid/exec, so the variable very probably arrived and those two rounds
+stand as ordinary negatives, by inference.
