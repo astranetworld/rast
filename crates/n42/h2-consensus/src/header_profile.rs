@@ -598,18 +598,27 @@ pub fn reconstruct_gov5_h2_block_from<T>(
         }
         _ => vec![block.header.block_access_list_hash],
     };
+    // The slot number: a V4 payload always carries one (alloy's V4 has no
+    // "absent"), but the header this chain's builder seals has none, and the
+    // raw path gives the payload the block number. Round ams5 refused every
+    // Amsterdam block with both access-list-hash candidates equal -- the one
+    // dimension not tried was this one.
+    let slot_numbers = if block.header.slot_number.is_some() { vec![block.header.slot_number, None] } else { vec![None] };
     for ommers_hash in [B256::ZERO, EMPTY_OMMER_ROOT_HASH] {
         for difficulty in [U256::ZERO, U256::from(1)] {
             for withdrawals_root in &withdrawals_roots {
                 for requests_hash in &requests_hashes {
                     for bal_hash in &bal_hashes {
-                        block.header.ommers_hash = ommers_hash;
-                        block.header.difficulty = difficulty;
-                        block.header.withdrawals_root = *withdrawals_root;
-                        block.header.requests_hash = *requests_hash;
-                        block.header.block_access_list_hash = *bal_hash;
-                        if block.header.hash_slow() == expected {
-                            return Ok(block);
+                        for slot_number in &slot_numbers {
+                            block.header.ommers_hash = ommers_hash;
+                            block.header.difficulty = difficulty;
+                            block.header.withdrawals_root = *withdrawals_root;
+                            block.header.requests_hash = *requests_hash;
+                            block.header.block_access_list_hash = *bal_hash;
+                            block.header.slot_number = *slot_number;
+                            if block.header.hash_slow() == expected {
+                                return Ok(block);
+                            }
                         }
                     }
                 }
