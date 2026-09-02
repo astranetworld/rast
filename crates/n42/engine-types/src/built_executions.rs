@@ -39,8 +39,11 @@ pub struct BuiltExecution {
 }
 
 /// How many recent builds are kept. A leader's block is sealed and comes
-/// back within a view; builds that were never proposed age out.
-const KEEP: usize = 4;
+/// back within a view, so one is in flight and one may be the build ahead;
+/// each is ~100 MB at 163,000 transactions (block, bundle state, receipts),
+/// and on a box whose page cache is the contended resource every retained
+/// hundred megabytes is a hundred megabytes of state pages evicted.
+const KEEP: usize = 2;
 
 fn store() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
     static STORE: OnceLock<Mutex<VecDeque<(B256, BuiltExecution)>>> = OnceLock::new();
