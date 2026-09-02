@@ -51,6 +51,17 @@
 - `evm_env()` 中使用 `recover_address()` 获取 beneficiary
 - `blob_max_and_target_count_by_hardfork()` 方法
 
+## 模块6: node/builder
+### 定制文件:
+- `crates/node/builder/src/launch/executed_inserts.rs`（N42 新增）
+- `crates/node/builder/src/launch/engine.rs`（引擎循环多一个 select 分支）
+- `crates/node/builder/src/lib.rs`（`pub use launch::executed_inserts`）
+### 定制内容:
+- 一条进入引擎循环的通道：节点把自己已经执行过的块（`BuiltPayloadExecutedBlock`）交给引擎，
+  循环转成 `EngineApiRequest::InsertExecutedBlock` 并回执。reth 只对 payload 事件流里带执行结果的
+  payload 走这条路，以太坊 payload 类型不带；N42 的共识在构建之后才封装块头、哈希会变，
+  所以由节点自己配对（`bin/n42/src/payload_serve.rs`）。纯增量，默认对上游行为无影响。
+
 ## 其他 N42 独有模块:
 - `crates/n42/clique/` - APoS 共识实现
 - `crates/n42/primitives/` - beacon 链原语
