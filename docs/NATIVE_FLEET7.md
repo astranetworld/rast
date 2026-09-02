@@ -3188,3 +3188,9 @@ tenure (250 -> 928 ms; the cached-reads hypothesis is being worked on the
 `feat/tenure-leader` branch) and the supply oscillating at block cadence
 (round 30). Neither is the consensus structure, and both are now
 instrumented.
+
+`tenure16q`, the gate granting one block's allowance per block the pool
+lags the chain (`F7_GATE_LAG=1`): 122,716 / 99,803 / 100,638 -- inside the
+three-round distribution above, so not a result on one round; the deepest
+pool then sits at the pool's own cap (483,500 of 489,000), which is where
+the next stall comes from. Opt-in, recorded, not adopted.

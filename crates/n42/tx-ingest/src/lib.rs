@@ -139,10 +139,21 @@ fn spawn_stats_reporter() {
     });
 }
 
+/// Transactions a block holds at the tier the gate is sized for, from
+/// `N42_TX_INGEST_BLOCK_TXS`; the allowance the gate grants per block the
+/// pool has yet to hear of. Zero (the default) is the old gate.
+fn block_txs_allowance() -> u64 {
+    std::env::var("N42_TX_INGEST_BLOCK_TXS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
 pub async fn serve<P>(
     addr: SocketAddr,
     pool: P,
     cache: Option<reth_evm::SenderRecoveryCache>,
+    head: std::sync::Arc<AtomicU64>,
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
@@ -160,8 +171,9 @@ where
         };
         let pool = pool.clone();
         let cache = cache.clone();
+        let head = std::sync::Arc::clone(&head);
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(stream, pool, cache).await {
+            if let Err(err) = serve_connection(stream, pool, cache, head).await {
                 debug!(target: "n42.tx_ingest", %peer, %err, "ingest connection ended");
             }
         });
@@ -172,12 +184,14 @@ async fn serve_connection<P>(
     mut stream: TcpStream,
     pool: P,
     cache: Option<reth_evm::SenderRecoveryCache>,
+    head: std::sync::Arc<AtomicU64>,
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
     P::Transaction: 'static,
 {
     let gate = high_water();
+    let allowance = block_txs_allowance();
     // N42_TX_INGEST_ASYNC=1: answer a frame once it is past the gate and
     // admit it in the background, at most ASYNC_FRAMES_IN_FLIGHT frames at a
     // time per connection. The pool's write lock is taken for a block's
@@ -230,7 +244,22 @@ where
         // transaction's `Arc` into a fresh `Vec`, which at a 100,000-deep pool
         // polled every 2 ms by 32 connections is a few hundred million refcount
         // touches a second under the same lock the pool admits through.
-        while pool.pool_size().pending >= gate {
+        // The gate, on what a builder could use rather than on `pending` as
+        // the pool counts it: a block's transactions stay pending until the
+        // pool hears the block is canonical, and a follower that has just
+        // imported one holds 163,000 of them through its maintenance. Every
+        // full-block round reported the deepest pool at the gate while the
+        // leader's ran short -- the generator, answered by all seven nodes,
+        // throttled by a follower's stale count. So for each block the chain
+        // is ahead of the pool, the gate allows one block's worth more.
+        loop {
+            let lag = head
+                .load(Ordering::Relaxed)
+                .saturating_sub(pool.block_info().last_seen_block_number)
+                .min(4);
+            if u64::try_from(pool.pool_size().pending).unwrap_or(u64::MAX) < gate as u64 + lag * allowance {
+                break;
+            }
             tokio::time::sleep(GATE_POLL).await;
         }
         if asynchronous {

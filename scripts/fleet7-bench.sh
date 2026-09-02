@@ -142,6 +142,10 @@ if [[ -n $GASCEIL ]]; then
   blk=$(( GASCEIL / 21000 ))
   : "${F7_BENCH_POOL_SLOTS:=$(( blk * 3 ))}"
   : "${N42_TX_INGEST_HIGH_WATER:=$(( F7_BENCH_POOL_SLOTS * 5 / 6 ))}"
+  # F7_GATE_LAG=1: the ingest's gate allows one block's transactions more
+  # for each block the pool has yet to hear of (see the ingest); opt-in, as
+  # it is a variable of its own.
+  [[ ${F7_GATE_LAG:-0} == 1 ]] && export N42_TX_INGEST_BLOCK_TXS=$blk
   export F7_BENCH_POOL_SLOTS N42_TX_INGEST_HIGH_WATER
   echo "tier sizing  : ${blk} tx/block, pool ${F7_BENCH_POOL_SLOTS}, ingest gate ${N42_TX_INGEST_HIGH_WATER}"
   DERIVED=${F7_ROOT:-/data/blockchain/rust-fleet7-bench}/genesis-${GASCEIL}.json

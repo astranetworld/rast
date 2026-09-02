@@ -248,8 +248,22 @@ fn main() {
                         // The sender-recovery cache, so a transaction admitted
                         // here is not recovered again when its block arrives.
                         let cache = node.evm_config().sender_recovery_cache.clone();
+                        // The canonical head's number, for the ingest's gate to
+                        // know how far the pool lags the chain.
+                        let head = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        {
+                            use futures::StreamExt as _;
+                            use reth_provider::CanonStateSubscriptions as _;
+                            let head = head.clone();
+                            let mut canonical = node.provider.canonical_state_stream();
+                            tokio::spawn(async move {
+                                while let Some(notification) = canonical.next().await {
+                                    head.store(notification.tip().number, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            });
+                        }
                         tokio::spawn(async move {
-                            if let Err(err) = n42_tx_ingest::serve(addr, pool, cache).await {
+                            if let Err(err) = n42_tx_ingest::serve(addr, pool, cache, head).await {
                                 error!(target: "reth::cli", %err, "transaction ingest stopped");
                             }
                         });

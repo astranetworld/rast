@@ -7637,6 +7637,7 @@ dependencies = [
  "clap",
  "consensus-client",
  "eyre",
+ "futures",
  "hex",
  "jsonrpsee",
  "n42-clique",
