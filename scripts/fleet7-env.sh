@@ -206,6 +206,14 @@ fi
 # credits one lever with another's saving.
 : "${F7_PROFILE:=lean}"
 [[ $F7_PROFILE == lean ]] && export MALLOC_CONF="$F7_JEMALLOC"
+# Every other profile: return freed pages after 1 s instead of jemalloc's
+# 10 s. At this tier a node churns 100-200 MB/s per block and held about a
+# gigabyte of dead pages while the box's page cache -- what the importers
+# read their state through -- was down to 9 GB. Bookended (jemA1/jemB/jemA2,
+# the variable verified in the EL's environ): followers 4.20 / 3.98 / 4.32
+# us/tx on full blocks, windows 2-3 130k/125k, 136k/136k, 119k/125k.
+: "${F7_JEMALLOC_DECAY:=dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true}"
+[[ $F7_PROFILE == lean ]] || export MALLOC_CONF="${MALLOC_CONF:-$F7_JEMALLOC_DECAY}"
 
 # Log level. The validator's own logs are the fleet's only progress record, so
 # they stay at info; debug costs real write bandwidth at seven nodes.
