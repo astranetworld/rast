@@ -219,7 +219,24 @@ where
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
-    let accepted = results.iter().filter(|outcome| outcome.is_ok()).count();
+    // Accepted, for a sender that advances its nonce on the answer: the pool
+    // took it, or already had it, or the chain already mined it. The last two
+    // arrive when the same frame reaches every node (`tx_flood --ingest-all`)
+    // and one of them is ahead -- reporting them as refusals made the
+    // generator re-send the same nonce to every node forever, and every pool
+    // that had it refuse it again, until the sender gave up as stalled. What
+    // is *not* accepted is what a re-send would still not fix: a gap, a fee,
+    // a full pool.
+    let accepted = results
+        .iter()
+        .filter(|outcome| match outcome {
+            Ok(_) => true,
+            Err(err) => {
+                matches!(err.kind, reth_transaction_pool::error::PoolErrorKind::AlreadyImported)
+                    || matches!(&err.kind, reth_transaction_pool::error::PoolErrorKind::InvalidTransaction(invalid) if invalid.is_nonce_too_low())
+            }
+        })
+        .count();
     u32::try_from(accepted).unwrap_or(u32::MAX)
 }
 
