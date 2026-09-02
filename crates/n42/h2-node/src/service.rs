@@ -904,6 +904,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                     reason = self.defer_reason.unwrap_or(if leader { "proposed; the votes did not arrive" } else { "not this node's view to lead" }),
                     "view timed out"
                 );
+                // A leader's build prepared ahead was on the block that just
+                // went unanswered; the next proposal extends the last QC's
+                // block, so that build is not the one it wants.
+                if leader {
+                    self.driver.discard_prepared();
+                }
                 self.engine.on_timeout()?;
             }
             () = tokio::time::sleep(self.propose_retry), if self.proposal_deferred => {
