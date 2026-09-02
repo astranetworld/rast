@@ -157,6 +157,56 @@ fn direct_to_queue() -> bool {
     *DIRECT.get_or_init(|| std::env::var("N42_TX_INGEST_DIRECT").is_ok())
 }
 
+/// Whether the gate lets a frame through: the queue's depth (the pool's
+/// pending without a queue) against the high-water mark, plus one block's
+/// allowance for each block the chain is ahead of the pool.
+fn gate_open<P: TransactionPool + 'static>(
+    pool: &P,
+    head: &std::sync::Arc<AtomicU64>,
+    gate: usize,
+    allowance: u64,
+) -> bool
+where
+    P::Transaction: 'static,
+{
+    let lag = head
+        .load(Ordering::Relaxed)
+        .saturating_sub(pool.block_info().last_seen_block_number)
+        .min(4);
+    u64::try_from(queue_depth(pool)).unwrap_or(u64::MAX) < gate as u64 + lag * allowance
+}
+
+/// The node's gate: connections held at the high-water mark wait here, and
+/// one watcher task ([`spawn_gate_watcher`]) wakes them when the depth is
+/// back under it.
+struct Gate {
+    open: tokio::sync::Notify,
+    waiting: AtomicU64,
+}
+
+static GATE: Gate = Gate { open: tokio::sync::Notify::const_new(), waiting: AtomicU64::new(0) };
+
+/// Polls the gate every `GATE_POLL` while anyone is waiting on it, and wakes
+/// every waiter when it is open; idles at a slower rate otherwise.
+fn spawn_gate_watcher<P>(pool: P, head: std::sync::Arc<AtomicU64>, gate: usize, allowance: u64)
+where
+    P: TransactionPool + 'static,
+    P::Transaction: 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            if GATE.waiting.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(GATE_POLL * 10).await;
+                continue;
+            }
+            tokio::time::sleep(GATE_POLL).await;
+            if gate_open(&pool, &head, gate, allowance) {
+                GATE.open.notify_waiters();
+            }
+        }
+    });
+}
+
 fn queue_depth<P: TransactionPool + 'static>(pool: &P) -> usize
 where
     P::Transaction: 'static,
@@ -233,6 +283,7 @@ where
     P: TransactionPool + Clone + 'static,
 {
     spawn_stats_reporter();
+    spawn_gate_watcher(pool.clone(), std::sync::Arc::clone(&head), high_water(), block_txs_allowance());
     let listener = TcpListener::bind(addr).await?;
     info!(target: "n42.tx_ingest", %addr, "binary transaction ingest listening");
     loop {
@@ -347,15 +398,23 @@ where
         // leader's ran short -- the generator, answered by all seven nodes,
         // throttled by a follower's stale count. So for each block the chain
         // is ahead of the pool, the gate allows one block's worth more.
+        // Waiting is on a node-wide notification, not a poll per connection.
+        // Sixty-four connections each sleeping 2 ms and re-reading the queue's
+        // depth is 32,000 wake-ups and lock takes a second on the node's tokio
+        // workers, and it happens only while the gate is shut -- i.e. exactly
+        // when a backlog has formed, which is when the followers' import was
+        // seen to double (80% of a follower's samples on the runtime's threads
+        // in one kernel address). One watcher polls; the waiters sleep.
         loop {
-            let lag = head
-                .load(Ordering::Relaxed)
-                .saturating_sub(pool.block_info().last_seen_block_number)
-                .min(4);
-            if u64::try_from(queue_depth(&pool)).unwrap_or(u64::MAX) < gate as u64 + lag * allowance {
+            let notified = GATE.open.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if gate_open(&pool, &head, gate, allowance) {
                 break;
             }
-            tokio::time::sleep(GATE_POLL).await;
+            GATE.waiting.fetch_add(1, Ordering::Relaxed);
+            notified.await;
+            GATE.waiting.fetch_sub(1, Ordering::Relaxed);
         }
         if asynchronous {
             let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
