@@ -65,14 +65,29 @@ struct Inner<T: PoolTransaction> {
     gaps: Vec<(Address, u64, u64)>,
 }
 
+/// A transaction handed in but not yet in its lane.
+enum Staged<T: PoolTransaction> {
+    Raw(T, std::time::Instant),
+    Valid(Arc<ValidPoolTransaction<T>>),
+}
+
 /// The queue. Cheap to clone; every clone is the same queue.
+///
+/// Pushes go to an inbox under their own lock, held for a `Vec` push; the
+/// lanes' lock is taken only by the builder, the pruner and the feed's
+/// drain. Sixty-four ingest connections pushing straight into the lanes
+/// while a build took the lock 163,000 times and a prune held it for tens
+/// of milliseconds put every node's runtime threads into a spin (round
+/// prof3: 72% of a follower's samples on one kernel address).
 pub struct TxQueue<T: PoolTransaction> {
     inner: Arc<Mutex<Inner<T>>>,
+    inbox: Arc<Mutex<Vec<Staged<T>>>>,
+    staged: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<T: PoolTransaction> Clone for TxQueue<T> {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self { inner: Arc::clone(&self.inner), inbox: Arc::clone(&self.inbox), staged: Arc::clone(&self.staged) }
     }
 }
 
@@ -100,6 +115,25 @@ impl<T: PoolTransaction> TxQueue<T> {
                 last_build: None,
                 gaps: Vec::new(),
             })),
+            inbox: Arc::new(Mutex::new(Vec::new())),
+            staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Moves what was pushed since the last drain into the lanes. Called
+    /// with the lanes' lock held; a no-op when nothing was pushed.
+    fn drain_inbox(&self, inner: &mut Inner<T>) {
+        use std::sync::atomic::Ordering;
+        if self.staged.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let staged = std::mem::take(&mut *self.inbox.lock());
+        self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
+        for item in staged {
+            match item {
+                Staged::Raw(transaction, at) => inner.insert(transaction, at, TransactionOrigin::External),
+                Staged::Valid(valid) => inner.insert_valid(valid),
+            }
         }
     }
 
@@ -113,7 +147,7 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// How many transactions are queued.
     pub fn len(&self) -> usize {
-        self.inner.lock().len
+        self.inner.lock().len + self.staged.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether nothing is queued.
@@ -124,32 +158,35 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// Queues validated, recovered transactions. A (sender, nonce) already
     /// queued keeps its first arrival.
     pub fn push(&self, transactions: impl IntoIterator<Item = T>) {
-        let mut inner = self.inner.lock();
         let now = std::time::Instant::now();
-        for transaction in transactions {
-            inner.insert(transaction, now, TransactionOrigin::External);
-        }
+        let staged: Vec<Staged<T>> = transactions.into_iter().map(|t| Staged::Raw(t, now)).collect();
+        let count = staged.len();
+        self.inbox.lock().extend(staged);
+        self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Queues transactions the pool has already validated, as the pool holds
     /// them. What the pool's new-transaction listener yields; the queue is a
     /// view of the pool's arrivals, whichever door they came in by.
     pub fn push_valid(&self, transactions: impl IntoIterator<Item = Arc<ValidPoolTransaction<T>>>) {
-        let mut inner = self.inner.lock();
-        for valid in transactions {
-            inner.insert_valid(valid);
-        }
+        let staged: Vec<Staged<T>> = transactions.into_iter().map(Staged::Valid).collect();
+        let count = staged.len();
+        self.inbox.lock().extend(staged);
+        self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Drops everything at or below `nonce` for `sender`: a block carrying
     /// (sender, nonce) has made every lower nonce unusable as well.
     pub fn remove_mined(&self, sender: Address, nonce: u64) {
-        self.inner.lock().remove_mined(sender, nonce);
+        let mut inner = self.inner.lock();
+        self.drain_inbox(&mut inner);
+        inner.remove_mined(sender, nonce);
     }
 
     /// Drops a batch of mined (sender, nonce) pairs.
     pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
         let mut inner = self.inner.lock();
+        self.drain_inbox(&mut inner);
         for (sender, nonce) in mined {
             inner.remove_mined(sender, nonce);
         }
@@ -161,6 +198,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn best_for_build(&self, parent: B256) -> QueueBest<T> {
         {
             let mut inner = self.inner.lock();
+            self.drain_inbox(&mut inner);
             match inner.last_build.take() {
                 Some((previous, taken)) if previous == parent => {
                     let count = taken.len();
@@ -303,7 +341,9 @@ impl<T: PoolTransaction> Iterator for QueueBest<T> {
     type Item = Arc<ValidPoolTransaction<T>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.queue.inner.lock().next_ready(&self.skipped)
+        let mut inner = self.queue.inner.lock();
+        self.queue.drain_inbox(&mut inner);
+        inner.next_ready(&self.skipped)
     }
 }
 
