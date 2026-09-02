@@ -3285,3 +3285,23 @@ Also seen and not explained: node 2's builder executes the same blocks in
 774-860 ms where node 0 takes 242-292 (in round 30's logs as well). Something
 about that node — its cores (64-95) or its datadir — and any leader-side
 number from it should be read with that in mind.
+
+### Re-read under whole physical cores
+
+`phys1`, the same tenure configuration with round 31's pinning (prune off):
+window 1 142,331 TPS (27 blocks, 1.111 s), then 108,557 / 99,578; full-block
+cycle mean 1.408 s, median 1.379 s. Every tenure leader's builds show
+`stale=0`: with each node on its own physical cores the pool's maintenance
+keeps up with a leader that builds every view, so the stale half of round
+32's finding was SMT contention, not the pool's design. What stands is the
+selection: 116-220 ms per build from a 400,000-transaction pool against
+~75 in round-robin, and the ingest's gate engaged (deepest pool 440,476
+against 407,500) while the fleet's pools held a block's worth of
+not-yet-maintained transactions each.
+
+Leader execution per build ranged 220-771 ms across the round with no
+monotonic trend inside a tenure; the nodes that led later in the round were
+slower (node 0 median 260 ms, nodes 2-4 413-485). The box is one NUMA node
+with sixteen L3 instances, so that is not locality; it is consistent with
+the state growing through the round (round 28), and is the reason a leader-
+side number needs the round position it was taken at.
