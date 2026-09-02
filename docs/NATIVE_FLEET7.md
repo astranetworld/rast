@@ -3232,3 +3232,56 @@ third. The ceiling is now demonstrated at the block size the target was
 set for; what remains is why a round does not hold it -- the leader's
 execution drift over a tenure, and the supply stalls of round 30 -- and
 both are instrumented and assigned.
+## Round 32: on the tenure, the pool is the wall
+
+Branch `feat/tenure-leader`, one round (`prune1`), the tenure configuration
+of round 29 (tenure 16, ingest-all, no transaction gossip, async ingest,
+direct push).
+
+### What a tenure leader's builder was pulling
+
+Round 30's logs, read for the builder: a tenure leader's builds show
+`txs=327,000 stale=163,000` on every second block — the pool still held the
+previous block's transactions when the next build began, so the builder
+walked 327,000 to select 163,000 and paid an account read for each stale one.
+The pool learns of a canonical block through its maintenance task,
+asynchronously; a round-robin leader has six other blocks of slack before
+it builds again, a tenure leader has none. Pool phase 177-299 ms per build
+against ~75 in round-robin.
+
+### Removing them at import: right diagnosis, wrong cure
+
+The raw payload channel now can take a block's transactions out of the pool
+the moment the block is in the tree, own build or `newPayload` Valid
+(`N42_PRUNE_POOL_ON_IMPORT=1`, off by default). It made `stale` zero on every
+build — and cost **260-293 ms per block** under the pool's write lock
+(`remove_transactions`, one transaction at a time), so the round was slower:
+windows 21/21/14 blocks, cycle mean 1.763 s.
+
+That figure is the finding. It is the same work the pool's maintenance does
+when the block goes canonical — the ~300 ms write-lock stall the other
+session measured on the ingest — so the prune moved the cost onto the
+critical path rather than removing it. On a tenure leader the pool is
+therefore about half a second of every block: ~200 ms to select from a
+400,000-transaction pool and ~300 ms to remove the block's transactions,
+both under the lock the ingest needs. reth's pool was not built for
+163,000-transaction blocks every 0.8 s, and the tenure route runs into that
+before it runs into execution.
+
+### What would remove it
+
+A builder-side transaction source beside reth's pool rather than inside it:
+the binary ingest already validates and recovers every transaction; kept in
+per-sender nonce order in a plain queue, selection is a linear walk (N42-26's
+drain is 20 ms on the same block size) and removal on inclusion is a pop.
+reth's pool would still receive everything for RPC and gossip, off the
+leader's path. A block that fails to commit would need its transactions
+re-queued from the built payload, which the builder has. It changes what the
+pool is for on this fleet, which is a design decision rather than a tuning
+one, and is recorded here as the next item on the tenure route rather than
+started.
+
+Also seen and not explained: node 2's builder executes the same blocks in
+774-860 ms where node 0 takes 242-292 (in round 30's logs as well). Something
+about that node — its cores (64-95) or its datadir — and any leader-side
+number from it should be read with that in mind.
