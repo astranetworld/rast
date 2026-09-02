@@ -315,6 +315,12 @@ fn sealed_header_from_fields(
     None
 }
 
+/// `N42_PAYLOAD_SERVE_FRESH_BUFFERS`, read once.
+fn fresh_buffers() -> bool {
+    static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FRESH.get_or_init(|| std::env::var("N42_PAYLOAD_SERVE_FRESH_BUFFERS").is_ok())
+}
+
 pub async fn serve<T>(
     addr: SocketAddr,
     payloads: PayloadBuilderHandle<T>,
@@ -372,6 +378,12 @@ where
             let len = stream.read_u32_le().await? as usize;
             if len > 256 << 20 {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload frame too large"));
+            }
+            // N42_PAYLOAD_SERVE_FRESH_BUFFERS=1 restores a fresh allocation per
+            // frame, for the A-B-A that separates buffer reuse from the box.
+            if fresh_buffers() {
+                frame = Vec::new();
+                out = Vec::new();
             }
             frame.clear();
             frame.resize(len, 0);
