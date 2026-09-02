@@ -3623,3 +3623,42 @@ measured under the syscall collapse and masked by it. A-B-A of
 `F7_SENDER_CACHE_MULT` 2 / 8 / 2 is running as this is written; if it
 holds, the structural fix is to carry the leader's recovered senders in the
 raw payload (3.3 MB a block) so import costs what the build costs.
+
+### Addendum 8: the full-block cost is page cache, and the page cache is memory
+
+Whole-round counters on a follower's engine thread (prof8/prof9, 5 s
+buckets joined with the transactions it executed in each): ~12k user
+instructions and ~7k user cycles per transaction in every bucket, 58k
+blocks and 163k blocks alike -- CPU per transaction is constant at 2.2-2.5
+µs. The two-point ratios reported earlier were normalisation errors (the
+sampled node was leading during the "partial" window). What doubles is wall
+time: engine_ms per transaction 2.37 at partial blocks, equal to CPU, and
+3.7-4.9 at full blocks, with the thread's context switches rising from 1.5k
+to 10-14k per 5 s. The engine thread waits.
+
+What it waits on (prof10/prof11, `/proc/<tid>/{stat,wchan,io}` sampled by
+the launcher): at full blocks 25-31% of samples in `folio_wait_bit_common`,
+101-134 of 1,000 in D state; at partial blocks none. The thread's own
+`read_bytes` is 0 at partial blocks and 26 MB/s at full blocks with
+`rchar` 0 -- disk reads through the mapping, i.e. MDBX page faults, the
+`cursor_seek` chain from the morning. Machine major faults 837/s against
+55,444/s; seven importers at 26 MB/s are most of that. `--db.sync-mode`
+durable / safe-no-sync / durable: 4.52 / 4.39 / 4.38 µs/tx, D-state 26 / 25
+/ 25% -- not writeback, eviction.
+
+Why later in every round (mem1, 20 s samples): the EL grows 0.78 -> 7.9 GB
+over a flood (seven of them), validators 1-1.4 GB, machine AnonPages 41 ->
+99 GB with the datc job at 31-45 GB, and the page cache falls 28 -> 8.7 GB
+at flood+35 s -- the collapse moment -- against ~55 GB of MDBX, static and
+RocksDB files the fleet reads. After the flood the EL falls back to 2.5 GB:
+most of the growth is transient (retained transactions, blocks awaiting
+persistence, jemalloc's dirty pages held for its 10 s decay). Bookended
+non-causes from the same series: gas ceiling (block size), sender runs,
+sender-cache size, cross-block cache size, sync mode. The leaders' new
+per-block log shows a full block changes ~5k accounts (created ~2k,
+updated ~3k): the flood's recipients repeat, so composition is small and
+constant.
+
+Levers, in order: the fleet's own memory per node (allocator decay under
+test; retained blocks; the queue's 400k transactions), then the neighbour,
+then residency of the maps (mlock needs a memlock limit this user lacks).
