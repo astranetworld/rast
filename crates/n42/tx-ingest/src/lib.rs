@@ -93,6 +93,21 @@ const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// sensible default for a fleet whose pool holds far more: a gate above the
 /// pool's own capacity never closes, and one far below it starves the builder.
 /// Sized by the round, which knows its own pool depth.
+/// What the gate measures: the builder-side queue's depth when one is
+/// installed (`N42_TX_QUEUE=1`), else the pool's pending count. The pool's
+/// count includes a block's transactions until the pool's maintenance hears
+/// of the block, which at this block size is long after the builder took
+/// them; the queue's count is what the next build can still use.
+fn queue_depth<P: TransactionPool + 'static>(pool: &P) -> usize
+where
+    P::Transaction: 'static,
+{
+    match n42_tx_queue::global::<P::Transaction>() {
+        Some(queue) => queue.len(),
+        None => pool.pool_size().pending,
+    }
+}
+
 fn high_water() -> usize {
     std::env::var("N42_TX_INGEST_HIGH_WATER")
         .ok()
@@ -204,7 +219,28 @@ where
     // which is right for a generator that only sends valid transactions and
     // wrong for anything else, so this is not the default.
     let asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok();
-    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(ASYNC_FRAMES_IN_FLIGHT));
+    // Recovery runs in parallel, ASYNC_FRAMES_IN_FLIGHT frames at a time, but
+    // the pool takes a connection's frames in the order they arrived: one
+    // admitter per connection drains them in sequence. Admitting each frame
+    // as its recovery finished put a sender's frame k+1 into the pool before
+    // its frame k; a builder reading the queue in nonce order then stopped
+    // at the hole, and half of a full queue sat behind one (rounds queue3-4).
+    let (admit_tx, mut admit_rx) =
+        tokio::sync::mpsc::channel::<tokio::task::JoinHandle<Vec<P::Transaction>>>(ASYNC_FRAMES_IN_FLIGHT);
+    if asynchronous {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            while let Some(recovering) = admit_rx.recv().await {
+                let started = std::time::Instant::now();
+                match recovering.await {
+                    Ok(decoded) => {
+                        let _ = admit_decoded(&pool, decoded, started).await;
+                    }
+                    Err(err) => warn!(target: "n42.tx_ingest", %err, "sender recovery task failed"),
+                }
+            }
+        });
+    }
     // Nagle would batch the acknowledgements into the next read's latency, and
     // the point of this path is that nothing waits for a round trip.
     stream.set_nodelay(true)?;
@@ -257,29 +293,27 @@ where
                 .load(Ordering::Relaxed)
                 .saturating_sub(pool.block_info().last_seen_block_number)
                 .min(4);
-            if u64::try_from(pool.pool_size().pending).unwrap_or(u64::MAX) < gate as u64 + lag * allowance {
+            if u64::try_from(queue_depth(&pool)).unwrap_or(u64::MAX) < gate as u64 + lag * allowance {
                 break;
             }
             tokio::time::sleep(GATE_POLL).await;
         }
         if asynchronous {
-            let permit = std::sync::Arc::clone(&in_flight)
-                .acquire_owned()
-                .await
-                .expect("the in-flight semaphore is never closed");
             let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
-            let pending = u32::try_from(pool.pool_size().pending).unwrap_or(u32::MAX);
-            let (pool, cache) = (pool.clone(), cache.clone());
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _ = admit(&pool, raws, cache).await;
-            });
+            let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
+            let cache = cache.clone();
+            let recovering = tokio::task::spawn_blocking(move || decode_and_recover::<P>(raws, cache.as_ref()));
+            // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
+            // waiting for the pool: the answer waits for a slot, as before.
+            if admit_tx.send(recovering).await.is_err() {
+                return Ok(());
+            }
             stream.write_u32_le(offered).await?;
             stream.write_u32_le(pending).await?;
             continue;
         }
         let accepted = admit(&pool, raws, cache.clone()).await;
-        let pending = u32::try_from(pool.pool_size().pending).unwrap_or(u32::MAX);
+        let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
         stream.write_u32_le(accepted).await?;
         stream.write_u32_le(pending).await?;
     }
@@ -333,6 +367,16 @@ where
             return 0;
         }
     };
+    admit_decoded(pool, decoded, started).await
+}
+
+/// Puts recovered transactions into the pool and counts them; `started` is
+/// when their frame's recovery began.
+async fn admit_decoded<P>(pool: &P, decoded: Vec<P::Transaction>, started: std::time::Instant) -> u32
+where
+    P: TransactionPool + 'static,
+    P::Transaction: 'static,
+{
     if decoded.is_empty() {
         return 0;
     }
