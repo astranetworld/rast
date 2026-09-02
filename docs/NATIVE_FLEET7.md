@@ -3194,3 +3194,41 @@ lags the chain (`F7_GATE_LAG=1`): 122,716 / 99,803 / 100,638 -- inside the
 three-round distribution above, so not a result on one round; the deepest
 pool then sits at the pool's own cap (483,500 of 489,000), which is where
 the next stall comes from. Opt-in, recorded, not adopted.
+
+## Round 31: seven nodes on 112 physical cores, and 184,717 TPS in a window
+
+The fleet pinned node i to logical CPUs 32i..32i+31. This machine is one
+EPYC 9B45, 128 cores and 256 threads, SMT siblings (c, c+128): so node 0
+shared its physical cores with node 4, node 1 with 5, node 2 with 6, and
+node 3 with the load generator. Seven nodes on 112 physical cores, every
+execution thread on a core another node's thread was also on. It was found
+by way of the other session's observation that node 2's builder executed
+the same blocks 2-3x slower than node 0's, and it explains a good part of
+this file's round-to-round noise: which pairs were busy at the same moment
+was down to which views they led. gov5's session, asked whether their
+fleet had it, found they do not pin at all (the scheduler avoids siblings)
+and offered the rule that fits: a synchronised fleet's instantaneous core
+demand is seven times its profile's average.
+
+`F7_PIN_PHYSICAL=1`, now the default: node i gets 16i..16i+15 and their
+siblings, the generator the sixteen physical cores the nodes leave. Three
+rounds of the tenure configuration (tenure 16, ingest-all, async ingest,
+pool 489k, tree a55750e57):
+
+| | run 1 | run 2 | run 3 | median |
+|---|---:|---:|---:|---:|
+| win1 TPS | 79,557 | **184,717** | **177,461** | 177,461 |
+| win2 TPS | 59,748 | 113,990 | 119,437 | 113,990 |
+| win3 TPS | **162,900** | 108,591 | 97,584 | 108,591 |
+| total txs | 9,070,688 | 12,225,000 | 11,844,675 | 11,844,675 |
+
+Against the unpinned distribution (114,598 / 99,916 / 86,651; total
+9,386,117): the total's median up 26%, and three windows over 160,000 --
+184,717 is 34 full blocks at a 0.882 s cycle, 162,900 is 30 full blocks at
+1.001 s -- the first time this fleet has held the target for a window with
+every block full. The spread is 59%, and it is honest: run 1's first two
+windows stalled at 80k and 60k before the same fleet did 162,900 in its
+third. The ceiling is now demonstrated at the block size the target was
+set for; what remains is why a round does not hold it -- the leader's
+execution drift over a tenure, and the supply stalls of round 30 -- and
+both are instrumented and assigned.

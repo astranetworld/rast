@@ -531,8 +531,9 @@ f7_smt_offset() {
 
 # f7_pin <index> -- echoes the taskset prefix for that node, or nothing.
 #
-# F7_PIN_PHYSICAL=1 gives each node whole physical cores: half as many core
-# numbers, each with its SMT sibling. Without it, node i takes logical CPUs
+# F7_PIN_PHYSICAL=1 (the default; 0 restores the old layout) gives each node
+# whole physical cores: half as many core numbers, each with its SMT sibling.
+# With F7_PIN_PHYSICAL=0, node i takes logical CPUs
 # 32i..32i+31, and on a 128-core / 256-thread part whose siblings are
 # (c, c+128) that puts node 0 on the same physical cores as node 4, 1 as 5,
 # 2 as 6, and 3 as the generator -- seven nodes on 112 physical cores, every
@@ -542,7 +543,7 @@ f7_smt_offset() {
 f7_pin() {
   local i=$1 lo hi off
   [[ $F7_PIN == 1 ]] || return 0
-  if [[ ${F7_PIN_PHYSICAL:-0} == 1 ]]; then
+  if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
     off=$(f7_smt_offset)
     lo=$((F7_CORE_OFFSET + i * F7_CORES_PER_NODE / 2))
     hi=$((lo + F7_CORES_PER_NODE / 2 - 1))

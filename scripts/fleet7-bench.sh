@@ -311,7 +311,7 @@ fi
 # signature per transaction, and it re-signs a batch it has to retry -- so an
 # unpinned generator competes with the nodes it is measuring and the round
 # reports the contention as the chain's.
-if [[ ${F7_PIN_PHYSICAL:-0} == 1 ]]; then
+if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
   # The physical cores the nodes left, with their siblings (see f7_pin).
   _off=$(f7_smt_offset); _lo=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE / 2)); _hi=$((_off - 1))
   FLOOD_CORES=${F7_FLOOD_CORES:-$_lo-$_hi,$((_lo + _off))-$((_hi + _off))}
