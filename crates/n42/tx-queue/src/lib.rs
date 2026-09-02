@@ -63,6 +63,26 @@ struct Inner<T: PoolTransaction> {
     /// Holes a build ran into: (sender, the account's next nonce, the lowest
     /// queued nonce above it). The feed fills them from the pool.
     gaps: Vec<(Address, u64, u64)>,
+    /// The sender a build is taking a run from, and how much of the run is
+    /// left. See [`run_length`].
+    current: Option<(Address, usize)>,
+}
+
+/// How many consecutive nonces a build takes from one sender before moving
+/// to the next: `N42_TX_QUEUE_RUN`, 1 by default (strict rotation).
+///
+/// A block drawn from a deep queue by strict rotation alternates among
+/// every queued sender -- 6,000 of them at the bench tier -- so each
+/// transaction touches two cold accounts; a block drawn from a shallow queue
+/// alternates among the few dozen senders that have arrived, and the same
+/// follower imports it at half the cost per transaction (round gcA1/gcB:
+/// 2.1-2.3 us/tx for partial blocks, 4.0 for full ones of any size). Runs
+/// keep a sender's account hot across its consecutive transactions.
+fn run_length() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("N42_TX_QUEUE_RUN").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or(1)
+    })
 }
 
 /// A transaction handed in but not yet in its lane.
@@ -114,6 +134,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 len: 0,
                 last_build: None,
                 gaps: Vec::new(),
+                current: None,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -208,6 +229,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 _ => {}
             }
             inner.last_build = Some((parent, Vec::new()));
+            inner.current = None;
         }
         QueueBest { queue: self.clone(), skipped: HashSet::new() }
     }
@@ -294,6 +316,37 @@ impl<T: PoolTransaction> Inner<T> {
     /// The next transaction: the lowest nonce of the sender at the front of
     /// the arrival order, skipping senders the build marked.
     fn next_ready(&mut self, skipped: &HashSet<Address>) -> Option<Arc<ValidPoolTransaction<T>>> {
+        // Continue the current sender's run first.
+        if let Some((sender, left)) = self.current.take() {
+            if left > 0 && !skipped.contains(&sender) {
+                if let Some(lane) = self.lanes.get_mut(&sender) {
+                    if let Some((_, valid)) = lane.by_nonce.pop_first() {
+                        self.len -= 1;
+                        if lane.by_nonce.is_empty() {
+                            lane.queued = false;
+                        } else if left > 1 {
+                            self.current = Some((sender, left - 1));
+                        } else {
+                            self.arrivals.push_back(sender);
+                        }
+                        if let Some((_, taken)) = self.last_build.as_mut() {
+                            taken.push(Arc::clone(&valid));
+                        }
+                        return Some(valid);
+                    }
+                }
+            }
+            // The run ended, was refused, or the lane emptied: the sender
+            // rejoins the rotation if it still has anything.
+            if let Some(lane) = self.lanes.get_mut(&sender) {
+                if lane.by_nonce.is_empty() {
+                    lane.queued = false;
+                } else {
+                    self.arrivals.push_back(sender);
+                }
+            }
+        }
+        let run = run_length();
         let mut passes = self.arrivals.len();
         while passes > 0 {
             passes -= 1;
@@ -311,6 +364,8 @@ impl<T: PoolTransaction> Inner<T> {
             self.len -= 1;
             if lane.by_nonce.is_empty() {
                 lane.queued = false;
+            } else if run > 1 {
+                self.current = Some((sender, run - 1));
             } else {
                 self.arrivals.push_back(sender);
             }
