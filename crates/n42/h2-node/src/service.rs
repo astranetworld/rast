@@ -466,6 +466,16 @@ const PULLED_BLOCKS_PER_STEP: usize = 32;
 // this is rebuilt from the execution layer, as the comment at the store says.
 const REMEMBERED_BODIES: usize = 64;
 
+/// How many bodies the store keeps: `N42_H2_REMEMBERED_BODIES`, else
+/// [`REMEMBERED_BODIES`]. An environment knob so a round can bookend the
+/// old 4,096 against the new default.
+fn remembered_bodies() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("N42_H2_REMEMBERED_BODIES").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or(REMEMBERED_BODIES)
+    })
+}
+
 /// How many block timestamps to remember. Far more than any head-selection
 /// needs; the bound is against a peer flooding bodies, not a working set.
 const REMEMBERED_TIMESTAMPS: usize = 256;
@@ -2106,7 +2116,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn remember_body(&mut self, block_hash: B256, rlp: impl Into<crate::body_channel::BodyBuf>) {
         if self.body_store.insert(block_hash, rlp.into()).is_none() {
             self.body_store_order.push(block_hash);
-            while self.body_store_order.len() > REMEMBERED_BODIES {
+            while self.body_store_order.len() > remembered_bodies() {
                 let oldest = self.body_store_order.remove(0);
                 self.body_store.remove(&oldest);
             }
