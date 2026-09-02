@@ -3590,3 +3590,36 @@ block size. That is why window 1 (55k blocks at the pacing floor) runs
 the working set outgrowing the L3 slices or something per-block that is
 quadratic (revm's State cache, the bundle, the hashed-state build) is open;
 the lever is testable either way: gas ceiling 3.42G / 1.5G / 3.42G.
+
+### Addendum 7: block size, rotation, and what a follower pays that a leader does not
+
+Two more A-B-As on the direct configuration (conditions every 5 s, the
+datc job present at 33-45 GB throughout), read bookends first.
+
+**Gas ceiling** 3.42G / 1.5G / 3.42G: 172,977 / 124,935 / 114,018;
+144,896 / 116,628 / 121,364; 193,951 / 119,349 / 114,030. Windows 2-3 do
+not move with 70k-transaction blocks. The bins do: node 3 imports 25-100k
+blocks at 2.10-2.27 µs/tx in both bookends and 163k blocks at 4.05-4.33,
+while gcB's 50-75k blocks -- full ones, drawn from a backlog -- cost 3.96.
+
+**Rotation vs runs** (`N42_TX_QUEUE_RUN` 1 / 256 / 1): followers 4.32 /
+4.44 / 4.47 on full blocks; 173,994 / 130,344 / 119,464; 182,138 / 141,219 /
+119,442; 187,279 / 124,932 / 124,931. Sender locality is not it (the gov5
+builder drains senders in runs and shows the same rise).
+
+What the raw per-block data say. On a leader, within one tenure and one
+minute (node 6, runA2, blocks 208-223): 30-65k blocks execute at 1.3-1.8
+µs/tx, 88k at 2.07, 148k at 2.31, 165k at 3.0-3.65 -- execution is
+superlinear in transactions per block on the same node at the same moment,
+neighbour-independent: the in-block state (revm's cache and bundle, ~326k
+accounts by the end of a full block) outgrows the caches and is rehashed as
+it grows. On a follower the transition is equally sharp in time (#217 at
+2.01, #218 one second later at 4.04) but a 70k full block costs it 3.96
+where the leader pays ~2 for that size: a second component that appears
+only with a backlog and only on import. The leader has its senders from the
+queue; the follower recovers them through a direct-mapped cache whose slots
+a deep backlog overwrites -- the hypothesis discarded in the morning was
+measured under the syscall collapse and masked by it. A-B-A of
+`F7_SENDER_CACHE_MULT` 2 / 8 / 2 is running as this is written; if it
+holds, the structural fix is to carry the leader's recovered senders in the
+raw payload (3.3 MB a block) so import costs what the build costs.
