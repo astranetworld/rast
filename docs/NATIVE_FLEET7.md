@@ -3041,3 +3041,71 @@ and assembly, batched QMDB root), three consecutive rounds:
 
 Against the day's start (`rep-a` at the same block size: win1 93,379, cycle
 medians 1.73-1.81 s) and the file's first comparable figure (65,197 at 2.5 s).
+
+## Round 29: the leader's second execution removed, the build ahead armed, and 140,841 TPS in a window
+
+Six rounds on the tenure, each moving one thing, all with `tx_flood
+--ingest-all` and no transaction gossip (round 27's supply finding).
+
+| round | change | win1 / win2 / win3 | cycle (mean) | note |
+|---|---|---|---|---|
+| `tenure16e` | ingest-all supply | 119,487 / 113,979 / 97,620 | 1.499 s | blocks full; ahead used 11 of 181 |
+| `tenure16g` | own block reused, first cut | 83,820 / 8,710 / 6,876 | — | own import 22-59 ms; generator livelocked (below) |
+| `tenure16h` | ingest counts known/mined as accepted | 89,507 / 80,872 / 85,714 | 1.795 s | full again; own import 112-192 ms; ahead 10 of 174 |
+| `tenure16i` | ahead-path decisions logged | 102,555 / 108,634 / 103,201 | 1.539 s | the ahead build is never *requested* in a tenure |
+| **`tenure16j`** | build ahead armed on own import; sealed header from fields | **140,841** / 92,914 / 90,520 | 1.281 s | ahead 223 of 226; win2-3 starve |
+| `tenure16k` | flood instrumented | 129,562 / 94,401 / 101,253 | 1.401 s | generator 195k/s peak, gated |
+
+### The leader executed its own block twice
+
+A leader's own block came back from consensus under a different hash --
+the seal puts view, QC and signature in `extra_data` -- and reth executed
+it again on import: ~500 ms, on the tenure leader's path before the next
+build could start. reth can insert an already-executed block
+(`InsertExecutedBlock`, the sequencer path), but its Ethereum payload types
+carry no execution and the only entry is the engine loop's payload-event
+stream. Now the builder keeps each build's bundle, receipts, hashed state
+and trie updates keyed by the hash it gave the block; the raw payload
+channel, on a newPayload whose parent, number, roots and gas match a kept
+build, reconstructs the sealed header from the payload's fields (the seal
+changes only those; the hash proves the pairing), pairs it with the build's
+body, senders and execution, files the build's QMDB root under the sealed
+hash (`QmdbForest::rename` -- the record, the tip, the head, and every
+child's parent follow it; the first cut moved only the record and the next
+build could not find its way from the tip), and hands the engine the block
+through a channel added to the vendored node launcher. The newPayload then
+finds the block known. Own import: ~500 -> 22-59 ms on the raw pairing,
+200-330 with the full conversion, ~30 with the header from fields.
+
+### The build ahead was never armed in a tenure
+
+`prepare_on` was set by `BlockImported`, the follower path's event. A
+leader's own block raised none, so a tenure's builds were all on demand,
+after the Decide: `decide -> publish` 1,081 ms in `tenure16h`. The driver's
+spawned own import now reports every block the execution layer took, the
+loop selects on it, and the report arms the build ahead. `tenure16j`, a
+tenure leader's block: own import 200-330 ms -> build ahead 520-610 ms,
+overlapping the fleet's import (recv -> vote 380 ms) and vote (68 ms) ->
+proposal waits 27-290 ms. Window 1: 29 blocks, 1.035 s cycle, 140,841 TPS.
+
+### What the generator says
+
+The flood now prints, every five seconds, its rate and where its workers'
+time went. `tenure16k`: 195,358/s in the first five seconds with the pools
+empty, then 50,000-177,000/s swinging; signing 23% of worker time, waiting
+for the ingest's answer 76%; deepest pool 413,700 against a gate of
+407,500. The gate is engaged, and it engages on `pending`, which counts a
+block's transactions until the pool hears the block is canonical -- a
+follower that has just imported a block holds its 163,000 as pending for
+the length of its pool maintenance. With every frame answered by all seven
+nodes, one gated follower stalls every worker for every node. That is the
+oscillation, and the 43-77% occupancy of windows 2-3 while the leader's
+pool ran dry.
+
+Two generator defects on the way: advancing a nonce by the *fewest* any
+node accepted livelocked once a node had the transaction already (it
+refused the copy, the minimum was zero, the sender re-sent forever and was
+written off as stalled -- `tenure16g`'s 1,500-transaction blocks); the
+ingest now counts already-known and already-mined as accepted, which is
+what a re-send could not change. And `deepest pool` is reported across
+the nodes, so the gated one is visible.
