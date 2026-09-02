@@ -43,6 +43,18 @@ pub struct HotStuffGenesisConfig {
     /// seconds, so this is also the floor on how often a leader may propose.
     #[serde(default = "default_period")]
     pub period: u64,
+    /// Consecutive views one validator leads before the rotation moves on:
+    /// the leader of view `v` is validator `(v / leaderTenure) % n`.
+    ///
+    /// 1 is gov5's round-robin and the only value a mixed fleet can run. A
+    /// larger value lets a leader build its next block while the fleet is
+    /// still importing the one it just proposed, which takes one of the two
+    /// executions every block costs off the critical path. The price is
+    /// liveness: a leader that stops proposing costs up to `leaderTenure`
+    /// view timeouts instead of one, because a timeout advances the view by
+    /// one and the tenure counts views.
+    #[serde(default = "default_leader_tenure")]
+    pub leader_tenure: u64,
     /// First view timeout, milliseconds.
     #[serde(default = "default_base_timeout")]
     pub base_timeout: u64,
@@ -143,6 +155,9 @@ impl HotStuffGenesisConfig {
 
 const fn default_period() -> u64 {
     3
+}
+const fn default_leader_tenure() -> u64 {
+    1
 }
 const fn default_base_timeout() -> u64 {
     6_000

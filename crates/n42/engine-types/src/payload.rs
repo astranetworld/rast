@@ -36,6 +36,7 @@ use reth_transaction_pool::{
     ValidPoolTransaction,
 };
 use revm::context_interface::Block as _;
+use revm::Database as _;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -454,6 +455,7 @@ where
     let build_started = std::time::Instant::now();
     let mut pool_ns: u128 = 0;
     let mut exec_ns: u128 = 0;
+    let mut stale_txs: u64 = 0;
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -512,6 +514,23 @@ where
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
             return Ok(BuildOutcome::Cancelled);
+        }
+
+        // A transaction the chain has already mined, still in the pool because
+        // the pool hears of a canonical block a little after the execution
+        // layer has it. A build started the moment its parent was imported --
+        // the build a leader with a tenure runs ahead of its next view --
+        // finds every one of the parent's transactions still pending, and
+        // executing each only to fail on its nonce cost 1.5-3 s at 163,000 a
+        // block. The account is read from the same state the execution would
+        // read it from, cached after the first transaction of each sender.
+        // Skipped rather than marked invalid: marking drops the sender's later
+        // transactions with it, and those are exactly the ones this block wants.
+        if let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender()) {
+            if pool_tx.nonce() < account.nonce {
+                stale_txs += 1;
+                continue;
+            }
         }
 
         // convert tx to a signed transaction
@@ -755,6 +774,7 @@ where
             target: "payload_builder",
             txs = tx_count,
             gas = cumulative_gas_used,
+            stale = stale_txs,
             pool_ms = (pool_ns / 1_000_000) as u64,
             exec_ms = (exec_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,

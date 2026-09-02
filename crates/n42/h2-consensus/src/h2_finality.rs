@@ -136,11 +136,22 @@ pub fn verify_h2_v4_shadow_message(
     envelope: &H2V4Envelope,
     validator_set: &ValidatorSet,
 ) -> Result<H2V4ShadowProof, H2V4ShadowError> {
+    verify_h2_v4_shadow_message_with_tenure(envelope, validator_set, 1)
+}
+
+/// [`verify_h2_v4_shadow_message`] on a chain whose validators lead
+/// `leader_tenure` consecutive views (`hotstuff.leaderTenure`); the leader
+/// rule is the only check that depends on it.
+pub fn verify_h2_v4_shadow_message_with_tenure(
+    envelope: &H2V4Envelope,
+    validator_set: &ValidatorSet,
+    leader_tenure: u64,
+) -> Result<H2V4ShadowProof, H2V4ShadowError> {
     let identity = envelope.identity;
     let changes_hash = envelope.changes_hash;
     let (kind, view) = match &envelope.message {
         H2Message::Proposal(proposal) => {
-            verify_leader("Proposal", proposal.view, proposal.proposer, validator_set)?;
+            verify_leader("Proposal", proposal.view, proposal.proposer, validator_set, leader_tenure)?;
             verify_single_signature(
                 "Proposal",
                 proposal.proposer,
@@ -255,7 +266,7 @@ pub fn verify_h2_v4_shadow_message(
             (H2MessageKind::Timeout, timeout.view)
         }
         H2Message::NewView(new_view) => {
-            verify_leader("NewView", new_view.view, new_view.leader, validator_set)?;
+            verify_leader("NewView", new_view.view, new_view.leader, validator_set, leader_tenure)?;
             if new_view.view == 0
                 || new_view.timeout_certificate.view.checked_add(1) != Some(new_view.view)
             {
@@ -306,6 +317,7 @@ fn verify_leader(
     view: u64,
     actual: u32,
     validator_set: &ValidatorSet,
+    leader_tenure: u64,
 ) -> Result<(), H2V4ShadowError> {
     let set_size = validator_set.len();
     if set_size == 0 {
@@ -315,7 +327,7 @@ fn verify_leader(
             set_size,
         });
     }
-    let expected = (view % u64::from(set_size)) as u32;
+    let expected = ((view / leader_tenure.max(1)) % u64::from(set_size)) as u32;
     if actual != expected {
         return Err(H2V4ShadowError::WrongLeader {
             kind,

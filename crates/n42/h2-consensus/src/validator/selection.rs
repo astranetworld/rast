@@ -17,11 +17,26 @@ impl LeaderSelector {
     /// index would let a malformed release configuration appear to have a
     /// leader and fail open.
     pub fn leader_for_view(view: ViewNumber, validator_set: &ValidatorSet) -> u32 {
+        Self::leader_for_view_with_tenure(view, 1, validator_set)
+    }
+
+    /// The leader for view `v` when every validator leads `tenure` consecutive
+    /// views: `(v / tenure) % n`. A tenure of 1 is the round-robin above, and
+    /// 0 is read as 1 rather than dividing by it.
+    ///
+    /// # Panics
+    /// Panics if the validator set is empty, for the reason given on
+    /// [`Self::leader_for_view`].
+    pub fn leader_for_view_with_tenure(
+        view: ViewNumber,
+        tenure: u64,
+        validator_set: &ValidatorSet,
+    ) -> u32 {
         assert!(
             !validator_set.is_empty(),
             "leader_for_view called with empty validator set"
         );
-        (view % validator_set.len() as u64) as u32
+        ((view / tenure.max(1)) % validator_set.len() as u64) as u32
     }
 
     /// Checks if the given validator is the leader for the given view.
@@ -66,6 +81,25 @@ mod tests {
             let leader = LeaderSelector::leader_for_view(view as u64, &vs);
             assert_eq!(leader, expected_leader);
         }
+    }
+
+    #[test]
+    fn a_tenure_holds_the_leader_for_consecutive_views() {
+        let vs = make_validator_set(3);
+        // Tenure 1 is the round-robin, view by view.
+        for view in 0..9u64 {
+            assert_eq!(
+                LeaderSelector::leader_for_view_with_tenure(view, 1, &vs),
+                LeaderSelector::leader_for_view(view, &vs)
+            );
+        }
+        // Tenure 4: views 0-3 -> 0, 4-7 -> 1, 8-11 -> 2, 12-15 -> 0 again.
+        let expected = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0];
+        for (view, leader) in expected.iter().enumerate() {
+            assert_eq!(LeaderSelector::leader_for_view_with_tenure(view as u64, 4, &vs), *leader, "view {view}");
+        }
+        // Tenure 0 is read as 1 rather than dividing by it.
+        assert_eq!(LeaderSelector::leader_for_view_with_tenure(5, 0, &vs), 2);
     }
 
     #[test]

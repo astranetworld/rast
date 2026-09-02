@@ -83,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bls_key: Option<String> = None;
     let mut el_url: Option<String> = None;
     let mut el_rpc: Option<String> = None;
+    let mut el_ingest: Option<String> = None;
     let mut jwt_path: Option<String> = None;
     let mut peers: Vec<String> = Vec::new();
     let mut listen: Vec<String> = Vec::new();
@@ -114,6 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--bls-key" => bls_key = Some(args.next().ok_or("--bls-key needs a value")?),
             "--el" => el_url = Some(args.next().ok_or("--el needs a URL")?),
             "--el-rpc" => el_rpc = Some(args.next().ok_or("--el-rpc needs a URL")?),
+            "--el-ingest" => el_ingest = Some(args.next().ok_or("--el-ingest needs an address")?),
             "--jwt" => jwt_path = Some(args.next().ok_or("--jwt needs a path")?),
             "--peer" => peers.push(args.next().ok_or("--peer needs a multiaddr")?),
             "--listen" => listen.push(args.next().ok_or("--listen needs a multiaddr")?),
@@ -176,6 +178,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let base_timeout_ms = base_timeout_ms.unwrap_or(4_000);
     let max_timeout_ms = max_timeout_ms.unwrap_or(base_timeout_ms * 4);
+    // A chain rule, read from the genesis with the rest of them; 1 without a
+    // genesis, which is gov5's round-robin.
+    let leader_tenure = hotstuff_config
+        .as_ref()
+        .map_or(1, |config| config.leader_tenure.max(1));
     if validators.is_empty() {
         return Err("validator list is empty".into());
     }
@@ -266,6 +273,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("execution    : {el_url}");
         println!("proposing    : {}", if propose { "yes" } else { "no (votes only)" });
         println!("pacing       : {period_ms} ms");
+        if leader_tenure > 1 {
+            println!("leader tenure: {leader_tenure} views, so a leader builds its next block while the fleet imports this one");
+        }
 
         // Phones verify the Decide, not this node's word for it, so the endpoint
         // needs the chain identity the envelopes are bound to.
@@ -360,6 +370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Without this the node signs under the native profile and every fleet
         // member rejects its votes.
         engine.enable_h2_v4_signing(identity);
+        engine.set_leader_tenure(leader_tenure);
 
         let el = EngineApiClient::new(HttpTransport::new(el_url, jwt, Duration::from_secs(8))?);
         // The driver starts where the execution layer actually is. The
@@ -402,6 +413,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             service = service.with_transaction_source(rpc.parse()?);
             println!("transaction source: {rpc}");
         }
+        if let Some(addr) = &el_ingest {
+            let lanes = std::env::var("N42_INGEST_FORWARD_LANES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4usize);
+            service = service.with_transaction_ingest(addr.clone(), lanes);
+            println!("gossip -> pool : binary ingest at {addr}, {lanes} connections");
+        }
         if propose {
             let fee_recipient = entry.address;
             // The chain's committee pool, if it has one: every header links
@@ -435,7 +454,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // from the pacing rather than left at its production default.
             service = service.with_block_pacing(Duration::from_millis(period_ms));
             service = service.with_direct_block_push(direct_push);
-            service = service.with_build_ahead(std::env::var("N42_BUILD_AHEAD").is_ok());
+            // Building ahead is what a tenure is for: the leader of the next
+            // view is this node again, and it learns the parent the moment it
+            // imports its own block. With round-robin it stays behind the
+            // switch, because measured there it was a loss (see the service).
+            service = service
+                .with_build_ahead(std::env::var("N42_BUILD_AHEAD").is_ok() || leader_tenure > 1);
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -679,6 +703,7 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
 
   --chain <genesis.json>    the chain's genesis; supplies id, hash, validators, timeouts, period
   --el-rpc <url>            the execution layer's public JSON-RPC; its pool's transactions are gossiped to the fleet
+  --el-ingest <addr>        the execution layer's binary ingest (N42_TX_INGEST); gossiped transactions go to the pool through it
   --chain-id <u64>          fleet chain id (without --chain)
   --genesis <0x…>           fleet genesis hash (without --chain)
   --validators <path>       JSON array of {address, bls_public_key} (without --chain)

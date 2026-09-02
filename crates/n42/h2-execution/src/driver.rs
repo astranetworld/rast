@@ -126,6 +126,24 @@ impl std::fmt::Debug for Normalizer {
     }
 }
 
+/// A block being built before this node is leader.
+///
+/// Resolved the moment its first build is done rather than when the proposal
+/// wants it, because a payload job that is still open holds a build lease in
+/// reth's engine, and the engine (2.5.1, `wait_for_event`) stops taking any
+/// message at all -- imports, forkchoice, everything -- from the moment a
+/// persistence completes until every lease is released. A job left open for
+/// the rest of the view therefore deadlocks with the very loop that would
+/// close it, and the deadlock is only broken by the 8-second RPC timeout.
+/// Measured as seven of those per round with a tenure of 16. Resolved at once,
+/// the job lives for one build.
+#[derive(Debug)]
+struct AheadBuild {
+    parent: B256,
+    attrs: PayloadAttributes,
+    task: tokio::task::JoinHandle<Result<BuiltBlock, ElError>>,
+}
+
 /// Drives an [`ExecutionLayer`] on behalf of the consensus engine.
 #[derive(Debug)]
 pub struct ExecutionDriver<E> {
@@ -135,10 +153,9 @@ pub struct ExecutionDriver<E> {
     /// Finishes a built payload before it is proposed. `None` proposes the
     /// payload exactly as built.
     normalizer: Option<Normalizer>,
-    /// A build started before this node needed the block: the parent it was
-    /// started on, the attributes it was started with, and the id to collect
-    /// it by. See [`Self::prepare_build_on`].
-    prepared: Option<(B256, PayloadAttributes, alloy_rpc_types_engine::PayloadId)>,
+    /// A build started before this node needed the block. See
+    /// [`Self::prepare_build_on`].
+    prepared: Option<AheadBuild>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
@@ -249,21 +266,50 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         parent: B256,
         attrs: PayloadAttributes,
     ) -> Result<(), ElError> {
-        if self.prepared.as_ref().is_some_and(|(p, a, _)| *p == parent && *a == attrs) {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|ahead| ahead.parent == parent && ahead.attrs == attrs)
+        {
             return Ok(());
         }
-        let updated = self
-            .el
-            .fork_choice_updated_with_attrs_for(
-                ExecutionPath::LIVE_SEQUENTIAL,
-                self.forkchoice(parent),
-                attrs.clone(),
-            )
-            .await?;
-        if let Some(id) = updated.payload_id {
-            debug!(target: "n42.h2.el", ?parent, "started a build ahead of leading");
-            self.prepared = Some((parent, attrs, id));
+        if let Some(stale) = self.prepared.take() {
+            stale.task.abort();
         }
+        // Off the caller's loop entirely: the forkchoice call that starts the
+        // build is answered by the same engine the loop's other calls queue
+        // behind, and a loop that awaits it here is the loop that cannot
+        // resolve the build when the engine waits for that.
+        let el = std::sync::Arc::clone(&self.el);
+        let state = self.forkchoice(parent);
+        let task_attrs = attrs.clone();
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let updated = el
+                .fork_choice_updated_with_attrs_for(ExecutionPath::LIVE_SEQUENTIAL, state, task_attrs)
+                .await?;
+            let id = updated.payload_id.ok_or_else(|| {
+                ElError::new(format!(
+                    "forkchoiceUpdated started no build ahead of leading (status {:?})",
+                    updated.payload_status.status
+                ))
+            })?;
+            let after_fcu = started.elapsed();
+            let built = el
+                .resolve_payload_for(ExecutionPath::LIVE_SEQUENTIAL, id, ResolveKind::WaitForPending)
+                .await
+                .ok_or_else(|| ElError::new(format!("no payload build for id {id}")))??;
+            info!(
+                target: "n42.h2.el",
+                ?parent,
+                number = built.number,
+                fcu_ms = after_fcu.as_millis() as u64,
+                build_ms = (started.elapsed() - after_fcu).as_millis() as u64,
+                "built a block ahead of leading"
+            );
+            Ok(built)
+        });
+        self.prepared = Some(AheadBuild { parent, attrs, task });
         Ok(())
     }
 
@@ -300,17 +346,35 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let started = std::time::Instant::now();
         // A build prepared earlier counts only if it was started on this exact
         // parent with these exact attributes. Anything else and the block it
-        // is assembling is not the block this node is about to propose.
-        let prepared = match self.prepared.take() {
-            Some((p, a, id)) if p == parent && a == attrs => Some(id),
-            _ => None,
+        // assembled is not the block this node is about to propose. One that
+        // failed is reported and replaced, not propagated: the proposal is
+        // worth more than the shortcut.
+        let ahead = match self.prepared.take() {
+            Some(prepared) if prepared.parent == parent && prepared.attrs == attrs => {
+                match prepared.task.await {
+                    Ok(Ok(built)) => Some(built),
+                    Ok(Err(err)) => {
+                        warn!(target: "n42.h2.el", %err, ?parent, "the build prepared ahead failed; building now");
+                        None
+                    }
+                    Err(err) => {
+                        warn!(target: "n42.h2.el", %err, ?parent, "the build prepared ahead was lost; building now");
+                        None
+                    }
+                }
+            }
+            Some(prepared) => {
+                prepared.task.abort();
+                None
+            }
+            None => None,
         };
-        // The status is kept, not just the id: VALID-without-an-id and SYNCING
-        // mean very different things to an operator, and a bare "no payload id"
-        // says neither. A prepared build has no status to report because its
-        // forkchoice was answered earlier and accepted then.
-        let (payload_id, status) = match prepared {
-            Some(id) => (Some(id), None),
+        // With a build from ahead, fcu_ms below is the wait for one still in
+        // flight and build_ms is nothing. Without, the status is reported
+        // rather than a bare "no payload id": VALID-without-an-id and SYNCING
+        // mean very different things to an operator.
+        let (mut built, after_fcu, after_resolve, ahead) = match ahead {
+            Some(built) => (built, started.elapsed(), started.elapsed(), true),
             None => {
                 let updated = self
                     .el
@@ -320,32 +384,25 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                         attrs,
                     )
                     .await?;
-                (updated.payload_id, Some(updated.payload_status.status))
+                let after_fcu = started.elapsed();
+                let payload_id = updated.payload_id.ok_or_else(|| {
+                    ElError::new(format!(
+                        "forkchoiceUpdated returned no payload id (status {:?})",
+                        updated.payload_status.status
+                    ))
+                })?;
+                let built = self
+                    .el
+                    .resolve_payload_for(
+                        ExecutionPath::LIVE_SEQUENTIAL,
+                        payload_id,
+                        ResolveKind::WaitForPending,
+                    )
+                    .await
+                    .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
+                (built, after_fcu, started.elapsed(), false)
             }
         };
-        let ahead = prepared.is_some();
-        let after_fcu = started.elapsed();
-
-        // A build only starts if the EL accepted the forkchoice. Reporting the
-        // status is more useful than a bare "no payload id": VALID-without-id
-        // and SYNCING mean very different things to an operator.
-        let payload_id = payload_id.ok_or_else(|| match &status {
-            Some(status) => {
-                ElError::new(format!("forkchoiceUpdated returned no payload id (status {status:?})"))
-            }
-            None => ElError::new("a build prepared earlier had no payload id".to_string()),
-        })?;
-
-        let mut built = self
-            .el
-            .resolve_payload_for(
-                ExecutionPath::LIVE_SEQUENTIAL,
-                payload_id,
-                ResolveKind::WaitForPending,
-            )
-            .await
-            .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
-        let after_resolve = started.elapsed();
 
         // The block the execution layer built is not necessarily the block
         // this node proposes: a chain whose header carries the view needs it

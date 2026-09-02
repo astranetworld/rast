@@ -232,12 +232,25 @@ exec > >(tee -a "$OUT/round.txt") 2>&1
 
 f7_check_binary_fresh || exit 1
 
+# F7_LEADER_TENURE=<views>: every validator leads that many consecutive views
+# (`hotstuff.leaderTenure`), so a leader builds block h+1 while the fleet is
+# still importing h and one of a block's two executions leaves the critical
+# path. A chain rule, so it is derived into its own genesis; the config section
+# is not part of the genesis hash, so the chain id and hash are unchanged.
+if [[ -n ${F7_LEADER_TENURE:-} ]]; then
+  DERIVED=${F7_ROOT:-/data/blockchain/rust-fleet7-bench}/genesis-tenure${F7_LEADER_TENURE}-$(basename "$F7_GENESIS")
+  python3 -c "import json,sys
+g = json.load(open(sys.argv[1]))
+g['config']['hotstuff']['leaderTenure'] = int(sys.argv[3])
+json.dump(g, open(sys.argv[2], 'w'), indent=2)" "$F7_GENESIS" "$DERIVED" "$F7_LEADER_TENURE"
+  export F7_GENESIS=$DERIVED
+fi
 CHAIN=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['chainId'])" "$F7_GENESIS")
 RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_HTTP_BASE + i)); done | sed 's/,$//')
 
 {
   echo "round        : $TAG"
-  echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}${F7_AMSTERDAM:+, amsterdam}"
+  echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}${F7_AMSTERDAM:+, amsterdam}${F7_LEADER_TENURE:+, leader tenure $F7_LEADER_TENURE}"
   echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients, gas $F7_TX_GAS${F7_PRECREATE:+, precreate $F7_PRECREATE}"
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
 }

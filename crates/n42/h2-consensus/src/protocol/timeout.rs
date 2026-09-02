@@ -3,8 +3,8 @@ use n42_h2_primitives::consensus::{ConsensusMessage, NewView, TimeoutCertificate
 use super::quorum::TimeoutCollector;
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput};
-use crate::error::{ConsensusError, ConsensusResult};
 use crate::validator::LeaderSelector;
+use crate::error::{ConsensusError, ConsensusResult};
 
 impl ConsensusEngine {
     /// Verifies and collects a timeout vote for a bounded future view.
@@ -65,7 +65,14 @@ impl ConsensusEngine {
         }
         self.verify_embedded_qc(&timeout.high_qc)?;
 
-        let next_leader = LeaderSelector::leader_for_view(next_view, &next_view_set);
+        // From the set this branch just established is known exactly, not
+        // from the engine's fallback resolver; the tenure is the only thing
+        // added to the original rule here.
+        let next_leader = LeaderSelector::leader_for_view_with_tenure(
+            next_view,
+            self.leader_tenure,
+            &next_view_set,
+        );
         let local_timeout_index = view_set.index_of_public_key(&self.local_public_key);
         let local_next_index = next_view_set.index_of_public_key(&self.local_public_key);
         if local_timeout_index != Some(timeout.sender) && local_next_index != Some(next_leader) {
@@ -278,7 +285,7 @@ impl ConsensusEngine {
         let n_validators = view_set.len();
         let quorum_size = view_set.quorum_size();
         let next_view = view.saturating_add(1);
-        let next_leader = LeaderSelector::leader_for_view(next_view, view_set);
+        let next_leader = self.leader_index_for_view(next_view);
         let relay_timeout = (timeout.sender != self.my_index && next_leader != self.my_index)
             .then(|| timeout.clone());
 
@@ -348,7 +355,7 @@ impl ConsensusEngine {
         }
 
         let new_view_set = self.validator_set_for_view(nv.view);
-        let expected_leader = LeaderSelector::leader_for_view(nv.view, new_view_set);
+        let expected_leader = self.leader_index_for_view(nv.view);
         if nv.leader != expected_leader {
             return Err(ConsensusError::InvalidProposer {
                 view: nv.view,

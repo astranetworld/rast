@@ -716,6 +716,18 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Hands gossiped transactions to the execution layer's binary ingest
+    /// instead of its JSON-RPC. The outbound direction is unchanged, so this
+    /// goes after [`Self::with_transaction_source`] and replaces only the
+    /// inbound forwarder it set up. See
+    /// [`crate::tx_source::forward_transactions_over_ingest`] for why.
+    pub fn with_transaction_ingest(mut self, addr: String, connections: usize) -> Self {
+        let (forward_tx, forward_rx) = mpsc::channel(TX_FORWARD_QUEUE * 4);
+        tokio::spawn(crate::tx_source::forward_transactions_over_ingest(addr, forward_rx, connections));
+        self.inbound_forward = Some(forward_tx);
+        self
+    }
+
     /// The transport, for dialing more peers or reading mesh state.
     pub const fn transport(&self) -> &H2V4Transport {
         &self.transport

@@ -263,6 +263,11 @@ pub struct ConsensusEngine {
     /// multiplications in `local_validator_index_for_view` (called on every message).
     pub(super) local_public_key: n42_h2_primitives::BlsPublicKey,
     pub(super) epoch_manager: EpochManager,
+    /// Consecutive views one validator leads; the chain's
+    /// `hotstuff.leaderTenure`. 1 is round-robin. Every leader decision in
+    /// the engine goes through [`Self::leader_index_for_view`] so that this
+    /// is applied in exactly one place.
+    pub(super) leader_tenure: u64,
     /// Explicitly selected signing domain. Native is the safe default; H2-v4
     /// is enabled only for gov5 participant mode.
     pub(super) signing_profile: ConsensusSigningProfile,
@@ -379,6 +384,7 @@ impl ConsensusEngine {
             secret_key,
             local_public_key,
             epoch_manager,
+            leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
@@ -480,6 +486,7 @@ impl ConsensusEngine {
             secret_key,
             local_public_key,
             epoch_manager,
+            leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
             round_state: RoundState::from_snapshot(
                 recovered_view,
@@ -829,6 +836,19 @@ impl ConsensusEngine {
     /// Returns the validator index of the current leader.
     pub fn current_leader_index(&self) -> u32 {
         self.leader_index_for_view(self.round_state.current_view())
+    }
+
+    /// Sets how many consecutive views one validator leads (the chain's
+    /// `hotstuff.leaderTenure`); 0 is read as 1. Every node of a fleet has to
+    /// agree on this, because a proposal from anyone but the expected leader
+    /// is refused.
+    pub fn set_leader_tenure(&mut self, tenure: u64) {
+        self.leader_tenure = tenure.max(1);
+    }
+
+    /// Consecutive views one validator leads; see [`Self::set_leader_tenure`].
+    pub const fn leader_tenure(&self) -> u64 {
+        self.leader_tenure
     }
 
     /// Checks if this node is the leader for a specific view.
@@ -1342,7 +1362,11 @@ impl ConsensusEngine {
     }
 
     pub(super) fn leader_index_for_view(&self, view: ViewNumber) -> u32 {
-        LeaderSelector::leader_for_view(view, self.validator_set_for_view(view))
+        LeaderSelector::leader_for_view_with_tenure(
+            view,
+            self.leader_tenure,
+            self.validator_set_for_view(view),
+        )
     }
 
     pub(super) fn local_validator_index_for_view(&self, view: ViewNumber) -> Option<u32> {

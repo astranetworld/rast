@@ -420,7 +420,10 @@ f7_el_args() {
       # hint pass reads the sender off the pooled transaction object and never
       # reaches the cache.
       $( [[ ${F7_NO_SENDER_CACHE:-0} == 1 ]] || echo --engine.sender-recovery-cache )
-      --engine.txpool-prewarming
+      $( [[ ${F7_NO_TXPOOL_PREWARM:-0} == 1 ]] || echo --engine.txpool-prewarming )
+      # F7_EL_EXTRA: any further execution-layer flags, for a single-variable
+      # round (e.g. --engine.disable-prewarming). Word-split on purpose.
+      ${F7_EL_EXTRA:-}
     )
   fi
 
@@ -460,6 +463,13 @@ f7_validator_args() {
   # already have, and dropping it isolates what the forwarding costs. On a real
   # fleet it is how a transaction reaches the nodes it was not sent to.
   [[ ${F7_NO_TX_GOSSIP:-0} == 1 ]] || F7_V_ARGS+=(--el-rpc "http://127.0.0.1:$((F7_HTTP_BASE + i))")
+  # F7_INGEST_FORWARD=1: what the fleet gossips reaches the pool through the
+  # binary ingest rather than through eth_sendRawTransaction, which is worth
+  # an order of magnitude to a leader whose pool has to refill every block
+  # (a leader with a tenure). Opt-in, not implied by F7_INGEST: it is a
+  # variable of its own, and a validator binary built before the flag existed
+  # refuses to start with it.
+  [[ ${F7_INGEST_FORWARD:-0} == 1 && -n ${F7_INGEST:-} ]] && F7_V_ARGS+=(--el-ingest "127.0.0.1:$((F7_INGEST_BASE + i))")
   [[ $F7_PROFILE == lean ]] && F7_V_ARGS+=(--worker-threads 2)
   # A throughput round is not trying to honour a block interval, it is trying to
   # find the ceiling, so the bench tier paces in milliseconds and overrides the

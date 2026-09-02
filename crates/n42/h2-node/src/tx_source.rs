@@ -12,8 +12,9 @@
 use alloy_primitives::{Bytes, B256};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, info};
 
 const POLL: Duration = Duration::from_millis(500);
 
@@ -126,6 +127,110 @@ pub async fn poll_pending_transactions(rpc_url: url::Url, sink: mpsc::Sender<Vec
         }
         if !batch.is_empty() && sink.send(batch).await.is_err() {
             return;
+        }
+    }
+}
+
+/// Transactions per frame on the binary ingest. Its server takes up to 10,000;
+/// a frame is also the unit one connection waits on, so smaller frames spread
+/// a burst over the connections instead of queueing it behind one.
+const INGEST_FRAME: usize = 1000;
+
+/// Hands gossiped transactions to the execution layer over its binary ingest
+/// (`N42_TX_INGEST`, the same socket the load generator uses) instead of
+/// JSON-RPC.
+///
+/// The JSON path in [`forward_transactions`] tops out in the tens of
+/// thousands a second: each transaction is hex in a JSON array that the RPC
+/// server parses, decodes and recovers one at a time on its request path.
+/// That was enough while a leader built one block in seven, because its pool
+/// had seven cycles to refill from its own share of the load. A leader with a
+/// tenure builds every block, so its pool has to refill at the chain's whole
+/// rate -- 163,000 a second at the bench tier -- and six sevenths of that
+/// arrives here, by gossip. The ingest server recovers senders on blocking
+/// threads in parallel and admits a frame at a time, and it applies the
+/// pool's high-water gate by delaying its reply, which is the backpressure
+/// this task wants: a full pool stalls the forwarder, the loop's queue fills,
+/// and the loop drops the excess gossip as it already does.
+///
+/// `connections` streams share the work round-robin; each waits for the reply
+/// to its frame before sending the next, so the parallelism is the number of
+/// connections. Connecting is lazy and retried per frame, because the
+/// execution layer is usually still starting when the validator does.
+pub async fn forward_transactions_over_ingest(
+    addr: String,
+    mut source: mpsc::Receiver<Vec<Bytes>>,
+    connections: usize,
+) {
+    let connections = connections.max(1);
+    let mut lanes: Vec<mpsc::Sender<Vec<Bytes>>> = Vec::with_capacity(connections);
+    for lane in 0..connections {
+        let (tx, rx) = mpsc::channel::<Vec<Bytes>>(4);
+        tokio::spawn(ingest_lane(addr.clone(), lane, rx));
+        lanes.push(tx);
+    }
+    let mut next = 0usize;
+    while let Some(batch) = source.recv().await {
+        for frame in batch.chunks(INGEST_FRAME) {
+            let lane = &lanes[next % lanes.len()];
+            next = next.wrapping_add(1);
+            // Waits here, not `try_send`: the loop already bounded what it
+            // hands over, and a lane that is behind is the ingest telling us
+            // the pool is full. Dropping here would drop what the gate meant
+            // to delay.
+            if lane.send(frame.to_vec()).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// One connection's worth of [`forward_transactions_over_ingest`].
+async fn ingest_lane(addr: String, lane: usize, mut frames: mpsc::Receiver<Vec<Bytes>>) {
+    let mut stream: Option<tokio::net::TcpStream> = None;
+    let mut forwarded: u64 = 0;
+    let mut accepted_total: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    while let Some(frame) = frames.recv().await {
+        if stream.is_none() {
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    stream = Some(s);
+                }
+                Err(err) => {
+                    debug!(target: "n42.h2.node", %err, %addr, lane, count = frame.len(), "ingest not reachable; transactions dropped");
+                    continue;
+                }
+            }
+        }
+        let mut wire = Vec::with_capacity(4 + frame.iter().map(|raw| 4 + raw.len()).sum::<usize>());
+        wire.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        for raw in &frame {
+            wire.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            wire.extend_from_slice(raw);
+        }
+        let s = stream.as_mut().expect("connected above");
+        let outcome = async {
+            s.write_all(&wire).await?;
+            let accepted = s.read_u32_le().await?;
+            let pending = s.read_u32_le().await?;
+            Ok::<(u32, u32), std::io::Error>((accepted, pending))
+        }
+        .await;
+        match outcome {
+            Ok((accepted, pending)) => {
+                forwarded += frame.len() as u64;
+                accepted_total += u64::from(accepted);
+                if last_report.elapsed() >= Duration::from_secs(10) {
+                    info!(target: "n42.h2.node", lane, forwarded, accepted = accepted_total, pool_pending = pending, "gossiped transactions handed to the ingest");
+                    last_report = std::time::Instant::now();
+                }
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.node", %err, %addr, lane, count = frame.len(), "ingest connection failed; reconnecting on the next frame");
+                stream = None;
+            }
         }
     }
 }
