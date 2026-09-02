@@ -246,7 +246,41 @@ fn sealed_header_from_fields(
     header.timestamp = v1.timestamp;
     header.extra_data = v1.extra_data.clone();
     header.base_fee_per_gas = Some(v1.base_fee_per_gas.try_into().ok()?);
-    Some(reth_primitives_traits::SealedHeader::seal_slow(header))
+    // The fields gov5's profile is free to leave in either of two shapes --
+    // the same candidates the engine's own conversion tries, a few dozen
+    // header hashes at most.
+    let expected = data.payload.block_hash();
+    let withdrawals_roots: Vec<Option<B256>> = match (built.withdrawals_root, data.payload.as_v2()) {
+        (Some(root), Some(v2)) => {
+            let rewards = n42_h2_consensus::withdrawals_to_rewards(v2.withdrawals.as_slice());
+            vec![Some(root), Some(n42_h2_consensus::gov5_rewards_root(rewards))]
+        }
+        (root, _) => vec![root],
+    };
+    let requests_hashes: Vec<Option<B256>> = match built.requests_hash {
+        Some(hash) => vec![
+            Some(hash),
+            Some(n42_h2_consensus::GOV5_EMPTY_REQUESTS_HASH),
+            Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+        ],
+        None => vec![None],
+    };
+    for ommers_hash in [built.ommers_hash, B256::ZERO, alloy_consensus::EMPTY_OMMER_ROOT_HASH] {
+        for difficulty in [built.difficulty, alloy_primitives::U256::ZERO, alloy_primitives::U256::from(1)] {
+            for withdrawals_root in &withdrawals_roots {
+                for requests_hash in &requests_hashes {
+                    header.ommers_hash = ommers_hash;
+                    header.difficulty = difficulty;
+                    header.withdrawals_root = *withdrawals_root;
+                    header.requests_hash = *requests_hash;
+                    if header.hash_slow() == expected {
+                        return Some(reth_primitives_traits::SealedHeader::new(header, expected));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub async fn serve<T>(

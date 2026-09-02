@@ -75,6 +75,12 @@ use tracing::{debug, info, warn};
 /// about 1.1 MB and comfortably more than one block of any tier here.
 const MAX_FRAME_TXS: u32 = 10_000;
 
+/// Frames one connection may have admitting in the background under
+/// `N42_TX_INGEST_ASYNC`. At 100 transactions a frame and 64 connections
+/// that is ~51,000 transactions buffered per node, about 300 ms of a full
+/// block's demand: the length of the pool stall it is meant to cover.
+const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
+
 /// Largest single transaction, in bytes.
 const MAX_TX_BYTES: u32 = 1 << 20;
 
@@ -168,10 +174,23 @@ async fn serve_connection<P>(
     cache: Option<reth_evm::SenderRecoveryCache>,
 ) -> std::io::Result<()>
 where
-    P: TransactionPool + 'static,
+    P: TransactionPool + Clone + 'static,
     P::Transaction: 'static,
 {
     let gate = high_water();
+    // N42_TX_INGEST_ASYNC=1: answer a frame once it is past the gate and
+    // admit it in the background, at most ASYNC_FRAMES_IN_FLIGHT frames at a
+    // time per connection. The pool's write lock is taken for a block's
+    // maintenance and the builder's snapshot, 200-300 ms at 163,000 a block,
+    // and a generator whose every worker waits on this server's answer --
+    // and, sending to all seven nodes, on the slowest of them -- stops for
+    // that long at every block. Answered first, the frames in flight ride the
+    // stall out. The answer's "accepted" is then the frame's size: what the
+    // pool will not take (a gap, a fee, a full pool) is no longer reported,
+    // which is right for a generator that only sends valid transactions and
+    // wrong for anything else, so this is not the default.
+    let asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok();
+    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(ASYNC_FRAMES_IN_FLIGHT));
     // Nagle would batch the acknowledgements into the next read's latency, and
     // the point of this path is that nothing waits for a round trip.
     stream.set_nodelay(true)?;
@@ -213,6 +232,22 @@ where
         // touches a second under the same lock the pool admits through.
         while pool.pool_size().pending >= gate {
             tokio::time::sleep(GATE_POLL).await;
+        }
+        if asynchronous {
+            let permit = std::sync::Arc::clone(&in_flight)
+                .acquire_owned()
+                .await
+                .expect("the in-flight semaphore is never closed");
+            let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
+            let pending = u32::try_from(pool.pool_size().pending).unwrap_or(u32::MAX);
+            let (pool, cache) = (pool.clone(), cache.clone());
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = admit(&pool, raws, cache).await;
+            });
+            stream.write_u32_le(offered).await?;
+            stream.write_u32_le(pending).await?;
+            continue;
         }
         let accepted = admit(&pool, raws, cache.clone()).await;
         let pending = u32::try_from(pool.pool_size().pending).unwrap_or(u32::MAX);
