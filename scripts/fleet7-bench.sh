@@ -318,6 +318,11 @@ INGEST_ARG=()
 if [[ -n ${F7_INGEST:-} ]]; then
   INGESTS=$(for ((i = 0; i < F7_NODES; i++)); do printf '127.0.0.1:%s,' $((F7_INGEST_BASE + i)); done | sed 's/,$//')
   INGEST_ARG=(--ingest "$INGESTS")
+  # F7_INGEST_ALL=1: every transaction to every node's ingest, so no pool
+  # depends on gossip for what another pool holds. gov5's methodology, and
+  # what a leader with a tenure needs; pair it with F7_NO_TX_GOSSIP=1 or the
+  # fleet gossips what every pool already has.
+  [[ ${F7_INGEST_ALL:-0} == 1 ]] && INGEST_ARG+=(--ingest-all)
   echo "ingest       : $INGESTS"
 fi
 # Create the recipients first, when the round asked for it (see F7_PRECREATE

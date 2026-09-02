@@ -118,6 +118,13 @@ struct Args {
     /// flood. Funding stays on RPC: it is six thousand transactions once, and
     /// it needs to read nonces back.
     ingest: Vec<String>,
+    /// Every worker sends every transaction to every ingest, so no pool
+    /// depends on gossip to hold what another pool holds. gov5 measures this
+    /// way (their flood submits to all seven RPCs), and a leader with a
+    /// tenure needs it: a transaction its pool never received leaves that
+    /// sender's later nonces unbuildable for the whole tenure, and the fleet's
+    /// other pools fill with them until the ingest gate stops the generator.
+    ingest_all: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -175,11 +182,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut ingest = if args.ingest.is_empty() {
                     None
                 } else {
-                    let addr = &args.ingest[worker % args.ingest.len()];
-                    match Ingest::connect(addr) {
+                    let addrs: Vec<&str> = if args.ingest_all {
+                        args.ingest.iter().map(String::as_str).collect()
+                    } else {
+                        vec![args.ingest[worker % args.ingest.len()].as_str()]
+                    };
+                    match Ingest::connect(&addrs) {
                         Ok(conn) => Some(conn),
                         Err(err) => {
-                            eprintln!("ingest {addr}: {err}");
+                            eprintln!("ingest {}: {err}", addrs.join(","));
                             return;
                         }
                     }
@@ -397,7 +408,9 @@ fn flood_over_ingest(
 /// still strictly serial — one frame, then its answer, then the next — while
 /// the connection always has work on it.
 struct Ingest {
-    stream: std::net::TcpStream,
+    /// One node's ingest, or every node's at once (`--ingest-all`): a frame
+    /// goes to each stream, and a reply is read from each in the same order.
+    streams: Vec<std::net::TcpStream>,
     /// Senders with a frame in flight, in the order the frames were written.
     /// Replies come back in the same order, so this is what matches an answer
     /// to the sender it belongs to.
@@ -405,12 +418,16 @@ struct Ingest {
 }
 
 impl Ingest {
-    fn connect(addr: &str) -> std::io::Result<Self> {
-        let stream = std::net::TcpStream::connect(addr)?;
-        // Without this the kernel holds a frame back waiting for company, and
-        // the pipelining above turns back into a round trip per batch.
-        stream.set_nodelay(true)?;
-        Ok(Self { stream, inflight: std::collections::VecDeque::new() })
+    fn connect(addrs: &[&str]) -> std::io::Result<Self> {
+        let mut streams = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let stream = std::net::TcpStream::connect(addr)?;
+            // Without this the kernel holds a frame back waiting for company,
+            // and the pipelining above turns back into a round trip per batch.
+            stream.set_nodelay(true)?;
+            streams.push(stream);
+        }
+        Ok(Self { streams, inflight: std::collections::VecDeque::new() })
     }
 
     /// Writes one frame: `u32` count, then each transaction as `u32` length and
@@ -425,7 +442,9 @@ impl Ingest {
         }
         // One write for the whole frame: a frame split across writes is a
         // frame the server reads in two syscalls.
-        self.stream.write_all(&frame)?;
+        for stream in &mut self.streams {
+            stream.write_all(&frame)?;
+        }
         self.inflight.push_back((sender, batch.len()));
         Ok(())
     }
@@ -443,10 +462,17 @@ impl Ingest {
         let Some((sender, offered)) = self.inflight.pop_front() else {
             return Ok(None);
         };
-        let mut buf = [0u8; 8];
-        self.stream.read_exact(&mut buf)?;
-        let accepted = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")) as usize;
-        let pending = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize;
+        // Across the streams: the fewest accepted, so a nonce never advances
+        // past what every pool holds, and the deepest pool, which is the one
+        // gating the generator.
+        let mut accepted = usize::MAX;
+        let mut pending = 0usize;
+        for stream in &mut self.streams {
+            let mut buf = [0u8; 8];
+            stream.read_exact(&mut buf)?;
+            accepted = accepted.min(u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")) as usize);
+            pending = pending.max(u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize);
+        }
         Ok(Some((sender, offered, accepted, pending)))
     }
 }
@@ -655,6 +681,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         shard_senders: false,
         skip_funding: false,
         ingest: Vec::new(),
+        ingest_all: false,
         recipients: 1,
     };
     let mut it = std::env::args().skip(1);
@@ -672,6 +699,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--conc" => args.conc = next()?.parse()?,
             "--rpcbatch" => args.rpc_batch = next()?.parse::<usize>()?.clamp(1, MAX_RPC_BATCH),
             "--ingest" => args.ingest = next()?.split(',').map(str::to_owned).collect(),
+            "--ingest-all" => args.ingest_all = true,
             "--recipients" => args.recipients = next()?.parse()?,
             "--shard-senders" => args.shard_senders = true,
             "--skip-funding" => args.skip_funding = true,
