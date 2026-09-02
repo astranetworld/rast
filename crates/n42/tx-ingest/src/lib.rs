@@ -86,6 +86,42 @@ const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
 /// connections with 8 frames in flight each are 512 blocking threads of
 /// secp256k1 on a node pinned to 16 cores, and the builder's thread -- and
 /// the engine's import -- get a slice of a core while the generator is busy.
+/// The nice value recovery threads run at: `N42_TX_INGEST_RECOVER_NICE`,
+/// 0 by default. At 10 or more, the scheduler gives the builder's and the
+/// engine's threads the core whenever they are runnable and recovery the
+/// cycles nobody else wants -- a budget that follows the load instead of a
+/// fixed one.
+fn recovery_nice() -> i32 {
+    static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *NICE.get_or_init(|| {
+        std::env::var("N42_TX_INGEST_RECOVER_NICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|n| n.clamp(0, 19))
+            .unwrap_or(0)
+    })
+}
+
+/// Lowers the calling thread's priority to [`recovery_nice`], once per
+/// thread; blocking-pool threads are reused, so this is a few syscalls a
+/// frame at most.
+fn apply_recovery_nice() {
+    thread_local! {
+        static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let nice = recovery_nice();
+    if nice == 0 || APPLIED.with(|a| a.replace(true)) {
+        return;
+    }
+    // SAFETY: setpriority on the calling thread (PRIO_PROCESS with a thread
+    // id) is a plain syscall with no memory effects; a failure leaves the
+    // priority as it was.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, nice);
+    }
+}
+
 fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| {
@@ -325,6 +361,7 @@ where
                 .expect("the recovery semaphore is never closed");
             let recovering = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
+                apply_recovery_nice();
                 decode_and_recover::<P>(raws, cache.as_ref())
             });
             // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
@@ -390,6 +427,7 @@ where
         .expect("the recovery semaphore is never closed");
     let decoded = match tokio::task::spawn_blocking(move || {
         let _slot = slot;
+        apply_recovery_nice();
         decode_and_recover::<P>(raws, cache.as_ref())
     })
     .await
