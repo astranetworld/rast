@@ -50,7 +50,7 @@ fi
 # the feature.
 #
 #   cargo build --profile profiling -p n42 --bin n42 --features jemalloc-prof
-#   MALLOC_CONF=prof:true,prof_active:true,lg_prof_interval:30,prof_prefix=<dir>/heap \
+#   MALLOC_CONF=prof:true,prof_active:true,lg_prof_interval:30,prof_prefix:<dir>/heap \
 #     F7_BIN=target/profiling scripts/fleet7-bench.sh --tag alloc
 #   scripts/fleet7-profile.sh --alloc <dir>/heap
 #
