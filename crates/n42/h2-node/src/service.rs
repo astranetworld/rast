@@ -212,7 +212,7 @@ pub struct H2Service<E> {
     /// When each body arrived, for the import timing log.
     body_arrived: std::collections::HashMap<B256, std::time::Instant>,
     /// Bodies arriving over the plain TCP channel. See [`crate::body_channel`].
-    body_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    body_rx: Option<mpsc::Receiver<crate::body_channel::BodyBuf>>,
     /// The channel's senders, one per peer, for this node's own bodies.
     body_pushers: Option<crate::body_channel::BodyPushers>,
     /// Publish every body on the block topic even when the direct push
@@ -304,7 +304,7 @@ pub struct H2Service<E> {
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
-    body_store: std::collections::HashMap<B256, Vec<u8>>,
+    body_store: std::collections::HashMap<B256, crate::body_channel::BodyBuf>,
     body_store_order: Vec<B256>,
     /// Timestamps of blocks this node has seen the body of, for
     /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
@@ -461,7 +461,10 @@ const PULLED_BLOCKS_PER_STEP: usize = 32;
 /// parent of a block it cannot place and for the block a proposal names —
 /// recent blocks, both — but a member restarting after a long absence walks
 /// back further, and a body is a few hundred bytes when empty.
-const REMEMBERED_BODIES: usize = 4096;
+// Was 4,096: at 13-15 MB a full block, a validator held several gigabytes
+// of bodies by the end of a bench round, on every node. Anything older than
+// this is rebuilt from the execution layer, as the comment at the store says.
+const REMEMBERED_BODIES: usize = 64;
 
 /// How many block timestamps to remember. Far more than any head-selection
 /// needs; the bound is against a peer flooding bodies, not a working set.
@@ -1145,7 +1148,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // The store holds recent bodies byte for byte; anything older
                 // is rebuilt from the execution layer on the next drain, the
                 // way ranges are served.
-                match self.body_store.get(&hash).cloned() {
+                match self.body_store.get(&hash).map(|body| body.to_vec()) {
                     Some(body) => {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
                         self.transport.respond_block(channel, Some(body));
@@ -1503,7 +1506,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// push kept for any peer the channel does not reach.
     pub fn with_body_channel(
         mut self,
-        rx: mpsc::Receiver<Vec<u8>>,
+        rx: mpsc::Receiver<crate::body_channel::BodyBuf>,
         pushers: crate::body_channel::BodyPushers,
     ) -> Self {
         self.body_rx = Some(rx);
@@ -2100,8 +2103,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         *known = (*known).max(height);
     }
 
-    fn remember_body(&mut self, block_hash: B256, rlp: Vec<u8>) {
-        if self.body_store.insert(block_hash, rlp).is_none() {
+    fn remember_body(&mut self, block_hash: B256, rlp: impl Into<crate::body_channel::BodyBuf>) {
+        if self.body_store.insert(block_hash, rlp.into()).is_none() {
             self.body_store_order.push(block_hash);
             while self.body_store_order.len() > REMEMBERED_BODIES {
                 let oldest = self.body_store_order.remove(0);
@@ -2265,9 +2268,9 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     /// A body that came over the TCP channel: the same decode and the same
     /// bookkeeping as a pushed one, identified by what it decodes to.
-    fn handle_direct_body(&mut self, rlp: Vec<u8>) {
+    fn handle_direct_body(&mut self, rlp: crate::body_channel::BodyBuf) {
         let started = std::time::Instant::now();
-        match decode_block_rlp_raw(&rlp, self.header_profile) {
+        match decode_block_rlp_raw(&rlp[..], self.header_profile) {
             Ok(block) => {
                 let hash = block.block_hash;
                 if !self.body_store.contains_key(&hash) {
