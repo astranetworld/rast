@@ -818,6 +818,57 @@ impl Twig {
     fn refresh_root(&mut self) {
         self.root = hash_node(&self.nodes[1], &self.bits_root);
     }
+
+    /// The bit set and root, after bits changed and leaves did not.
+    fn rehash_bits(&mut self) {
+        self.bits_root = hash_bits(&self.bits);
+        self.refresh_root();
+    }
+}
+
+/// A twig whose bit set changed; its leaves did not.
+const DIRTY_BITS: u8 = 1;
+/// A twig that took new leaves (and possibly bit changes).
+const DIRTY_LEAVES: u8 = 2;
+
+fn mark_dirty(dirty: &mut Vec<u8>, twig_id: usize, level: u8) {
+    if dirty.len() <= twig_id {
+        dirty.resize(twig_id + 1, 0);
+    }
+    dirty[twig_id] = dirty[twig_id].max(level);
+}
+
+/// The leaf hash of every operation that writes a value, on the worker pool
+/// when the `rayon` feature is on.
+fn leaf_hashes(operations: &[QmdbOperation]) -> Vec<Option<Hash>> {
+    let leaf = |operation: &QmdbOperation| operation.value.as_ref().map(|value| hash_leaf(&operation.key, value));
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        operations.par_iter().map(leaf).collect()
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        operations.iter().map(leaf).collect()
+    }
+}
+
+/// Rehashes every twig marked in `dirty`, each independently of the others.
+fn rehash_dirty(twigs: &mut [Twig], dirty: &[u8]) {
+    let work = |(twig_id, twig): (usize, &mut Twig)| match dirty.get(twig_id).copied().unwrap_or(0) {
+        DIRTY_LEAVES => twig.recompute(),
+        DIRTY_BITS => twig.rehash_bits(),
+        _ => {}
+    };
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        twigs.par_iter_mut().enumerate().for_each(work);
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        twigs.iter_mut().enumerate().for_each(work);
+    }
 }
 
 fn hash_bits(bits: &[u8; BITS_BYTES]) -> Hash {
@@ -1158,14 +1209,80 @@ impl QmdbCompatTree {
                 return Err(QmdbOperationError::DuplicateKey(pair[0].key));
             }
         }
-        for operation in operations {
-            if let Some(value) = operation.value {
-                self.set(operation.key, value);
-            } else {
-                self.delete(&operation.key);
+        // The same mutations as `set`/`delete` one after another, with the
+        // hashing taken out of the sequence. Per operation those hash a leaf,
+        // walk eleven nodes to the twig root, rehash the twig's whole bit set,
+        // and do the bit set again for the slot being retired -- about fifteen
+        // blake3 calls, all sequential; a 163,000-transfer block is ~326,000
+        // operations and its root cost ~100 ms on the importer's critical
+        // path. Here the leaf hashes are computed up front on the worker pool,
+        // the structural writes are made in order without hashing, and each
+        // touched twig is then rehashed once, in parallel: a twig that took
+        // new leaves gets one full recompute (one hash per node instead of
+        // eleven per leaf), a twig that only retired slots gets its bit set
+        // and root. The tree these produce is the tree `set`/`delete` produce,
+        // and a test says so operation for operation.
+        let leaves = leaf_hashes(&operations);
+        let mut dirty: Vec<u8> = Vec::with_capacity(self.twigs.len() + operations.len() / TWIG_SIZE + 2);
+        for (operation, leaf) in operations.into_iter().zip(leaves) {
+            match (operation.value, leaf) {
+                (Some(value), Some(leaf)) => self.set_deferred(operation.key, value, leaf, &mut dirty),
+                _ => {
+                    self.delete_deferred(&operation.key, &mut dirty);
+                }
             }
         }
+        rehash_dirty(&mut self.twigs, &dirty);
         Ok(self.root())
+    }
+
+    /// `set`, with the twig's hashing left to [`rehash_dirty`].
+    fn set_deferred(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, dirty: &mut Vec<u8>) {
+        if let Some(old_slot) = self.index.get(&key).copied() {
+            self.record_deactivation(old_slot);
+            self.deactivate_deferred(old_slot, dirty);
+        }
+        if let Some(record) = self.recording.as_mut() {
+            record.appended_keys.push(key);
+        }
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        let twig_id = (slot as usize) / TWIG_SIZE;
+        let local = (slot as usize) % TWIG_SIZE;
+        self.ensure_twig(twig_id);
+        let twig = &mut self.twigs[twig_id];
+        twig.nodes[TWIG_SIZE + local] = leaf;
+        twig.bits[local / 8] |= 1 << (local % 8);
+        mark_dirty(dirty, twig_id, DIRTY_LEAVES);
+        self.entries.push(Entry {
+            key,
+            value,
+            active: true,
+        });
+        self.index.insert(key, slot);
+    }
+
+    /// `delete`, with the twig's hashing left to [`rehash_dirty`].
+    fn delete_deferred(&mut self, key: &Hash, dirty: &mut Vec<u8>) -> bool {
+        let Some(slot) = self.index.remove(key) else {
+            return false;
+        };
+        self.record_deactivation(slot);
+        self.deactivate_deferred(slot, dirty);
+        true
+    }
+
+    /// `deactivate`, with the twig's hashing left to [`rehash_dirty`].
+    fn deactivate_deferred(&mut self, slot: u64, dirty: &mut Vec<u8>) {
+        let entry = &mut self.entries[slot as usize];
+        if !entry.active {
+            return;
+        }
+        entry.active = false;
+        let twig_id = (slot as usize) / TWIG_SIZE;
+        let local = (slot as usize) % TWIG_SIZE;
+        self.twigs[twig_id].bits[local / 8] &= !(1 << (local % 8));
+        mark_dirty(dirty, twig_id, DIRTY_BITS);
     }
 
     pub fn root(&self) -> Hash {
@@ -1301,6 +1418,62 @@ impl QmdbCompatTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The batched apply is `set`/`delete` in order: same root, same undo
+    /// record, same snapshot, over blocks that create, update, delete and
+    /// re-create keys across twig boundaries.
+    #[test]
+    fn batched_apply_matches_one_operation_at_a_time() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let key_of = |n: u64| {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&n.to_le_bytes());
+            key
+        };
+        let mut batched = QmdbCompatTree::new();
+        let mut one_by_one = QmdbCompatTree::new();
+        for block in 0..6 {
+            let count = if block == 0 { 1_800 } else { 900 };
+            let mut seen = std::collections::HashSet::new();
+            let mut operations = Vec::new();
+            while operations.len() < count {
+                let r = next();
+                let key = key_of(r % 2_500);
+                if !seen.insert(key) {
+                    continue;
+                }
+                let value = if r % 7 == 0 && block > 0 {
+                    None
+                } else {
+                    Some((0..(8 + (r % 40) as usize)).map(|i| (r as u8).wrapping_add(i as u8)).collect())
+                };
+                operations.push(QmdbOperation { key, value });
+            }
+            let mut ordered = operations.clone();
+            ordered.sort_unstable_by_key(|operation| operation.key);
+            one_by_one.start_undo_recording();
+            for operation in ordered {
+                match operation.value {
+                    Some(value) => one_by_one.set(operation.key, value),
+                    None => {
+                        one_by_one.delete(&operation.key);
+                    }
+                }
+            }
+            let expected_root = one_by_one.root();
+            let expected_undo = one_by_one.stop_undo_recording().unwrap();
+            let (root, undo) = batched.apply_sorted_ops_recorded(operations).unwrap();
+            assert_eq!(root, expected_root, "root differs at block {block}");
+            assert_eq!(undo, expected_undo, "undo record differs at block {block}");
+            assert_eq!(batched.snapshot(), one_by_one.snapshot(), "snapshot differs at block {block}");
+        }
+    }
 
     #[derive(serde::Deserialize)]
     struct CrossClientVector {
