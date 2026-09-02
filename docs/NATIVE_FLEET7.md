@@ -3464,3 +3464,35 @@ collapse on its client (22,857-transaction blocks, QMDB, 3m45s flat).
 Naming the 17 kernel frames needs `/proc/kallsyms` or `System.map`, both
 root-only on this box. That is the open item; the fix depends on which
 syscall it is.
+
+### Addendum 3: the collapse is kernel time on the runtime's workers, and its rate is page faults
+
+Three more rounds of the other branch's gate watcher (574401f23: one
+watcher task and a `Notify` instead of a 2 ms poll per connection) changed
+nothing: 194,894 / 93k / 68k, 193,774 / 125k / 86k, 194,702 / 85k / 71k. Nor
+did jemalloc keeping large allocations in its arenas (`oversize_threshold:0`
+plus no decay): 138,984 / 81,740, the collapse earlier.
+
+What the in-process diagnostics say (read from `/proc` by the launcher; the
+`syscall` file and `strace` are refused even to an ancestor under
+`ptrace_scope` 1, so the syscall is not named): at flood+50 s all sixteen
+tokio workers of a follower spend 92% of wall time in kernel mode, running,
+not blocked -- 28.9-35.7 cores of system time on a node pinned to 16
+physical cores (its SMT siblings included) against 0.4 at flood+10 s in the
+same round. The sockets carry 6-7 MB/s then, so it is not a copy. Page
+faults (software events, no root): 48k/s at flood+10 s, 95k/s at flood+50 s
+on one node, 65% of them on the tokio workers inside libc's `memmove` --
+first touch of fresh pages during copies -- plus 3.2k/s major faults (MDBX
+pages not in the page cache, the engine thread's 34-frame chain through the
+filesystem module). Machine-wide during a round: 200-700k faults/s, 20-50k
+major/s, half of the majors the foreign 33.5 GB `n42-datc` job. The box is
+one NUMA node, so one zone; sixteen faulting workers per node, seven nodes
+and a scanning job all take its allocator and LRU locks, and one spinning
+kernel address at 88% of a follower's samples is what that looks like. That
+is the reading; the name of the function needs `/proc/kallsyms` (root).
+
+Two clean negatives stand: the gov5 client on the same box, same hour, shows
+no collapse (22,857-transaction blocks, 3m45s flat), and the cap-6 round
+(generator below the chain's rate, no backlog) stayed flat through 11M
+transactions. Whatever the kernel function is, it is reached only when this
+client is pushed past its rate.
