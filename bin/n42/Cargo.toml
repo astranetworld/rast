@@ -59,6 +59,7 @@ reth-payload-primitives.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-engine-primitives.workspace = true
 n42-h2-execution.workspace = true
+n42-tx-queue.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-eips.workspace = true
 rayon.workspace = true

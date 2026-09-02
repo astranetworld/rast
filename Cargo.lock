@@ -7648,6 +7648,7 @@ dependencies = [
  "n42-primitives",
  "n42-qmdb-reth",
  "n42-tx-ingest",
+ "n42-tx-queue",
  "pubsub-mem",
  "rayon",
  "reth-chainspec",
@@ -7893,6 +7894,7 @@ dependencies = [
  "n42-h2-consensus",
  "n42-primitives",
  "n42-qmdb-reth",
+ "n42-tx-queue",
  "rayon",
  "reth-basic-payload-builder",
  "reth-chain-state",
@@ -8321,9 +8323,24 @@ version = "2.1.5"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives 1.7.1",
+ "n42-tx-queue",
  "reth-evm",
  "reth-transaction-pool",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "n42-tx-queue"
+version = "2.1.5"
+dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-primitives 1.7.1",
+ "parking_lot 0.12.5",
+ "reth-ethereum-primitives",
+ "reth-primitives-traits",
+ "reth-transaction-pool",
+ "revm 42.0.1",
  "tracing",
 ]
 

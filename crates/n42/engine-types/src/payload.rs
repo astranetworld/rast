@@ -236,13 +236,22 @@ where
         args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         let started = std::time::Instant::now();
+        let parent_hash = args.config.parent_header.hash();
         let result = default_n42_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
             self.builder_config.clone(),
             args,
-            |attributes| self.pool.best_transactions_with_attributes(attributes),
+            |attributes| {
+                // The queue beside the pool, when installed (N42_TX_QUEUE=1):
+                // selection is a walk and taking is a pop, against 116-220 ms
+                // a build from the pool's ordered sets on a tenure leader.
+                match n42_tx_queue::global::<Pool::Transaction>() {
+                    Some(queue) => Box::new(queue.best_for_build(parent_hash)),
+                    None => self.pool.best_transactions_with_attributes(attributes),
+                }
+            },
             self.cons.clone(),
             self.qmdb.clone(),
         );
@@ -582,12 +591,17 @@ where
                     // if the transaction is invalid, we can skip it and all of its
                     // descendants
                     trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
-                    best_txs.mark_invalid(
-                        &pool_tx,
-                        InvalidPoolTransactionError::Consensus(
-                            InvalidTransactionError::TxTypeNotSupported,
-                        ),
-                    );
+                    // reth reports every such refusal as an unsupported type.
+                    // A nonce above the account's is reported as what it is,
+                    // so a queue that orders by nonce can tell a hole from a
+                    // bad transaction and fill it.
+                    let kind = match reth_evm::InvalidTxError::as_invalid_tx_err(&*error) {
+                        Some(revm::context_interface::result::InvalidTransaction::NonceTooHigh { tx, state }) => {
+                            InvalidTransactionError::NonceNotConsistent { tx: *tx, state: *state }
+                        }
+                        _ => InvalidTransactionError::TxTypeNotSupported,
+                    };
+                    best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Consensus(kind));
                 }
                 continue;
             }

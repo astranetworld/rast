@@ -1,0 +1,27 @@
+[package]
+name = "n42-tx-queue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "A builder-side transaction queue fed by the binary ingest, beside reth's pool"
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-transaction-pool.workspace = true
+reth-primitives-traits.workspace = true
+alloy-primitives.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+# Feature unification: the vendored reth-revm needs revm's serde when this
+# crate is built on its own, as bin/n42 enables it anyway.
+revm = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+alloy-consensus.workspace = true
+reth-primitives-traits.workspace = true
+reth-ethereum-primitives.workspace = true

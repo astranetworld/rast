@@ -249,6 +249,87 @@ fn main() {
                 }
             }
 
+            // The builder-side transaction queue, beside the pool. See
+            // n42_tx_queue. Fed by the ingest, drained by the builder, pruned
+            // here by every canonical block on every node.
+            if std::env::var("N42_TX_QUEUE").is_ok() {
+                let queue: n42_tx_queue::TxQueue<reth_transaction_pool::EthPooledTransaction> = n42_tx_queue::TxQueue::new();
+                if n42_tx_queue::install(queue.clone()) {
+                    info!(target: "reth::cli", "builder-side transaction queue installed");
+                }
+                // Fed by the pool's own arrivals, whichever door they came in
+                // by, so what the builder sees is what the pool validated.
+                let mut arrivals = reth_transaction_pool::TransactionPool::new_transactions_listener_for(
+                    &node.pool,
+                    reth_transaction_pool::TransactionListenerKind::All,
+                );
+                let feed = queue.clone();
+                let pool_for_gaps = node.pool.clone();
+                tokio::spawn(async move {
+                    let mut batch = Vec::with_capacity(256);
+                    loop {
+                        // Holes the builder ran into: the pool's listener drops
+                        // events on a full channel, so a nonce can be in the
+                        // pool and not here. Look those up; one still on its
+                        // way in is simply not found yet.
+                        for (sender, from, to) in feed.take_gaps() {
+                            let to = to.min(from.saturating_add(256));
+                            let found: Vec<_> = (from..to)
+                                .filter_map(|nonce| {
+                                    reth_transaction_pool::TransactionPool::get_transaction_by_sender_and_nonce(
+                                        &pool_for_gaps,
+                                        sender,
+                                        nonce,
+                                    )
+                                })
+                                .collect();
+                            if !found.is_empty() {
+                                feed.push_valid(found);
+                            }
+                        }
+                        let event = match tokio::time::timeout(std::time::Duration::from_millis(50), arrivals.recv()).await {
+                            Ok(Some(event)) => event,
+                            Ok(None) => break,
+                            Err(_) => continue,
+                        };
+                        batch.push(event.transaction);
+                        while let Ok(event) = arrivals.try_recv() {
+                            batch.push(event.transaction);
+                            if batch.len() >= 4096 {
+                                break;
+                            }
+                        }
+                        feed.push_valid(batch.drain(..));
+                    }
+                });
+                let mut canonical = node.provider.subscribe_to_canonical_state();
+                tokio::spawn(async move {
+                    loop {
+                        match canonical.recv().await {
+                            Ok(notification) => {
+                                let started = std::time::Instant::now();
+                                let mut mined = 0usize;
+                                for (_, block) in notification.committed().blocks_iter().map(|b| (b.number(), b)) {
+                                    let pairs: Vec<(alloy_primitives::Address, u64)> = block
+                                        .transactions_with_sender()
+                                        .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+                                        .collect();
+                                    mined += pairs.len();
+                                    queue.remove_mined_batch(pairs);
+                                }
+                                if mined > 10_000 {
+                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(target: "n42.tx_queue", skipped, "queue pruning fell behind canonical notifications");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             // A binary path into the pool, for load generators. Off unless
             // asked for, and meant for loopback: it admits nothing
             // `eth_sendRawTransaction` would not, but it is unauthenticated,

@@ -1,0 +1,407 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! A transaction source for the block builder that lives beside reth's pool
+//! rather than inside it.
+//!
+//! reth's pool was measured, on a leader that builds every view at 163,000
+//! transactions a block, to cost about half a second per block: 116-220 ms
+//! to select from its ordered sets and ~300 ms to remove the block's
+//! transactions one at a time under its write lock -- the lock the ingest
+//! needs to admit anything. The pool is right for a mainnet node and wrong
+//! for that.
+//!
+//! This queue takes the same transactions the binary ingest has already
+//! validated and recovered, keeps them per sender in nonce order, and hands
+//! them to the builder in the order the senders' first transactions arrived,
+//! one per sender per pass, so no sender starves another. Selection is a
+//! walk; taking is a pop. reth's pool still receives everything for RPC and
+//! gossip, off the builder's path.
+//!
+//! What goes out for a build is remembered until the next build. A build on
+//! the same parent again means the previous block was not committed, and its
+//! transactions go back to the front; a build on a new parent means it was,
+//! and they are dropped. Canonical blocks prune the queue on every node by
+//! (sender, nonce), so a follower that becomes leader does not offer what the
+//! chain already holds.
+//!
+//! Enabled by `N42_TX_QUEUE=1`. The queue is fed from the pool's
+//! new-transaction listener, so a transaction that came in by the ingest,
+//! by RPC or by gossip is offered alike; the builder finds the queue through
+//! [`global`].
+
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, OnceLock};
+
+use alloy_primitives::{Address, B256};
+use parking_lot::Mutex;
+use reth_primitives_traits::transaction::error::InvalidTransactionError;
+use reth_transaction_pool::{
+    error::InvalidPoolTransactionError,
+    identifier::{SenderId, TransactionId},
+    BestTransactions, PoolTransaction, TransactionOrigin, ValidPoolTransaction,
+};
+
+/// One sender's queued transactions, nonce-ordered.
+struct Lane<T: PoolTransaction> {
+    by_nonce: BTreeMap<u64, Arc<ValidPoolTransaction<T>>>,
+    /// Whether the sender is in the arrival order right now.
+    queued: bool,
+    id: SenderId,
+}
+
+struct Inner<T: PoolTransaction> {
+    lanes: HashMap<Address, Lane<T>>,
+    /// Senders with queued transactions, in the order their queued run began;
+    /// a sender taken from the front goes to the back if it has more.
+    arrivals: VecDeque<Address>,
+    next_sender_id: u64,
+    len: usize,
+    /// What the last build took, and the parent it built on.
+    last_build: Option<(B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
+    /// Holes a build ran into: (sender, the account's next nonce, the lowest
+    /// queued nonce above it). The feed fills them from the pool.
+    gaps: Vec<(Address, u64, u64)>,
+}
+
+/// The queue. Cheap to clone; every clone is the same queue.
+pub struct TxQueue<T: PoolTransaction> {
+    inner: Arc<Mutex<Inner<T>>>,
+}
+
+impl<T: PoolTransaction> Clone for TxQueue<T> {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl<T: PoolTransaction> std::fmt::Debug for TxQueue<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxQueue").field("len", &self.len()).finish()
+    }
+}
+
+impl<T: PoolTransaction> Default for TxQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: PoolTransaction> TxQueue<T> {
+    /// An empty queue.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                lanes: HashMap::new(),
+                arrivals: VecDeque::new(),
+                next_sender_id: 1,
+                len: 0,
+                last_build: None,
+                gaps: Vec::new(),
+            })),
+        }
+    }
+
+    /// The holes builds ran into since the last call: (sender, first missing
+    /// nonce, first queued nonce above the hole). A hole is a transaction the
+    /// queue never saw -- the pool's listener drops on a full channel -- or
+    /// one still on its way in; the feed looks the pool up for it.
+    pub fn take_gaps(&self) -> Vec<(Address, u64, u64)> {
+        std::mem::take(&mut self.inner.lock().gaps)
+    }
+
+    /// How many transactions are queued.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len
+    }
+
+    /// Whether nothing is queued.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Queues validated, recovered transactions. A (sender, nonce) already
+    /// queued keeps its first arrival.
+    pub fn push(&self, transactions: impl IntoIterator<Item = T>) {
+        let mut inner = self.inner.lock();
+        let now = std::time::Instant::now();
+        for transaction in transactions {
+            inner.insert(transaction, now, TransactionOrigin::External);
+        }
+    }
+
+    /// Queues transactions the pool has already validated, as the pool holds
+    /// them. What the pool's new-transaction listener yields; the queue is a
+    /// view of the pool's arrivals, whichever door they came in by.
+    pub fn push_valid(&self, transactions: impl IntoIterator<Item = Arc<ValidPoolTransaction<T>>>) {
+        let mut inner = self.inner.lock();
+        for valid in transactions {
+            inner.insert_valid(valid);
+        }
+    }
+
+    /// Drops everything at or below `nonce` for `sender`: a block carrying
+    /// (sender, nonce) has made every lower nonce unusable as well.
+    pub fn remove_mined(&self, sender: Address, nonce: u64) {
+        self.inner.lock().remove_mined(sender, nonce);
+    }
+
+    /// Drops a batch of mined (sender, nonce) pairs.
+    pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
+        let mut inner = self.inner.lock();
+        for (sender, nonce) in mined {
+            inner.remove_mined(sender, nonce);
+        }
+    }
+
+    /// The transactions for a build on `parent`, as the pool's iterator would
+    /// hand them. Taking returns what the previous build on the same parent
+    /// took, first.
+    pub fn best_for_build(&self, parent: B256) -> QueueBest<T> {
+        {
+            let mut inner = self.inner.lock();
+            match inner.last_build.take() {
+                Some((previous, taken)) if previous == parent => {
+                    let count = taken.len();
+                    inner.give_back(taken);
+                    tracing::info!(target: "n42.tx_queue", count, "previous build on the same parent was not committed; its transactions are offered again");
+                }
+                _ => {}
+            }
+            inner.last_build = Some((parent, Vec::new()));
+        }
+        QueueBest { queue: self.clone(), skipped: HashSet::new() }
+    }
+}
+
+impl<T: PoolTransaction> Inner<T> {
+    fn insert(&mut self, transaction: T, now: std::time::Instant, origin: TransactionOrigin) {
+        let sender = transaction.sender();
+        let nonce = transaction.nonce();
+        let next_id = &mut self.next_sender_id;
+        let lane = self.lanes.entry(sender).or_insert_with(|| {
+            let id = SenderId::from(*next_id);
+            *next_id += 1;
+            Lane { by_nonce: BTreeMap::new(), queued: false, id }
+        });
+        if lane.by_nonce.contains_key(&nonce) {
+            return;
+        }
+        let valid = Arc::new(ValidPoolTransaction {
+            transaction,
+            transaction_id: TransactionId::new(lane.id, nonce),
+            propagate: false,
+            timestamp: now,
+            origin,
+            authority_ids: None,
+        });
+        lane.by_nonce.insert(nonce, valid);
+        self.len += 1;
+        if !lane.queued {
+            lane.queued = true;
+            self.arrivals.push_back(sender);
+        }
+    }
+
+    fn insert_valid(&mut self, valid: Arc<ValidPoolTransaction<T>>) {
+        let sender = valid.sender();
+        let nonce = valid.nonce();
+        let next_id = &mut self.next_sender_id;
+        let lane = self.lanes.entry(sender).or_insert_with(|| {
+            let id = SenderId::from(*next_id);
+            *next_id += 1;
+            Lane { by_nonce: BTreeMap::new(), queued: false, id }
+        });
+        if lane.by_nonce.contains_key(&nonce) {
+            return;
+        }
+        lane.by_nonce.insert(nonce, valid);
+        self.len += 1;
+        if !lane.queued {
+            lane.queued = true;
+            self.arrivals.push_back(sender);
+        }
+    }
+
+    /// Puts transactions a build took back at their nonces; their senders go
+    /// to the front so they are offered before anything newer.
+    fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) {
+        let mut senders: Vec<Address> = Vec::new();
+        for valid in taken {
+            let sender = valid.sender();
+            let nonce = valid.nonce();
+            let Some(lane) = self.lanes.get_mut(&sender) else { continue };
+            if lane.by_nonce.insert(nonce, valid).is_none() {
+                self.len += 1;
+            }
+            if !lane.queued {
+                lane.queued = true;
+                senders.push(sender);
+            }
+        }
+        for sender in senders.into_iter().rev() {
+            self.arrivals.push_front(sender);
+        }
+    }
+
+    fn remove_mined(&mut self, sender: Address, nonce: u64) {
+        let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        let keep = lane.by_nonce.split_off(&(nonce + 1));
+        self.len -= lane.by_nonce.len();
+        lane.by_nonce = keep;
+        // A now-empty lane leaves the arrival order when its turn comes.
+    }
+
+    /// The next transaction: the lowest nonce of the sender at the front of
+    /// the arrival order, skipping senders the build marked.
+    fn next_ready(&mut self, skipped: &HashSet<Address>) -> Option<Arc<ValidPoolTransaction<T>>> {
+        let mut passes = self.arrivals.len();
+        while passes > 0 {
+            passes -= 1;
+            let sender = self.arrivals.pop_front()?;
+            let Some(lane) = self.lanes.get_mut(&sender) else { continue };
+            if lane.by_nonce.is_empty() {
+                lane.queued = false;
+                continue;
+            }
+            if skipped.contains(&sender) {
+                self.arrivals.push_back(sender);
+                continue;
+            }
+            let (_, valid) = lane.by_nonce.pop_first()?;
+            self.len -= 1;
+            if lane.by_nonce.is_empty() {
+                lane.queued = false;
+            } else {
+                self.arrivals.push_back(sender);
+            }
+            if let Some((_, taken)) = self.last_build.as_mut() {
+                taken.push(Arc::clone(&valid));
+            }
+            return Some(valid);
+        }
+        None
+    }
+}
+
+/// The builder's iterator over the queue. Implements reth's
+/// [`BestTransactions`], so the payload builder takes it in place of the
+/// pool's.
+pub struct QueueBest<T: PoolTransaction> {
+    queue: TxQueue<T>,
+    skipped: HashSet<Address>,
+}
+
+impl<T: PoolTransaction> std::fmt::Debug for QueueBest<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueBest").field("skipped", &self.skipped.len()).finish()
+    }
+}
+
+impl<T: PoolTransaction> Iterator for QueueBest<T> {
+    type Item = Arc<ValidPoolTransaction<T>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.queue.inner.lock().next_ready(&self.skipped)
+    }
+}
+
+impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
+    /// The build refused this transaction: it goes back where it was and the
+    /// sender's later nonces are not offered again in this build. A stale
+    /// one (nonce below the account's) is dropped instead.
+    fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError) {
+        let sender = transaction.sender();
+        self.skipped.insert(sender);
+        let stale = matches!(&kind, InvalidPoolTransactionError::Consensus(err) if err.is_nonce_too_low());
+        if stale {
+            return;
+        }
+        let mut inner = self.queue.inner.lock();
+        if let Some((_, taken)) = inner.last_build.as_mut() {
+            taken.retain(|t| !Arc::ptr_eq(t, transaction));
+        }
+        if let InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
+            tx,
+            state,
+        }) = &kind
+        {
+            if tx > state {
+                inner.gaps.push((sender, *state, *tx));
+            }
+        }
+        inner.give_back(vec![Arc::clone(transaction)]);
+    }
+
+    fn no_updates(&mut self) {}
+
+    fn set_skip_blobs(&mut self, _skip_blobs: bool) {}
+}
+
+static GLOBAL: OnceLock<Option<Box<dyn Any + Send + Sync>>> = OnceLock::new();
+
+/// Installs the fleet-wide queue for `T`, once. Returns whether this call
+/// installed it.
+pub fn install<T: PoolTransaction + 'static>(queue: TxQueue<T>) -> bool {
+    GLOBAL.set(Some(Box::new(queue))).is_ok()
+}
+
+/// The installed queue for `T`, if one was installed with that type.
+pub fn global<T: PoolTransaction + 'static>() -> Option<TxQueue<T>> {
+    GLOBAL.get()?.as_ref()?.downcast_ref::<TxQueue<T>>().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Signature, TxKind, U256};
+    use reth_transaction_pool::EthPooledTransaction;
+
+    fn tx(sender_seed: u8, nonce: u64) -> EthPooledTransaction {
+        use alloy_consensus::{Signed, TxEip1559};
+        let inner = TxEip1559 { chain_id: 1, nonce, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(9)), value: U256::from(1), ..Default::default() };
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), Default::default());
+        let recovered = reth_primitives_traits::Recovered::new_unchecked(reth_ethereum_primitives::TransactionSigned::from(signed), Address::repeat_byte(sender_seed));
+        EthPooledTransaction::new(recovered, 120)
+    }
+
+    #[test]
+    fn senders_take_turns_in_nonce_order_and_a_failed_build_is_offered_again() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(2, 0), tx(1, 2), tx(3, 5)]);
+        assert_eq!(queue.len(), 5);
+        let parent = B256::repeat_byte(7);
+        let mut best = queue.best_for_build(parent);
+        let order: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        assert_eq!(order, vec![(1, 0), (2, 0), (3, 5), (1, 1), (1, 2)]);
+        assert!(queue.is_empty());
+        // Same parent again: everything comes back, same order.
+        let mut best = queue.best_for_build(parent);
+        let again: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        assert_eq!(again.len(), 5);
+        assert_eq!(again[0], (1, 0));
+        // A new parent: the previous build was committed, nothing comes back.
+        let mut best = queue.best_for_build(B256::repeat_byte(8));
+        assert!(best.next().is_none());
+    }
+
+    #[test]
+    fn mined_nonces_and_refused_transactions_are_handled() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(1, 2), tx(2, 4)]);
+        queue.remove_mined(Address::repeat_byte(1), 1);
+        assert_eq!(queue.len(), 2);
+        let mut best = queue.best_for_build(B256::ZERO);
+        let first = best.next().unwrap();
+        assert_eq!((first.sender(), first.nonce()), (Address::repeat_byte(1), 2));
+        let second = best.next().unwrap();
+        assert_eq!(second.nonce(), 4);
+        // Refused for a gap: back in the queue, sender skipped for this build.
+        best.mark_invalid(&second, InvalidPoolTransactionError::Underpriced);
+        assert!(best.next().is_none());
+        assert_eq!(queue.len(), 1);
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        assert_eq!(best.next().unwrap().nonce(), 4);
+    }
+}
