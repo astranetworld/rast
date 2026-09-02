@@ -3166,3 +3166,25 @@ build -- pending less the last block's not-yet-maintained transactions --
 or, on a chain with a tenure, supply that is aimed at the leader rather
 than at seven pools. Both are the generator's and the ingest's business,
 not the chain's.
+
+### The tenure's three-round record (async ingest, pool 489k, tree at 4cfa2abec)
+
+`scripts/fleet7-repeat.sh 3` on the configuration of `tenure16o`:
+
+| | run 1 | run 2 | run 3 | median | spread |
+|---|---:|---:|---:|---:|---:|
+| win1 TPS | 108,190 | 114,598 | 125,470 | **114,598** | 15% |
+| win2 TPS | 89,561 | 99,916 | 101,283 | 99,916 | 12% |
+| win3 TPS | 83,865 | 97,656 | 86,651 | 86,651 | 16% |
+| total txs | 8,466,801 | 9,386,117 | 9,409,534 | 9,386,117 | 10% |
+
+Against the other session's round-robin record on the same tree (round
+28: 114,584 / 108,615 / 97,762): **equal in window 1, behind in windows 2
+and 3**. The single 140,841 window of `tenure16j` is not reproduced by the
+distribution. What the tenure bought -- a view cycle of 0.76-1.0 s when the
+leader's build is ahead and its own import is free -- is real and measured;
+what eats it over a round is the leader's execution slowing across its
+tenure (250 -> 928 ms; the cached-reads hypothesis is being worked on the
+`feat/tenure-leader` branch) and the supply oscillating at block cadence
+(round 30). Neither is the consensus structure, and both are now
+instrumented.
