@@ -109,11 +109,7 @@ where
         // computed while the decodes run on the worker pool.
         let raw_transactions = payload.payload.as_v1().transactions.clone();
         let (transactions_root, decoded_transactions) = rayon::join(
-            || {
-                alloy_trie::root::ordered_trie_root_with_encoder(&raw_transactions, |tx, buf| {
-                    buf.extend_from_slice(tx)
-                })
-            },
+            || crate::assembler::parallel_ordered_trie_root(&raw_transactions),
             || {
                 use rayon::prelude::*;
                 raw_transactions

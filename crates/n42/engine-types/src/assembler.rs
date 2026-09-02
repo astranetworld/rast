@@ -83,17 +83,101 @@ impl<ChainSpec> N42BlockAssembler<ChainSpec> {
     }
 }
 
-/// The transactions root, with the encodings produced in parallel.
+/// The transactions root, with the encodings produced in parallel and the
+/// trie built in parallel.
 ///
 /// Identical to `alloy_consensus::proofs::calculate_transaction_root`: the
-/// trie is over each transaction's EIP-2718 encoding, keyed by index, and
-/// only the encoding step is spread over the worker pool.
+/// trie is over each transaction's EIP-2718 encoding, keyed by index.
 pub fn parallel_transaction_root<T: Encodable2718 + Sync>(transactions: &[T]) -> B256 {
     use rayon::prelude::*;
     let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.encoded_2718()).collect();
-    alloy_trie::root::ordered_trie_root_with_encoder(&encoded, |item, buf| {
-        buf.extend_from_slice(item)
-    })
+    parallel_ordered_trie_root(&encoded)
+}
+
+/// Below this many items the sequential builder is used: the split's
+/// bookkeeping is not worth it, and every ordinary Ethereum block is here.
+const PARALLEL_TRIE_MIN_ITEMS: usize = 2_048;
+
+/// The root of the ordered trie over `items` -- what `ordered_trie_root`
+/// computes -- with the subtries built on the worker pool.
+///
+/// The keys are `rlp(index)`, so every key of the same byte length shares
+/// its length byte and the items split naturally by all but their last
+/// byte: 256 leaves under each such prefix. Each group's subtrie is built by
+/// its own `HashBuilder` over the keys with the prefix stripped, and the
+/// top-level builder is handed the group's root as a branch at that prefix,
+/// which is how reth's own parallel state root joins its pieces. A group's
+/// root is always a hashed node rather than an inlined one because the
+/// values here are transactions, far past the 32-byte inline limit; a caller
+/// with shorter values gets the sequential builder instead.
+///
+/// At the 163,000-transaction tier the sequential trie was ~80 ms of every
+/// follower's import and ~110 ms of every leader's build; it is on both
+/// critical paths, and nothing else in either overlaps with it.
+pub fn parallel_ordered_trie_root<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 {
+    use alloy_trie::{HashBuilder, Nibbles};
+    use rayon::prelude::*;
+
+    let sequential = || {
+        alloy_trie::root::ordered_trie_root_with_encoder(items, |item, buf| buf.extend_from_slice(item.as_ref()))
+    };
+    if items.len() < PARALLEL_TRIE_MIN_ITEMS || items.iter().any(|v| v.as_ref().len() < 32) {
+        return sequential();
+    }
+
+    // Every key, in the trie's order.
+    let mut keyed: Vec<(Nibbles, usize)> = (0..items.len())
+        .map(|i| (Nibbles::unpack(alloy_rlp::encode_fixed_size(&i)), i))
+        .collect();
+    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    // Groups: keys of four nibbles or more, by all but their last two
+    // nibbles; shorter keys stand alone as leaves.
+    enum Piece {
+        Leaf(Nibbles, usize),
+        Group(Nibbles, Vec<(Nibbles, usize)>),
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    for (key, index) in keyed {
+        if key.len() < 4 {
+            pieces.push(Piece::Leaf(key, index));
+            continue;
+        }
+        let prefix = key.slice(..key.len() - 2);
+        match pieces.last_mut() {
+            Some(Piece::Group(p, members)) if *p == prefix => members.push((key, index)),
+            _ => pieces.push(Piece::Group(prefix, vec![(key, index)])),
+        }
+    }
+
+    // Subtrie roots, in parallel.
+    let roots: Vec<Option<B256>> = pieces
+        .par_iter()
+        .map(|piece| match piece {
+            Piece::Leaf(..) => None,
+            Piece::Group(prefix, members) if members.len() > 1 => {
+                let mut hb = HashBuilder::default();
+                for (key, index) in members {
+                    hb.add_leaf(key.slice(prefix.len()..), items[*index].as_ref());
+                }
+                Some(hb.root())
+            }
+            Piece::Group(..) => None,
+        })
+        .collect();
+
+    let mut hb = HashBuilder::default();
+    for (piece, root) in pieces.iter().zip(roots) {
+        match (piece, root) {
+            (Piece::Leaf(key, index), _) => hb.add_leaf(*key, items[*index].as_ref()),
+            (Piece::Group(_, members), None) => {
+                let (key, index) = &members[0];
+                hb.add_leaf(*key, items[*index].as_ref());
+            }
+            (Piece::Group(prefix, _), Some(root)) => hb.add_branch(*prefix, root, false),
+        }
+    }
+    hb.root()
 }
 
 impl<F, ChainSpec> BlockAssembler<F> for N42BlockAssembler<ChainSpec>
@@ -151,6 +235,23 @@ mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559, TxEnvelope, TxLegacy};
     use alloy_primitives::{Address, Signature, TxKind, U256};
+
+    /// The parallel trie is alloy's ordered trie, at every size where the
+    /// key shape changes: one byte, two, three and four bytes of index, and
+    /// the boundaries between them.
+    #[test]
+    fn parallel_ordered_trie_is_alloys_at_every_key_shape() {
+        for n in [0usize, 1, 2, 3, 127, 128, 129, 255, 256, 257, 2_047, 2_048, 2_049, 4_096, 4_097, 65_535, 65_536, 65_537, 70_000, 163_000] {
+            let items: Vec<Vec<u8>> = (0..n)
+                .map(|i| {
+                    let len = 40 + (i * 7) % 90;
+                    (0..len).map(|j| ((i * 31 + j * 17) % 251) as u8).collect()
+                })
+                .collect();
+            let want = alloy_trie::root::ordered_trie_root_with_encoder(&items, |item, buf| buf.extend_from_slice(item));
+            assert_eq!(parallel_ordered_trie_root(&items), want, "n = {n}");
+        }
+    }
 
     /// The parallel root is the sequential one, on typed and legacy
     /// transactions alike.
