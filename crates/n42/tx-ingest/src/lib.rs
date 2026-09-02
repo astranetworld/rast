@@ -207,6 +207,12 @@ where
     });
 }
 
+/// `N42_TX_INGEST_UNBUFFERED`, read once.
+fn unbuffered_reads() -> bool {
+    static UNBUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNBUFFERED.get_or_init(|| std::env::var("N42_TX_INGEST_UNBUFFERED").is_ok())
+}
+
 fn queue_depth<P: TransactionPool + 'static>(pool: &P) -> usize
 where
     P::Transaction: 'static,
@@ -285,7 +291,14 @@ where
     spawn_stats_reporter();
     spawn_gate_watcher(pool.clone(), std::sync::Arc::clone(&head), high_water(), block_txs_allowance());
     let listener = TcpListener::bind(addr).await?;
-    info!(target: "n42.tx_ingest", %addr, "binary transaction ingest listening");
+    info!(
+        target: "n42.tx_ingest",
+        %addr,
+        buffered_reads = !unbuffered_reads(),
+        direct_to_queue = direct_to_queue(),
+        asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok(),
+        "binary transaction ingest listening"
+    );
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -359,8 +372,11 @@ where
     // makes a read(2) of each -- two syscalls a transaction, 400,000 a second
     // a node at the flood's rate. Writes stay direct; an answer is 8 bytes
     // and must not wait for company.
+    // N42_TX_INGEST_UNBUFFERED=1 restores a read(2) per field, for the A-B-A
+    // that separates the buffer from the box.
     let (read_half, mut write_half) = stream.into_split();
-    let mut stream = tokio::io::BufReader::with_capacity(1 << 20, read_half);
+    let capacity = if unbuffered_reads() { 0 } else { 1 << 20 };
+    let mut stream = tokio::io::BufReader::with_capacity(capacity, read_half);
     loop {
         let count = match stream.read_u32_le().await {
             Ok(count) => count,
