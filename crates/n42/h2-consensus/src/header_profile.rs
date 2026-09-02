@@ -616,9 +616,13 @@ pub fn reconstruct_gov5_h2_block_from<T>(
             }
         }
     }
-    Err(HeaderProfileError::Reconstruction(
-        "no gov5 header variant hashes to the payload's block hash".into(),
-    ))
+    // What was tried, so a refusal in the field says which dimension is off
+    // instead of only that one is.
+    Err(HeaderProfileError::Reconstruction(format!(
+        "no gov5 header variant hashes to the payload's block hash {expected}: number {} slot {:?} \
+         bal hash candidates {:?} withdrawals roots {:?} requests hashes {:?}",
+        block.header.number, block.header.slot_number, bal_hashes, withdrawals_roots, requests_hashes
+    )))
 }
 
 /// Turns a locally built payload into the block this node proposes.

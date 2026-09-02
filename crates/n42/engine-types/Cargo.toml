@@ -85,3 +85,6 @@ reth-metrics.workspace = true
 metrics.workspace = true
 
 
+
+[dev-dependencies]
+alloy-eip7928.workspace = true

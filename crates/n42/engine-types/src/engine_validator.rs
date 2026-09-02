@@ -301,6 +301,24 @@ mod tests {
         )
     }
 
+    /// An Amsterdam block as the raw payload path seals it -- the header's
+    /// access-list hash is EIP-7928's, its slot number set -- converts back
+    /// to the same hash through the parallel conversion. Round ams4k refused
+    /// every Amsterdam block at number 1 with "no gov5 header variant".
+    #[test]
+    fn an_amsterdam_block_converts_through_the_parallel_path() {
+        let bal = Bytes::from(alloy_rlp::encode(&alloy_eip7928::BlockAccessList::default()));
+        let decoded = <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(&mut bal.as_ref()).unwrap();
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        header.block_access_list_hash = Some(alloy_eip7928::compute_block_access_list_hash(decoded.as_slice()));
+        header.slot_number = Some(7);
+        let block = block_for_header(header, vec![]);
+        let payload = n42_h2_consensus::execution_data_for_block_with_bal(block.header.hash_slow(), &block, Some(bal));
+        let expected = payload.block_hash();
+        let sealed = convert(&validator(N42HeaderProfile::Gov5H2), payload).unwrap();
+        assert_eq!(sealed.hash(), expected);
+    }
+
     #[test]
     fn a_gov5_block_reconstructs_with_its_zero_ommers_hash() {
         let payload = payload_for(gov5_header(B256::ZERO, U256::ZERO));
