@@ -518,10 +518,37 @@ f7_validator_args() {
   done
 }
 
+# The SMT sibling of logical CPU c, as an offset: on this box `cpu0`'s
+# siblings are `0,128`, so the sibling of c is c + 128.
+f7_smt_offset() {
+  local siblings
+  siblings=$(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list 2>/dev/null)
+  case $siblings in
+    *,*) echo $(( ${siblings##*,} - ${siblings%%,*} )) ;;
+    *) echo 0 ;;
+  esac
+}
+
 # f7_pin <index> -- echoes the taskset prefix for that node, or nothing.
+#
+# F7_PIN_PHYSICAL=1 gives each node whole physical cores: half as many core
+# numbers, each with its SMT sibling. Without it, node i takes logical CPUs
+# 32i..32i+31, and on a 128-core / 256-thread part whose siblings are
+# (c, c+128) that puts node 0 on the same physical cores as node 4, 1 as 5,
+# 2 as 6, and 3 as the generator -- seven nodes on 112 physical cores, every
+# execution thread sharing a core with another node's. Measured before this
+# was noticed: node 2's builder executing the same blocks 2-3x slower than
+# node 0's.
 f7_pin() {
-  local i=$1 lo hi
+  local i=$1 lo hi off
   [[ $F7_PIN == 1 ]] || return 0
+  if [[ ${F7_PIN_PHYSICAL:-0} == 1 ]]; then
+    off=$(f7_smt_offset)
+    lo=$((F7_CORE_OFFSET + i * F7_CORES_PER_NODE / 2))
+    hi=$((lo + F7_CORES_PER_NODE / 2 - 1))
+    echo "taskset -c $lo-$hi,$((lo + off))-$((hi + off))"
+    return 0
+  fi
   lo=$((F7_CORE_OFFSET + i * F7_CORES_PER_NODE))
   hi=$((lo + F7_CORES_PER_NODE - 1))
   echo "taskset -c $lo-$hi"
