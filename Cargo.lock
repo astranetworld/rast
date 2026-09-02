@@ -7642,6 +7642,7 @@ dependencies = [
  "n42-clique",
  "n42-engine-primitives",
  "n42-engine-types",
+ "n42-h2-consensus",
  "n42-h2-execution",
  "n42-primitives",
  "n42-qmdb-reth",
