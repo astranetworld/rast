@@ -1667,6 +1667,26 @@ impl<E: ExecutionLayer> H2Service<E> {
         );
         match self.driver.build_block_on(head, attrs, view).await {
             Ok(built) => {
+                // The QC may have moved while the block was being built -- a
+                // leader that was behind when its tenure began sees Decides
+                // arrive during the build -- and the proposal carries the QC
+                // of the moment it is made. A block on the old QC's parent
+                // would be refused by every voter ("does not extend its
+                // justify QC's block") and the view lost; build again on the
+                // block the QC certifies now.
+                let certified_now = self.engine.locked_qc().block_hash;
+                if certified_now != B256::ZERO && certified_now != head {
+                    warn!(
+                        target: "n42.h2.node",
+                        view, built_on = ?head, certified = ?certified_now,
+                        "the QC moved during the build; the block would not extend it, building again"
+                    );
+                    self.driver.discard_prepared();
+                    self.proposed_view = None;
+                    self.proposal_deferred = true;
+                    self.defer_reason = Some("the QC moved during the build");
+                    return;
+                }
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");
                 self.remember_imported(built.hash);
                 // The proposal names the hash; the body has to get there by
