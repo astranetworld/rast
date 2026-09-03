@@ -378,7 +378,7 @@ where
     Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
     Node: FullNodeTypes<Types = Types>,
 {
-    type EVM = EthEvmConfig;
+    type EVM = EthEvmConfig<ChainSpec, crate::fast_transfer::N42EvmFactory>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         // The sender-recovery cache, as upstream's Ethereum node attaches it.
@@ -387,7 +387,12 @@ where
         // cache on the EVM config at import, and this config had none, so
         // every transaction was recovered again on the worker pool -- the
         // same pool the ingest and the prewarmer recover on.
-        let mut evm_config = EthEvmConfig::new(ctx.chain_spec());
+        // The EVM with the plain-transfer path (`fast_transfer`), off unless
+        // `N42_FAST_TRANSFER=1`.
+        let mut evm_config = EthEvmConfig::new_with_evm_factory(
+            ctx.chain_spec(),
+            crate::fast_transfer::N42EvmFactory::from_env(),
+        );
         if let Some(cache) = ctx.sender_recovery_cache() {
             evm_config = evm_config.with_sender_recovery_cache(cache.clone());
         }
