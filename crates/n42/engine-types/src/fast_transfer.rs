@@ -193,7 +193,13 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
         if to == caller || to == beneficiary || caller == beneficiary {
             return refused(5);
         }
-        if self.inner.precompiles().get(&to).is_some() {
+        // Every precompile lives below address 0x10000 (the BLS set ends at
+        // 0x11, RIP-7212 is 0x100): a recipient with any of its first
+        // eighteen bytes set is not one. The map lookup this replaces was 2%
+        // of a follower's engine thread; the rare low address still asks.
+        if to[..18].iter().any(|b| *b != 0) {
+            // not a precompile
+        } else if self.inner.precompiles().get(&to).is_some() {
             return refused(5);
         }
 
