@@ -31,9 +31,9 @@ source "$HERE/fleet7-env.sh"
 # when nothing is being measured.
 if [[ ${1:-} == --report ]]; then
   prefix=${2:?output prefix}
-  perf report -i "$prefix.data" --stdio --no-children --percent-limit 0.5 2>/dev/null |
+  perf report -i "$prefix.data" --stdio --no-inline --no-children --percent-limit 0.5 2>/dev/null |
     grep -v '^#' | grep -v '^$' | head -40 > "$prefix.flat.txt" || true
-  perf report -i "$prefix.data" --stdio --children --percent-limit 1.0 2>/dev/null |
+  perf report -i "$prefix.data" --stdio --no-inline --children --percent-limit 1.0 2>/dev/null |
     grep -v '^#' | grep -v '^$' | head -60 > "$prefix.tree.txt" || true
   echo "top symbols in $prefix:"
   head -12 "$prefix.flat.txt" | sed 's/^/  /'
