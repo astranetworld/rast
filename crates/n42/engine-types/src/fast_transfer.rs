@@ -48,6 +48,14 @@ use revm::{
 /// The gas of a call with no calldata: the whole cost of a qualifying transfer.
 const TRANSFER_GAS: u64 = 21_000;
 
+/// How many transfers have taken this path in this process.
+static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many transfers have taken this path in this process, so far.
+pub fn hits() -> u64 {
+    HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether `N42_FAST_TRANSFER=1` is set.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -280,6 +288,7 @@ where
     fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
         if self.fast && !self.inspecting {
             if let Some(done) = self.transfer(&tx).map_err(EVMError::Database)? {
+                HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(done);
             }
         }

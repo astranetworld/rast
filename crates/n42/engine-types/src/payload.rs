@@ -469,6 +469,12 @@ where
     let mut exec_ns: u128 = 0;
     let setup_took = build_started.elapsed();
     let mut stale_txs: u64 = 0;
+    // Transactions taken from the pool ahead of execution so that the
+    // accounts they touch can be read in parallel first (`N42_BUILDER_PREFETCH`).
+    let prefetch = builder_prefetch();
+    let mut lookahead: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+    let mut prefetch_ns: u128 = 0;
+    let fast_hits_before = crate::fast_transfer::hits();
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -510,19 +516,79 @@ where
         .unwrap_or_default();
 
     loop {
-        let pool_at = std::time::Instant::now();
-        let Some(pool_tx) = best_txs.next() else { break };
-        pool_ns += pool_at.elapsed().as_nanos();
-        tx_count += 1;
-        debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
-
         // Once the block cannot fit even the smallest transaction there is
         // nothing left to take: every further candidate would only be
         // refused, one refusal per queued sender -- thousands of them at the
-        // end of every full block (round 37).
+        // end of every full block (round 37). Checked before taking, so that
+        // nothing is taken from the queue and left neither built nor returned.
         if block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
+        let pool_at = std::time::Instant::now();
+        let pool_tx = if prefetch == 0 {
+            let Some(pool_tx) = best_txs.next() else { break };
+            pool_tx
+        } else {
+            if lookahead.is_empty() {
+                while lookahead.len() < prefetch {
+                    let Some(pool_tx) = best_txs.next() else { break };
+                    lookahead.push_back(pool_tx);
+                }
+                if lookahead.is_empty() {
+                    break;
+                }
+                let prefetch_at = std::time::Instant::now();
+                // The accounts these transactions read, fetched on the worker
+                // pool into the build's read cache: the serial execution then
+                // finds them there. At the bench tier almost every recipient is
+                // a cold miss, and those misses were most of the execution time.
+                {
+                    use rayon::prelude::*;
+                    let cached: &mut reth_revm::cached::CachedReads = builder.evm_mut().db_mut().database.cached;
+                    let mut wanted: Vec<alloy_primitives::Address> = Vec::with_capacity(lookahead.len() * 2);
+                    for pool_tx in &lookahead {
+                        let sender = pool_tx.sender();
+                        if !cached.accounts.contains_key(&sender) {
+                            wanted.push(sender);
+                        }
+                        if let Some(to) = pool_tx.to() {
+                            if !cached.accounts.contains_key(&to) {
+                                wanted.push(to);
+                            }
+                        }
+                    }
+                    wanted.sort_unstable();
+                    wanted.dedup();
+                    // The build's state provider is not shared across threads;
+                    // each chunk opens its own on the same parent.
+                    let parent_hash = parent_header.hash();
+                    let fetched: Vec<(alloy_primitives::Address, Option<Option<revm::state::AccountInfo>>)> = wanted
+                        .par_chunks(256)
+                        .flat_map_iter(|chunk| {
+                            let provider = client.state_by_block_hash(parent_hash).ok();
+                            chunk.iter().map(move |address| {
+                                let info = provider.as_ref().and_then(|provider| {
+                                    reth_storage_api::AccountReader::basic_account(provider, address).ok().map(|a| a.map(Into::into))
+                                });
+                                (*address, info)
+                            })
+                        })
+                        .collect();
+                    for (address, info) in fetched {
+                        // A read that failed is left for the execution to
+                        // repeat, and report.
+                        if let Some(info) = info {
+                            cached.accounts.entry(address).or_insert(reth_revm::cached::CachedAccount { info, storage: Default::default() });
+                        }
+                    }
+                }
+                prefetch_ns += prefetch_at.elapsed().as_nanos();
+            }
+            lookahead.pop_front().expect("checked non-empty")
+        };
+        pool_ns += pool_at.elapsed().as_nanos();
+        tx_count += 1;
+        debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -648,6 +714,14 @@ where
     }
 
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
+    // Whatever was taken ahead and not built goes back to the queue, last
+    // taken first so each is the queue's last and the return is O(1).
+    for pool_tx in lookahead.into_iter().rev() {
+        best_txs.mark_invalid(
+            &pool_tx,
+            InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
+        );
+    }
     let loop_done = build_started.elapsed();
 
     // check if we have a better block
@@ -836,6 +910,8 @@ where
             updated,
             setup_ms = setup_took.as_millis() as u64,
             pool_ms = (pool_ns / 1_000_000) as u64,
+            prefetch_ms = (prefetch_ns / 1_000_000) as u64,
+            fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
             exec_ms = (exec_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,
             finish_ms = finish_took.as_millis() as u64,
@@ -979,3 +1055,11 @@ fn stale_check() -> bool {
 /// The gas of the cheapest transaction (a plain transfer). A block with less
 /// than this left cannot take anything more.
 const MIN_TRANSACTION_GAS: u64 = 21_000;
+
+/// `N42_BUILDER_PREFETCH=<n>`: how many transactions the builder takes ahead
+/// of execution to read their accounts in parallel first; 0 (the default)
+/// executes straight from the pool.
+fn builder_prefetch() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("N42_BUILDER_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
