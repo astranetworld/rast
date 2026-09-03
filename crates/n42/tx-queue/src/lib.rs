@@ -233,7 +233,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             inner.last_build = Some((parent, Vec::new()));
             inner.current = None;
         }
-        QueueBest { queue: self.clone(), skipped: AddressHashSet::default() }
+        QueueBest { queue: self.clone(), skipped: AddressHashSet::default(), buffer: VecDeque::new(), batch: queue_batch() }
     }
 }
 
@@ -386,6 +386,45 @@ impl<T: PoolTransaction> Inner<T> {
 pub struct QueueBest<T: PoolTransaction> {
     queue: TxQueue<T>,
     skipped: AddressHashSet,
+    /// Transactions taken under one lock and not yet handed to the builder.
+    /// `N42_TX_QUEUE_BATCH=<n>` sets how many are taken at a time; 1 (the
+    /// default) locks once per transaction, which at the bench tier was
+    /// ~100 ms of a full block's build, 0.6 us a transaction, in the lock
+    /// and the inbox drain alone.
+    buffer: VecDeque<Arc<ValidPoolTransaction<T>>>,
+    batch: usize,
+}
+
+/// `N42_TX_QUEUE_BATCH`, read once.
+fn queue_batch() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("N42_TX_QUEUE_BATCH").ok().and_then(|v| v.parse().ok()).filter(|n| *n >= 1).unwrap_or(1))
+}
+
+impl<T: PoolTransaction> QueueBest<T> {
+    /// Returns a transaction taken but not built to the queue, and forgets
+    /// that the build took it. The taken list ends with the buffered ones,
+    /// so the search from the back is short.
+    fn untake(inner: &mut Inner<T>, transaction: Arc<ValidPoolTransaction<T>>) {
+        if let Some((_, taken)) = inner.last_build.as_mut() {
+            if let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, &transaction)) {
+                taken.remove(at);
+            }
+        }
+        inner.give_back(vec![transaction]);
+    }
+}
+
+impl<T: PoolTransaction> Drop for QueueBest<T> {
+    fn drop(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let mut inner = self.queue.inner.lock();
+        for transaction in self.buffer.drain(..) {
+            Self::untake(&mut inner, transaction);
+        }
+    }
 }
 
 impl<T: PoolTransaction> std::fmt::Debug for QueueBest<T> {
@@ -398,9 +437,32 @@ impl<T: PoolTransaction> Iterator for QueueBest<T> {
     type Item = Arc<ValidPoolTransaction<T>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut inner = self.queue.inner.lock();
-        self.queue.drain_inbox(&mut inner);
-        inner.next_ready(&self.skipped)
+        loop {
+            if let Some(transaction) = self.buffer.pop_front() {
+                // A sender the build refused meanwhile: its buffered
+                // transactions go back rather than to the builder.
+                if self.skipped.contains(&transaction.sender()) {
+                    let mut inner = self.queue.inner.lock();
+                    Self::untake(&mut inner, transaction);
+                    continue;
+                }
+                return Some(transaction);
+            }
+            let mut inner = self.queue.inner.lock();
+            self.queue.drain_inbox(&mut inner);
+            if self.batch <= 1 {
+                return inner.next_ready(&self.skipped);
+            }
+            for _ in 0..self.batch {
+                match inner.next_ready(&self.skipped) {
+                    Some(transaction) => self.buffer.push_back(transaction),
+                    None => break,
+                }
+            }
+            if self.buffer.is_empty() {
+                return None;
+            }
+        }
     }
 }
 
@@ -417,15 +479,12 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
         }
         let mut inner = self.queue.inner.lock();
         if let Some((_, taken)) = inner.last_build.as_mut() {
-            // The refused transaction is the one just yielded, all but
-            // always; a scan of everything the build took (165,000 at the
-            // bench tier, once per refused sender) was most of a full
-            // block's loop tail.
-            match taken.last() {
-                Some(last) if Arc::ptr_eq(last, transaction) => {
-                    taken.pop();
-                }
-                _ => taken.retain(|t| !Arc::ptr_eq(t, transaction)),
+            // The refused transaction is the one just yielded or one of the
+            // few buffered after it: found from the back. A scan of
+            // everything the build took (165,000 at the bench tier, once
+            // per refused sender) was most of a full block's loop tail.
+            if let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction)) {
+                taken.remove(at);
             }
         }
         if let InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
