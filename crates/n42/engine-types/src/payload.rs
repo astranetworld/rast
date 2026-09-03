@@ -525,10 +525,13 @@ where
         if block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
-        // One clock read per transaction boundary (the previous execution's
-        // end is this pull's start): the builder thread spent 17% of its
-        // time reading the clock in round 37's profile.
-        let pool_at = last_at;
+        // The pool/execution split is sampled: one transaction in
+        // `TIMED_EVERY` is timed and the sum scaled. Round 37's clock-count
+        // shim found 99.9% of the builder thread's clock reads were this
+        // loop's own per-transaction timers -- 17% of the thread at three a
+        // transaction, 13.6% at two, ~200 ns a read on this box.
+        let timed = tx_count % TIMED_EVERY == 0;
+        let pool_at = if timed { std::time::Instant::now() } else { last_at };
         let pool_tx = if prefetch == 0 {
             let Some(pool_tx) = best_txs.next() else { break };
             pool_tx
@@ -590,9 +593,10 @@ where
             }
             lookahead.pop_front().expect("checked non-empty")
         };
-        let pulled_at = std::time::Instant::now();
-        pool_ns += pulled_at.duration_since(pool_at).as_nanos();
-        last_at = pulled_at;
+        if timed {
+            last_at = std::time::Instant::now();
+            pool_ns += last_at.duration_since(pool_at).as_nanos() * TIMED_EVERY as u128;
+        }
         tx_count += 1;
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
         // ensure we still have capacity for this transaction
@@ -668,9 +672,9 @@ where
         let blob_count = tx.as_eip4844().map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let executed = builder.execute_transaction(tx);
-        let executed_at = std::time::Instant::now();
-        exec_ns += executed_at.duration_since(last_at).as_nanos();
-        last_at = executed_at;
+        if timed {
+            exec_ns += last_at.elapsed().as_nanos() * TIMED_EVERY as u128;
+        }
         let gas_used = match executed {
             Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
@@ -1075,3 +1079,6 @@ fn builder_prefetch() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("N42_BUILDER_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
+
+/// One transaction in this many is timed for the build's pool/execution split.
+const TIMED_EVERY: u64 = 32;
