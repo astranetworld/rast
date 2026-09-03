@@ -342,6 +342,40 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// layer imported. The forkchoice that starts the build makes `parent`
     /// the head (safe and finalized stay where they are), so the execution
     /// layer has to know the block already.
+    /// Asks the execution layer for a block on `parent` now, and waits for it.
+    async fn build_now(
+        &self,
+        parent: B256,
+        attrs: PayloadAttributes,
+        started: std::time::Instant,
+    ) -> Result<(BuiltBlock, std::time::Duration), ElError> {
+        let updated = self
+            .el
+            .fork_choice_updated_with_attrs_for(
+                ExecutionPath::LIVE_SEQUENTIAL,
+                self.forkchoice(parent),
+                attrs,
+            )
+            .await?;
+        let after_fcu = started.elapsed();
+        let payload_id = updated.payload_id.ok_or_else(|| {
+            ElError::new(format!(
+                "forkchoiceUpdated returned no payload id (status {:?})",
+                updated.payload_status.status
+            ))
+        })?;
+        let built = self
+            .el
+            .resolve_payload_for(
+                ExecutionPath::LIVE_SEQUENTIAL,
+                payload_id,
+                ResolveKind::WaitForPending,
+            )
+            .await
+            .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
+        Ok((built, after_fcu))
+    }
+
     pub async fn build_block_on(
         &mut self,
         parent: B256,
@@ -392,36 +426,37 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // flight and build_ms is nothing. Without, the status is reported
         // rather than a bare "no payload id": VALID-without-an-id and SYNCING
         // mean very different things to an operator.
+        // A build prepared ahead is trusted only if the block it delivered
+        // really extends the parent asked for: round 38 saw a build ahead
+        // resolve in 2 ms with a block on the previous parent, which every
+        // voter then refused as not extending the justify QC.
+        let ahead = match ahead {
+            Some(built) if built.execution_data.payload.parent_hash() == parent => Some(built),
+            Some(built) => {
+                warn!(
+                    target: "n42.h2.el",
+                    asked = ?parent,
+                    delivered_on = ?built.execution_data.payload.parent_hash(),
+                    block = ?built.hash,
+                    "the build prepared ahead extends another parent; building now"
+                );
+                None
+            }
+            None => None,
+        };
         let (mut built, after_fcu, after_resolve, ahead) = match ahead {
             Some(built) => (built, started.elapsed(), started.elapsed(), true),
             None => {
-                let updated = self
-                    .el
-                    .fork_choice_updated_with_attrs_for(
-                        ExecutionPath::LIVE_SEQUENTIAL,
-                        self.forkchoice(parent),
-                        attrs,
-                    )
-                    .await?;
-                let after_fcu = started.elapsed();
-                let payload_id = updated.payload_id.ok_or_else(|| {
-                    ElError::new(format!(
-                        "forkchoiceUpdated returned no payload id (status {:?})",
-                        updated.payload_status.status
-                    ))
-                })?;
-                let built = self
-                    .el
-                    .resolve_payload_for(
-                        ExecutionPath::LIVE_SEQUENTIAL,
-                        payload_id,
-                        ResolveKind::WaitForPending,
-                    )
-                    .await
-                    .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
+                let (built, after_fcu) = self.build_now(parent, attrs, started).await?;
                 (built, after_fcu, started.elapsed(), false)
             }
         };
+        if built.execution_data.payload.parent_hash() != parent {
+            return Err(ElError::new(format!(
+                "the execution layer built on {} when asked for {parent}",
+                built.execution_data.payload.parent_hash()
+            )));
+        }
 
         // The block the execution layer built is not necessarily the block
         // this node proposes: a chain whose header carries the view needs it
