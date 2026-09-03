@@ -3845,3 +3845,40 @@ parallel prefetch of the next batch's accounts into the build's read
 cache (`N42_BUILDER_PREFETCH=<n>`, 2e1e9611b; a state provider per chunk,
 since the build's own is not `Sync`) is the answer to that, measured
 below.
+
+### 24 recovery slots: slower, and sloped
+
+| leg | slots | fast | win1 | win2 | win3 | cycle |
+| --- | --- | --- | --- | --- | --- | --- |
+| loop4S | 24 | off | 228,174 | 217,324 | 201,026 | 0.698-0.811 s |
+| loop4SF | 24 | on | 222,758 | | | 0.732 s |
+| loop4S2 | 24 | off | 222,752 | | | 0.714 s |
+| loop4SF2 | 24 | on | 228,192 | | | 0.714 s |
+
+Every block full, every leg below the 16-slot legs, and inside a leg the
+followers' import climbs 373 -> 465 ms by 20-block bucket (+25%; the
+build 527 -> 600, +14%) where the 16-slot legs drift 1-7%. Eight more
+niced recovery threads per node take cores from the builder and the
+engine, progressively. Out. (The gov5 session's rule, adopted here: a
+leg whose first-to-last bucket level moves more than ~20% has no level
+to compare; `bucket-report` prints the drift beside every leg.)
+
+### Builder prefetch: a net loss, and the fast path never fired on the leader
+
+| leg | prefetch | fast | win1 | win2 | build | exec | prefetch | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| loop5P | 4096 | off | 228,192 | 222,758 | 552 ms | 247 | 34 ms | 0.698 s |
+| loop5PF | 4096 | on | 228,152 | 222,757 | 552 ms | 248 | 33 ms | 0.714 s |
+| loop5N | 0 | off | **233,624** | **233,625** | ~531 ms | ~264 | 0 | 0.682 s |
+| loop5PF2 | 4096 | on | 228,192 | 228,172 | | | | 0.714 s |
+
+Reading the next batch's 8,000 accounts in parallel costs 34 ms a block
+and takes 17 ms off the execution phase: the cold reads are not where the
+builder's 1.5 µs a transaction goes either. And the build's new `fast=`
+counter is **0** on every leader block with `N42_FAST_TRANSFER=1` -- the
+path that took 40 ms off the followers' import never applied on the
+builder, so the "interpreter is not the cost" verdict above was drawn
+from a leg where the interpreter was never bypassed on the leader. The
+refusal counters (fe393c159) and a `perf` profile of the leader's build
+(profiling binary, `--profile-node`) are the next instrument; the
+prefetch stays in the tree, off.
