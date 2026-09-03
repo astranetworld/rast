@@ -116,6 +116,21 @@ pub struct OwnBlockReuse {
     pub qmdb: Option<n42_qmdb_reth::QmdbNodeState>,
     /// Into the engine loop.
     pub inserts: tokio::sync::mpsc::UnboundedSender<reth_node_builder::executed_inserts::ExecutedInsert>,
+    /// Takes the block's transactions out of the pool the moment the block is
+    /// in the tree, so the next build does not select them again. Opt-in.
+    ///
+    /// The pool learns of a canonical block through its maintenance task,
+    /// asynchronously, and at 163,000 transactions a block that lags behind
+    /// a leader that builds every view: a tenure leader's builder was
+    /// measured pulling 327,000 transactions a build of which 163,000 were
+    /// the previous block's, paying the pool iteration twice and an account
+    /// read per stale transaction. Pruning here made `stale` zero and the
+    /// round slower: reth removes transactions one at a time under the
+    /// pool's write lock, 260-293 ms for a block's worth, and that is the
+    /// same cost the maintenance pays later -- so on the import path it is
+    /// on the critical path instead of beside it. The pool's per-transaction
+    /// removal is the wall, not when it happens.
+    pub prune_pool: Option<std::sync::Arc<dyn Fn(Vec<alloy_primitives::B256>) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for OwnBlockReuse {
@@ -182,6 +197,12 @@ where
         return None;
     }
     let body = built.block.body().clone();
+    // For the engine's newPayload of this block, which follows the hand-off:
+    // its conversion finds the block here instead of decoding the payload.
+    n42_engine_types::built_executions::remember_sealed(
+        sealed_hash,
+        SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
+    );
     let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(
         SealedBlock::from_sealed_parts(sealed_header, body),
         built.block.senders().to_vec(),
@@ -208,6 +229,23 @@ where
     }
     match tokio::time::timeout(std::time::Duration::from_secs(2), handed).await {
         Ok(Ok(true)) => {
+            if let Some(prune) = reuse.prune_pool.clone() {
+                let hashes: Vec<alloy_primitives::B256> =
+                    built.block.body().transactions().map(|tx| *tx.tx_hash()).collect();
+                let count = hashes.len();
+                let pruned_at = std::time::Instant::now();
+                // Synchronous, on a blocking thread: the removal holds the
+                // pool's write lock, and it has to be done before this returns
+                // so the next build, armed by this import, starts on a pool
+                // without them.
+                let _ = tokio::task::spawn_blocking(move || prune(hashes)).await;
+                info!(
+                    target: "n42.payload_serve",
+                    count,
+                    prune_ms = pruned_at.elapsed().as_millis() as u64,
+                    "own block's transactions taken out of the pool"
+                );
+            }
             info!(
                 target: "n42.payload_serve",
                 number = v1.block_number,
@@ -283,6 +321,12 @@ fn sealed_header_from_fields(
     None
 }
 
+/// `N42_PAYLOAD_SERVE_FRESH_BUFFERS`, read once.
+fn fresh_buffers() -> bool {
+    static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FRESH.get_or_init(|| std::env::var("N42_PAYLOAD_SERVE_FRESH_BUFFERS").is_ok())
+}
+
 pub async fn serve<T>(
     addr: SocketAddr,
     payloads: PayloadBuilderHandle<T>,
@@ -293,7 +337,15 @@ where
     T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
-    info!(target: "n42.payload_serve", %addr, "raw payload channel listening");
+    // Said at start-up so a round can grep that its switch reached this
+    // process: a variable that is set but never arrived measures nothing.
+    info!(
+        target: "n42.payload_serve",
+        %addr,
+        fresh_buffers = fresh_buffers(),
+        own_block_reuse = reuse.is_some(),
+        "raw payload channel listening"
+    );
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -323,6 +375,13 @@ where
     T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     stream.set_nodelay(true)?;
+    // Buffers retained across frames. A newPayload frame is ~19 MB at the
+    // bench tier and a served payload the same; allocated fresh per block
+    // they are fresh pages first-touched on every block on every node --
+    // measured as the followers' page-fault rate doubling in a round and
+    // their runtime threads' time going to the kernel. Grown once, reused.
+    let mut frame: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
     loop {
         let kind = match stream.read_u8().await {
             Ok(kind) => kind,
@@ -334,10 +393,17 @@ where
             if len > 256 << 20 {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload frame too large"));
             }
-            let mut frame = vec![0u8; len];
-            stream.read_exact(&mut frame).await?;
+            // N42_PAYLOAD_SERVE_FRESH_BUFFERS=1 restores a fresh allocation per
+            // frame, for the A-B-A that separates buffer reuse from the box.
+            if fresh_buffers() {
+                frame = Vec::new();
+                out = Vec::new();
+            }
+            frame.clear();
+            frame.resize(len, 0);
+            stream.read_exact(&mut frame[..]).await?;
             let started = std::time::Instant::now();
-            let mut out: Vec<u8> = Vec::with_capacity(96);
+            out.clear();
             match raw_engine::decode_execution_data(&frame) {
                 Err(err) => {
                     out.push(2);
@@ -354,8 +420,42 @@ where
                         Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
                         None => false,
                     };
+                    // The transactions' bytes, kept for the prune below; the
+                    // payload itself goes to the engine.
+                    let raw_transactions = data.payload.as_v1().transactions.clone();
                     match engine.new_payload(data).await {
                         Ok(status) => {
+                            // A block this node now holds: its transactions
+                            // leave the pool at once rather than when the
+                            // pool's maintenance gets to them. On a follower
+                            // that is what keeps `pending` honest -- the
+                            // ingest gate reads it, and a block's 163,000
+                            // still counted as pending after the block was
+                            // imported is what stalled the whole fleet's
+                            // supply for the length of one node's maintenance.
+                            if status.status == alloy_rpc_types_engine::PayloadStatusEnum::Valid
+                                && !reused
+                                && let Some(prune) = reuse.as_ref().and_then(|r| r.prune_pool.clone())
+                            {
+                                let pruned_at = std::time::Instant::now();
+                                let count = raw_transactions.len();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    use rayon::prelude::*;
+                                    let hashes: Vec<B256> =
+                                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect();
+                                    prune(hashes);
+                                })
+                                .await;
+                                if count > 10_000 {
+                                    info!(
+                                        target: "n42.payload_serve",
+                                        number,
+                                        count,
+                                        prune_ms = pruned_at.elapsed().as_millis() as u64,
+                                        "imported block's transactions taken out of the pool"
+                                    );
+                                }
+                            }
                             if txs > 10_000 {
                                 info!(
                                     target: "n42.payload_serve",
@@ -393,7 +493,7 @@ where
         let started = std::time::Instant::now();
         let resolved = payloads.resolve_kind(id, PayloadKind::WaitForPending).await;
         let waited = started.elapsed();
-        let mut out: Vec<u8> = Vec::new();
+        out.clear();
         match resolved {
             None => out.push(0),
             Some(Err(err)) => {

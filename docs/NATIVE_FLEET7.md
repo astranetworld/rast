@@ -25,6 +25,44 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
 
+## Where it stands today: 255,358 TPS (2026-09-03)
+
+The record on this fleet, bookended (round 37, `loop11A`/`loop11A2`):
+
+| window | TPS | blocks | cycle | occupancy |
+| --- | ---: | ---: | ---: | ---: |
+| win1 | **252,617** | 47 | 0.638 s | 98.9% |
+| win2 | **255,358** | 47 | 0.638 s | 100% |
+| win3 | 244,488 | 45 | 0.667 s | 100% |
+
+Seven nodes, every follower executing every transaction and computing the
+QMDB root, senders recovered on every node, bodies over direct push with
+GossipSub as the fallback, 163,000 transactions a block at the 480M gas
+ceiling. Same-binary spread on window 1 is 1-4%, so nothing under ~5% is a
+result. The configuration, all in the environment of `fleet7-bench.sh`:
+
+```bash
+F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1 N42_TX_INGEST_ASYNC=1 \
+F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250 F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1 \
+N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DIRECT=1 \
+N42_FAST_TRANSFER=1 \
+scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 6000 --conc 64 --rpcbatch 100
+```
+
+How it got here, in the order the rounds found it (each has its section
+below): the RPC block cache evicting the page cache (round 34, 4 blocks);
+the builder's per-transaction state read and clone (round 36); the full
+block's refusal tail and the own-block conversion (round 37: 190k -> 233-239k);
+the plain-transfer path without the interpreter, which only reached the
+builder once the payload service used the node's EVM factory (round 37:
+248-255k). Measured and rejected on the way: 24 recovery slots (slower and
+sloped), a parallel account prefetch (cold reads are 17 ms a block), a
+tighter view timeout, jemalloc knobs, RocksDB memtable size.
+
+The cycle is now set by the followers -- publish -> receive 74 ms,
+receive -> vote 447 ms, vote -> decide 120 ms -- not by the leader's build,
+which the build-ahead hides. The next 300k is a follower-side job.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
@@ -1259,7 +1297,8 @@ summary of what they say, not a re-measurement.
 
 | client | figure | what it measures |
 | --- | ---: | --- |
-| this fleet | ~13,700–16,000 tps | 7 nodes, full signature recovery, QMDB root computed per block, bodies over GossipSub, 480M gas, 250 ms pacing |
+| this fleet, round 13 | ~13,700–16,000 tps | 7 nodes, full signature recovery, QMDB root computed per block, bodies over GossipSub, 480M gas, 250 ms pacing |
+| **this fleet, round 37** | **252,617 / 255,358** | same path (every follower executes, QMDB root per block, senders recovered), direct push, queue-fed builder, plain transfers applied without the interpreter (`N42_FAST_TRANSFER=1`), 0.638 s cycle |
 | gov5 | 22,089 @ 0.98 s | 7 nodes, same 480M tier, full path (`docs/QS_TPS_BENCHMARK.md`) |
 | gov5 | 32,381 @ 0.496 s | as above at half the block interval |
 | N42-26 | **13,858** | "2s slot, all optimizations" — the row their own records call *more production-like* |
@@ -1275,9 +1314,12 @@ records**". Its first flag disables transaction verification. Every round in thi
 document recovers every sender and computes a real state commitment.
 
 Against the row N42-26 itself labels production-like — 13,858 at a 2 s slot —
-this fleet's 13,714–16,000 is the same order, at a quarter of the block
-interval, and at 1.4–2.0 GB of resident memory against the 39.1 GiB their round
-38 records for seven nodes.
+this fleet's round-13 figure of 13,714–16,000 was the same order at a quarter
+of the block interval. As of round 37 the fleet's **255,358** is 1.6x N42-26's
+*controlled* 156,500, on the path their own records call production-like:
+every follower executes, every sender is recovered, every block carries a real
+state commitment (the section on round 37 has the bookends and the
+same-binary spread).
 
 What is worth taking from their work is not the number but two of the levers
 behind it. The first is already here: their round 42 "partitions the 256 logical
@@ -1294,9 +1336,11 @@ and it is a feature rather than a flag.
 ## Where it stands
 
 Seven all-Rust members produce the native chain at its 3 s period, agree on
-every head hash, restart one at a time without losing their place, sustain 200
-transactions a second without refusing one, and cost between 1.37 and 1.70 GB
-between them depending on load. What is measured here is a chain from genesis; the
+every head hash, restart one at a time without losing their place, and on the
+bench chain sustain **252,617-255,358 transactions a second** (round 37,
+bookended; 200 tx/s of gossiped load without refusing one on the 3 s chain).
+Resident memory was 1.37-1.70 GB between them at that early load and is 3-4 GB
+per execution layer at the bench tier. What is measured here is a chain from genesis; the
 flagship chain is thirteen million blocks and thirty-five gigabytes of state,
 and three things stand between this and it.
 
@@ -3250,3 +3294,799 @@ did not, and the per-window figure to log next to the TPS is the
 generator's rate and the deepest pool. A rule, from the same source: "the
 machine is idle" is an average; a synchronised fleet's instantaneous core
 demand is seven times its profile's.
+## Round 32: on the tenure, the pool is the wall
+
+Branch `feat/tenure-leader`, one round (`prune1`), the tenure configuration
+of round 29 (tenure 16, ingest-all, no transaction gossip, async ingest,
+direct push).
+
+### What a tenure leader's builder was pulling
+
+Round 30's logs, read for the builder: a tenure leader's builds show
+`txs=327,000 stale=163,000` on every second block — the pool still held the
+previous block's transactions when the next build began, so the builder
+walked 327,000 to select 163,000 and paid an account read for each stale one.
+The pool learns of a canonical block through its maintenance task,
+asynchronously; a round-robin leader has six other blocks of slack before
+it builds again, a tenure leader has none. Pool phase 177-299 ms per build
+against ~75 in round-robin.
+
+### Removing them at import: right diagnosis, wrong cure
+
+The raw payload channel now can take a block's transactions out of the pool
+the moment the block is in the tree, own build or `newPayload` Valid
+(`N42_PRUNE_POOL_ON_IMPORT=1`, off by default). It made `stale` zero on every
+build — and cost **260-293 ms per block** under the pool's write lock
+(`remove_transactions`, one transaction at a time), so the round was slower:
+windows 21/21/14 blocks, cycle mean 1.763 s.
+
+That figure is the finding. It is the same work the pool's maintenance does
+when the block goes canonical — the ~300 ms write-lock stall the other
+session measured on the ingest — so the prune moved the cost onto the
+critical path rather than removing it. On a tenure leader the pool is
+therefore about half a second of every block: ~200 ms to select from a
+400,000-transaction pool and ~300 ms to remove the block's transactions,
+both under the lock the ingest needs. reth's pool was not built for
+163,000-transaction blocks every 0.8 s, and the tenure route runs into that
+before it runs into execution.
+
+### What would remove it
+
+A builder-side transaction source beside reth's pool rather than inside it:
+the binary ingest already validates and recovers every transaction; kept in
+per-sender nonce order in a plain queue, selection is a linear walk (N42-26's
+drain is 20 ms on the same block size) and removal on inclusion is a pop.
+reth's pool would still receive everything for RPC and gossip, off the
+leader's path. A block that fails to commit would need its transactions
+re-queued from the built payload, which the builder has. It changes what the
+pool is for on this fleet, which is a design decision rather than a tuning
+one, and is recorded here as the next item on the tenure route rather than
+started.
+
+Also seen and not explained: node 2's builder executes the same blocks in
+774-860 ms where node 0 takes 242-292 (in round 30's logs as well). Something
+about that node — its cores (64-95) or its datadir — and any leader-side
+number from it should be read with that in mind.
+
+### Re-read under whole physical cores
+
+`phys1`, the same tenure configuration with round 31's pinning (prune off):
+window 1 142,331 TPS (27 blocks, 1.111 s), then 108,557 / 99,578; full-block
+cycle mean 1.408 s, median 1.379 s. Every tenure leader's builds show
+`stale=0`: with each node on its own physical cores the pool's maintenance
+keeps up with a leader that builds every view, so the stale half of round
+32's finding was SMT contention, not the pool's design. What stands is the
+selection: 116-220 ms per build from a 400,000-transaction pool against
+~75 in round-robin, and the ingest's gate engaged (deepest pool 440,476
+against 407,500) while the fleet's pools held a block's worth of
+not-yet-maintained transactions each.
+
+Leader execution per build ranged 220-771 ms across the round with no
+monotonic trend inside a tenure; the nodes that led later in the round were
+slower (node 0 median 260 ms, nodes 2-4 413-485). The box is one NUMA node
+with sixteen L3 instances, so that is not locality; it is consistent with
+the state growing through the round (round 28), and is the reason a leader-
+side number needs the round position it was taken at.
+
+## Round 33: the leader drift was 512 threads, and the first two windows over 150,000
+
+Branch `feat/tenure-leader` (403c934ca), tenure 16, 250 ms pacing, `--ingest-all`,
+async ingest, whole physical cores. Everything below is from single rounds
+unless it says otherwise; the spread rule of round 27 stands.
+
+### The builder-side queue
+
+`crates/n42/tx-queue` (`N42_TX_QUEUE=1`): validated, recovered transactions per
+sender in nonce order, senders in arrival order, fed from the pool's own
+new-transaction listener, pruned on every node by canonical blocks, drained
+by the payload builder in place of the pool's iterator; a build on the same
+parent gets the previous build's transactions back. Builder pool phase
+116-220 ms -> 66-88 ms. The ingest's gate reads the queue's depth when one is
+installed (the pool's pending count carries a block's transactions until its
+maintenance hears of the block).
+
+Two supply defects surfaced immediately, both breaches of the one invariant a
+supply path has, per-sender nonce order:
+
+- **The async ingest reordered a sender's frames.** One task per frame,
+  eight in flight per connection: frame k+1 reached the pool before frame k,
+  the pool parked the gapped ones in `queued`, and a builder reading in nonce
+  order stopped that sender at the hole for the whole build. Rounds queue3/4:
+  115,730 queued, 58,569 built; 129,500 queued, 54,064 built. Fix: recovery
+  still parallel, one in-order admitter per connection (the bounded channel
+  is the back-pressure). After it a queue of 39,122 built a block of 39,665.
+- **The pool's listener drops on a full channel (1,024) and never resends**,
+  so a lane can miss a nonce for good. The builder now reports a nonce above
+  the account's as `NonceNotConsistent` (reth reports every refusal as
+  `TxTypeNotSupported`); the queue records the hole and the feed looks the
+  pool up for it.
+
+Persistence every 8 blocks against every 2: identical (queue3 vs queue4, win1
+130,583 vs 129,854), which removed persistence from the drift list.
+
+### The drift
+
+Since round 28 a leader's execution per transaction rose through a round —
+node 0 at 1.6 µs, the nodes leading later at 4-6 — and the state's growth was
+the standing explanation. It is not. The same binary in a round with a weak,
+erratic generator (prof2: 40% occupancy, a 7.5 s stall) gave every leader
+1.31-1.46 µs, late tenures included; stale counts are ~0 in all rounds. The
+cost tracks the generator, not the state.
+
+The ingest recovered senders with one `spawn_blocking` per frame and no
+bound: 64 connections x 8 frames in flight = up to 512 blocking threads of
+secp256k1 on a node pinned to 16 physical cores. The builder's thread got a
+slice of a core exactly when the generator pushed hardest, which is late in a
+round. `N42_TX_INGEST_RECOVER_PARALLEL=<n>` (a node-wide semaphore) and
+`N42_TX_INGEST_RECOVER_NICE=<n>` (recovery threads at a lower priority):
+
+| round | recovery | win1 | win2 | win3 | total | leaders µs/tx |
+| --- | --- | --- | --- | --- | --- | --- |
+| queue6 | unlimited | 119,752 (63%) | 81,779 | 80,031 | 8.46M | 1.5 → 5.0 |
+| queue7 | cap 6 | 140,898 (23%) | 117,147 | 110,646 | 11.06M | 1.37-1.50 flat |
+| rp10 | cap 10 | 184,661 (33%) | 89,244 | 75,029 | 10.47M | 1.4-4.0 |
+| rp14 | cap 14 | **203,051** (50%) | 89,021 | 85,245 | 11.33M | 1.4-3.7 |
+| rpnice | unlimited, nice 10 | 143,262 (40%) | 98,133 | 104,983 | 10.44M | 1.5-3.5 |
+| rp8nice | cap 8, nice 10 | **167,692** (28%) | **152,731** (29%) | 84,015 | **12.14M** | 1.3-1.4, node 0's 2nd tenure 3.6 |
+
+(occupancy in parentheses; 250 ms pacing, so 110 blocks in a window is the
+floor.) With the cap at 6 every leader is flat and the chain runs at the
+pacing floor at a quarter occupancy: the leader is idle most of the time and
+the generator, 128k/s, is the whole wall. Raising the cap raises the first
+window (203,051 is the first window over 200,000, at half occupancy) and
+brings the drift back, on the leader and — the part that matters — on the
+followers' import, whose engine thread shares the same cores: a follower that
+imports late prunes late, its queue reaches the gate, and the generator waits
+for the slowest node. Cap 8 with nice 10 held two consecutive windows above
+150,000 at 28% occupancy.
+
+Part of round 31's +26% from physical-core pinning was this contention;
+re-measure pinning after the budget lands. The follower's "700 ms import"
+carries the same signature and should be re-read under the budget too.
+
+### What the third window is
+
+Not the gate and not the state. Post-prune queue depth on every node stayed
+under 252k; the flood's rate fell from 167k/s (t = 20-35 s) to 147k (50 s),
+73k (65 s), 58k (80 s) while the queues held 40-110k and the workers spent
+90% of their time waiting for the ingest's answer. That is `add_transactions`
+starving on the pool's write lock: at 0.3 s blocks the pool's maintenance (a
+block's removals, 200-300 ms at 163,000) holds the lock most of the time, and
+the faster the chain the less admission gets — the collapse is the speed's
+own doing. Also `--pertx 2500 x 6000 senders = 15M` is within a round's reach
+now (12.8M sent). The remedy is the other branch's: feed the queue from the
+ingest directly (`TxQueue::push` builds the pool's `ValidPoolTransaction`
+itself) and let the pool carry RPC traffic only.
+
+### Practice
+
+Confirm a build succeeded before reading a round: queue5 ran queue3's binary
+(a missing dependency, a grep that hid the error, `F7_SKIP_STALE_CHECK`
+letting the round go) and would have been read as "ordered admission changes
+nothing". The launchers now abort when the binary is older than the source.
+
+### Addendum: the parallel trie's partial last group, and the direct path
+
+Round direct1 (the other branch's `N42_TX_INGEST_DIRECT=1`: after recovery a
+frame goes straight into the builder's queue and never touches the pool; the
+pool's share of an ingest answer went from 20-400 to 4-9 µs/tx) reached
+**190,102 TPS** in window 1 at the pacing floor and a third of occupancy, then
+fell to 80k. The fall was mine: block 319 (8,200 transactions) sealed a
+transactions root no follower could reproduce, nobody voted, and the leader —
+whose own import does not re-validate its own block — kept proposing for the
+rest of its tenure.
+
+The parallel trie (round 26) hands each 256-leaf group's subtrie root to the
+top-level builder as a branch node at the group's prefix. When the item count
+is 2 to 16 past a multiple of 256, the last group's members all share their
+next nibble, the subtrie's root is an extension node, and the parent puts a
+second extension in front of it. Full blocks of 163,000 (residue 184) never
+hit it; the test list (4,097; 65,537; 163,000) never did either. Fixed in
+84202bb47 — such a group's members go up as leaves — with a test over every
+residue modulo 256 at three- and four-byte keys, which reproduced 8,194
+before the fix.
+
+direct2 (direct path + fix): 0 root mismatches, no mid-round timeouts,
+175,079 / 99,733 / 113,458. Windows 2-3 are not readable: a 33.5 GB process
+that was not ours was on the box with the 7 GB swap fully used, and node 3's
+follower import went from 2.1 µs/tx to 4-7 in bursts (block 240: 49k at 7.0;
+block 253: 74k at 2.4). A round needs a quiet box in memory as well as in
+cores; `free -g` and `ps` by RSS join the pre-round checks. Also learned:
+`fleet7-bench.sh` leaves the fleet up, and `fleet7.sh down`'s SIGTERM did not
+stop these nodes — verify with `pgrep` after every down.
+
+### Addendum 2: what the round-position collapse is not, and what the profile says
+
+Every direct-path round (direct2-5, cache8, dwarf1-3) reaches 175-196k TPS in
+window 1 at a third of occupancy and then falls to 80-120k from about 35-45 s
+into the flood: the followers' import goes from 2.0 µs/tx to 4-12, the queue
+backs up to the gate on the slowest node, and the generator throttles. Ruled
+out, one round each, same configuration: the recovery budget (cap 8 + nice
+10 is in every round), persistence interval, jemalloc purging (disabled: TLB
+shootdowns 11/s, collapse unchanged), the queue's lock (inbox: unchanged),
+the sender-recovery cache (x4: unchanged; x1/32, every sender recovered on
+import: 184,918 / **121,727** / 73,825 -- the best second window, and the
+collapse 20 s later). The cap-6 round (generator 128k/s, below the chain's
+rate, no backlog) stayed flat through 11M transactions, so the trigger is
+the backlog forming, not the state's size.
+
+The profile (node 6, a follower, 88k dwarf samples at flood+45 s): 80% of
+samples are tokio runtime threads 17 kernel frames deep with no user frame
+the unwinder could recover, spinning on one kernel address (87.8% of the
+frame-pointer capture in prof3 too, entered through libc's `syscall()`
+wrapper, which is what std, parking_lot and tokio use for futex -- and
+what the ingest's sockets use for nothing). The engine thread's samples
+enter the kernel from `mdbx_get -> cursor_seek -> tree_search_finalize`
+into a 34-frame page-fault chain that passes through a filesystem module:
+MDBX's mmap pages are not in the page cache when the importer reads them.
+A 33.5 GB process that is not ours (`n42-datc-25m-hi4.bin`) was on the box
+for every one of these rounds, and the gov5 session measured no such
+collapse on its client (22,857-transaction blocks, QMDB, 3m45s flat).
+
+Naming the 17 kernel frames needs `/proc/kallsyms` or `System.map`, both
+root-only on this box. That is the open item; the fix depends on which
+syscall it is.
+
+### Addendum 3: the collapse is kernel time on the runtime's workers, and its rate is page faults
+
+Three more rounds of the other branch's gate watcher (574401f23: one
+watcher task and a `Notify` instead of a 2 ms poll per connection) changed
+nothing: 194,894 / 93k / 68k, 193,774 / 125k / 86k, 194,702 / 85k / 71k. Nor
+did jemalloc keeping large allocations in its arenas (`oversize_threshold:0`
+plus no decay): 138,984 / 81,740, the collapse earlier.
+
+What the in-process diagnostics say (read from `/proc` by the launcher; the
+`syscall` file and `strace` are refused even to an ancestor under
+`ptrace_scope` 1, so the syscall is not named): at flood+50 s all sixteen
+tokio workers of a follower spend 92% of wall time in kernel mode, running,
+not blocked -- 28.9-35.7 cores of system time on a node pinned to 16
+physical cores (its SMT siblings included) against 0.4 at flood+10 s in the
+same round. The sockets carry 6-7 MB/s then, so it is not a copy. Page
+faults (software events, no root): 48k/s at flood+10 s, 95k/s at flood+50 s
+on one node, 65% of them on the tokio workers inside libc's `memmove` --
+first touch of fresh pages during copies -- plus 3.2k/s major faults (MDBX
+pages not in the page cache, the engine thread's 34-frame chain through the
+filesystem module). Machine-wide during a round: 200-700k faults/s, 20-50k
+major/s, half of the majors the foreign 33.5 GB `n42-datc` job. The box is
+one NUMA node, so one zone; sixteen faulting workers per node, seven nodes
+and a scanning job all take its allocator and LRU locks, and one spinning
+kernel address at 88% of a follower's samples is what that looks like. That
+is the reading; the name of the function needs `/proc/kallsyms` (root).
+
+Two clean negatives stand: the gov5 client on the same box, same hour, shows
+no collapse (22,857-transaction blocks, 3m45s flat), and the cap-6 round
+(generator below the chain's rate, no backlog) stayed flat through 11M
+transactions. Whatever the kernel function is, it is reached only when this
+client is pushed past its rate.
+
+### Addendum 4: the validator's body store, bookended
+
+The supply session's A-B-A of its frame reuse (three legs, all flat at
+~4.3 µs/tx on the followers, windows 2-3 at 120-125k) had one thing in every
+leg that no collapsing round had: e3eca2e95 -- the body channel's pooled
+receive buffers and the validator's body store cut from 4,096 remembered
+bodies to 64. Bookended here with `N42_H2_REMEMBERED_BODIES` on this tree
+(without the supply session's ingest `BufReader`), direct configuration,
+conditions sampled every 5 s, read in the declared order:
+
+| leg | store | win1 | win2 | win3 | follower µs/tx | collapse | datc / available GB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| s64a | 64 | 186,219 | 84,449 | 100,030 | 2.0-2.3 → 7-10 | +34 s | 89→32 / 75→33 |
+| s4096 | 4,096 | 105,940 | 71,469 | 83,281 | 2.1 → 4.5 → 9.2 | +24 s | 33 / 89→42 |
+| s64b | 64 | 188,980 | 75,635 | 81,297 | 1.8-2.3 → 7-10 | +37 s | 35-39 / 87→35 |
+
+The bookends agree; the middle leg is 43% lower in window 1 and collapses
+ten seconds earlier under the best memory conditions of the three. The
+store cut is real and large. The collapse is not the store: both s64 legs
+have it. What the flat legs had and these lack is the 1 MiB `BufReader` on
+the ingest's read half -- two `read(2)` per transaction at 190k/s is
+~400k syscalls/s per node on the runtime workers, and the earlier magnitude
+argument priced a syscall uncontended, which under 20-60k major faults/s it
+is not. That is the supply session's A-B-A, next.
+
+Also from the conditions log: the fourteen node processes take 20-30 GB of
+the box's available memory within the first 30 s of every flood (QMDB's
+append-only entries, the pool, the caches), and the collapse came at 44-59
+GB available -- no single threshold, so not a memory cliff by itself, but
+the slope is ours. `MALLOC_CONF` in jem1/jem2: the supply session's environ
+dump was of its own legs, not those rounds; f7_spawn is a plain
+setsid/exec, so the variable very probably arrived and those two rounds
+stand as ordinary negatives, by inference.
+
+### Addendum 5: the collapse, named
+
+The supply session's A-B-A on the ingest's read buffer (one binary,
+f0f6f7bdb, the switch verified in the EL's environ per leg, direct
+configuration, conditions every 5 s):
+
+| leg | ingest reads | win1 | win2 | win3 | follower µs/tx | machine major faults/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| bufA1 | 1 MiB buffer | 169,233 | 119,435 | 119,486 | 3.8-5.1 flat | 32-35k |
+| bufB1 | unbuffered | 190,445 | 97,765 | 84,932 | 5.9-8.1 | 87-112k |
+| bufA2 | 1 MiB buffer | 194,753 | 123,149 | 124,889 | 4.0-5.2 flat | 33-36k |
+
+Bookends agree; the middle leg does what the prediction said. The
+within-round collapse every direct-path round showed was the ingest reading
+each transaction with two `read(2)` calls -- a 4-byte length and a ~110-byte
+body -- on tokio's unbuffered `TcpStream`: ~400,000 syscalls a second per
+node on the runtime workers, on the cores the follower imports on, under a
+box taking 20-100k major faults a second from a neighbour. That is what
+"sixteen workers at 92% system time, running, one hot kernel address"
+was, and why it appeared only when the generator outran the chain (more
+frames in flight, more reads) and never in the cap-6 round. The fix is the
+1 MiB `BufReader` on the ingest's read half (0a8a64097, cherry-picked
+here). The body store cut (addendum 4) is a separate, bookended win.
+
+Held over for a quiet box: the followers now import at ~4.5 µs/tx from
+the first full block (1.3-1.4 s full-block cycle, 120-125k in windows 2-3)
+where the s64 legs showed 2.0-2.6 before their collapse -- neighbour or
+ours is the open question, and it needs the datc job gone.
+
+### Addendum 6: the cross-block cache, bookended, and the block-size cost
+
+The gov5 session found the same neighbour costs its client 5% and ours
+2.5x, and the candidate was reth's cross-block cache: this fleet sets it to
+128 MB (round 22, inert on a quiet box), too small for a 2M-account working
+set, so every block reads ~326k accounts from MDBX's mmap, which a 100 GB
+scan can evict. A-B-A under the neighbour on purpose (direct configuration,
+the EL's argument checked per leg, conditions every 5 s):
+
+| leg | cache | win1 | win2 | win3 | follower full / mid µs/tx | leaders µs/tx |
+| --- | --- | --- | --- | --- | --- | --- |
+| c128a | 128 MB | 152,668 | 119,195 | 119,493 | 4.27 / 2.33 | 3.0-3.8 |
+| c4096 | 4,096 MB | 137,669 | 114,032 | 114,027 | 4.12 / 2.24 | 3.0-4.1 |
+| c128b | 128 MB | 151,324 | 119,478 | 119,458 | 4.17 / 2.19 | 3.3-3.7 |
+
+Bookends agree; the middle leg is within 5%. The cache size is not this
+client's exposure. (The 5%-vs-2.5x contrast itself was then withdrawn by
+the gov5 session: its generator wrote every transfer to one sink address,
+1,201 accounts a block against our 163,000, so its per-transaction numbers
+describe a workload ours does not run and every cross-client comparison
+built on them is void until re-measured.)
+
+What the three legs show that does not depend on any other rig: within one
+round, a follower imports 30-150k-transaction blocks at 2.2-2.3 µs/tx and
+163k blocks at 4.1-4.3 -- the per-transaction cost nearly doubles with
+block size. That is why window 1 (55k blocks at the pacing floor) runs
+150-195k TPS while full blocks give 120k at a 1.37 s cycle. Whether it is
+the working set outgrowing the L3 slices or something per-block that is
+quadratic (revm's State cache, the bundle, the hashed-state build) is open;
+the lever is testable either way: gas ceiling 3.42G / 1.5G / 3.42G.
+
+### Addendum 7: block size, rotation, and what a follower pays that a leader does not
+
+Two more A-B-As on the direct configuration (conditions every 5 s, the
+datc job present at 33-45 GB throughout), read bookends first.
+
+**Gas ceiling** 3.42G / 1.5G / 3.42G: 172,977 / 124,935 / 114,018;
+144,896 / 116,628 / 121,364; 193,951 / 119,349 / 114,030. Windows 2-3 do
+not move with 70k-transaction blocks. The bins do: node 3 imports 25-100k
+blocks at 2.10-2.27 µs/tx in both bookends and 163k blocks at 4.05-4.33,
+while gcB's 50-75k blocks -- full ones, drawn from a backlog -- cost 3.96.
+
+**Rotation vs runs** (`N42_TX_QUEUE_RUN` 1 / 256 / 1): followers 4.32 /
+4.44 / 4.47 on full blocks; 173,994 / 130,344 / 119,464; 182,138 / 141,219 /
+119,442; 187,279 / 124,932 / 124,931. Sender locality is not it (the gov5
+builder drains senders in runs and shows the same rise).
+
+What the raw per-block data say. On a leader, within one tenure and one
+minute (node 6, runA2, blocks 208-223): 30-65k blocks execute at 1.3-1.8
+µs/tx, 88k at 2.07, 148k at 2.31, 165k at 3.0-3.65 -- execution is
+superlinear in transactions per block on the same node at the same moment,
+neighbour-independent: the in-block state (revm's cache and bundle, ~326k
+accounts by the end of a full block) outgrows the caches and is rehashed as
+it grows. On a follower the transition is equally sharp in time (#217 at
+2.01, #218 one second later at 4.04) but a 70k full block costs it 3.96
+where the leader pays ~2 for that size: a second component that appears
+only with a backlog and only on import. The leader has its senders from the
+queue; the follower recovers them through a direct-mapped cache whose slots
+a deep backlog overwrites -- the hypothesis discarded in the morning was
+measured under the syscall collapse and masked by it. A-B-A of
+`F7_SENDER_CACHE_MULT` 2 / 8 / 2 is running as this is written; if it
+holds, the structural fix is to carry the leader's recovered senders in the
+raw payload (3.3 MB a block) so import costs what the build costs.
+
+### Addendum 8: the full-block cost is page cache, and the page cache is memory
+
+Whole-round counters on a follower's engine thread (prof8/prof9, 5 s
+buckets joined with the transactions it executed in each): ~12k user
+instructions and ~7k user cycles per transaction in every bucket, 58k
+blocks and 163k blocks alike -- CPU per transaction is constant at 2.2-2.5
+µs. The two-point ratios reported earlier were normalisation errors (the
+sampled node was leading during the "partial" window). What doubles is wall
+time: engine_ms per transaction 2.37 at partial blocks, equal to CPU, and
+3.7-4.9 at full blocks, with the thread's context switches rising from 1.5k
+to 10-14k per 5 s. The engine thread waits.
+
+What it waits on (prof10/prof11, `/proc/<tid>/{stat,wchan,io}` sampled by
+the launcher): at full blocks 25-31% of samples in `folio_wait_bit_common`,
+101-134 of 1,000 in D state; at partial blocks none. The thread's own
+`read_bytes` is 0 at partial blocks and 26 MB/s at full blocks with
+`rchar` 0 -- disk reads through the mapping, i.e. MDBX page faults, the
+`cursor_seek` chain from the morning. Machine major faults 837/s against
+55,444/s; seven importers at 26 MB/s are most of that. `--db.sync-mode`
+durable / safe-no-sync / durable: 4.52 / 4.39 / 4.38 µs/tx, D-state 26 / 25
+/ 25% -- not writeback, eviction.
+
+Why later in every round (mem1, 20 s samples): the EL grows 0.78 -> 7.9 GB
+over a flood (seven of them), validators 1-1.4 GB, machine AnonPages 41 ->
+99 GB with the datc job at 31-45 GB, and the page cache falls 28 -> 8.7 GB
+at flood+35 s -- the collapse moment -- against ~55 GB of MDBX, static and
+RocksDB files the fleet reads. After the flood the EL falls back to 2.5 GB:
+most of the growth is transient (retained transactions, blocks awaiting
+persistence, jemalloc's dirty pages held for its 10 s decay). Bookended
+non-causes from the same series: gas ceiling (block size), sender runs,
+sender-cache size, cross-block cache size, sync mode. The leaders' new
+per-block log shows a full block changes ~5k accounts (created ~2k,
+updated ~3k): the flood's recipients repeat, so composition is small and
+constant.
+
+Levers, in order: the fleet's own memory per node (allocator decay under
+test; retained blocks; the queue's 400k transactions), then the neighbour,
+then residency of the maps (mlock needs a memlock limit this user lacks).
+
+## Round 34: 190,000 TPS sustained -- the RPC block cache was eating the page cache
+
+The chain of evidence (addenda 8-9): a follower's engine thread costs a
+constant 2.2-2.5 µs per transaction; on full blocks it waited a quarter of
+the time on file pages (D state, `folio_wait_bit_common`), reading MDBX
+through its mapping at 26 MB/s because the box's page cache had fallen to
+9 GB; it fell because the fourteen node processes grew 50-60 GB during a
+flood; the EL's share was 4.24 GB of decoded transactions of every block
+imported since the flood began (jemalloc heap profile, `prof_prefix:` with a
+colon), held by a canonical-notification subscriber -- the tree stayed at
+7-9 blocks and our own subscribers and the pool's maintenance task never
+lagged (`Receiver::len()` logged) -- and the one subscriber left was reth's
+RPC eth cache, which `fleet7-env.sh` set to 256 blocks at the bench tier.
+
+A-B-A, `--rpc-cache.max-blocks` 256 / 4 / 256 (receipts 64 / 4 / 64), direct
+configuration, the datc neighbour at 45-71 GB throughout:
+
+| leg | cache | win1 | win2 | win3 | follower µs/tx | EL RSS | page cache |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rpcA1 | 256 | 159,120 | 119,346 | 113,997 | 4.35 full / 2.56 | 1.8 → 6.9 GB | 35 → 11 GB |
+| rpcB | 4 | **195,508** | **192,226** | **190,984** | 2.14 (no full block) | 1.3 → 2.5 GB | 16 → 50 GB |
+| rpcA2 | 256 | 155,277 | 119,435 | 119,496 | 4.22 full / 2.32 | 1.4 → 7.0 GB | 28 → 11 GB |
+
+Three consecutive windows above 190,000 at the pacing floor (110 blocks a
+window, 0.273 s cycles, a third of occupancy), every follower executing,
+no collapse, the page cache growing through the flood instead of
+collapsing. The cache at four is now the fleet default. The neighbour is
+still on the box; the residual to a quiet box is unmeasured.
+
+### The distribution, and the neighbour
+
+Three rounds with the cache at four (rpcB, rpc4a, rpc4b), the datc job's
+residency sampled every 5 s beside them:
+
+| round | win1 | win2 | win3 | total | follower µs/tx | datc GB | page cache |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rpcB | 195,508 | 192,226 | 190,984 | 17.4M | 2.14 | 41-46 | 16 → 53 GB |
+| rpc4a | 155,666 | 141,217 | 130,246 | 12.8M | 3.00 | 40-66 | 24 → 11 GB |
+| rpc4b | 191,324 | 189,246 | 103,185 | 14.5M | 2.62 | 41-63 | 25 → 11 GB |
+
+Medians 191,324 / 189,246 / 130,246. Two rounds of three hold above 189,000
+for two windows; the third window of rpc4b and all of rpc4a fall when the
+neighbour's residency passes ~50 GB and the page cache is back at 11 GB.
+With the fleet's own retention gone, sustained throughput on this box is
+set by what the page cache has left after the neighbour: at ~45 GB it is
+above 190,000 for three windows; at 60 GB and more the eviction returns.
+The generator's ~195k/s is the ceiling of the good rounds, not the chain.
+
+### Round 35: the quiet box, and throughput is not monotonic in block size
+
+The datc job left the box at 04:08 (0 GB, 115 GB available) and the armed
+launcher took the window under the claim protocol agreed with the gov5
+session (claim file, randomised 20-50 s wait, re-check; the older claim
+wins, ties to them, claims older than 30 min are stale). Recovery slots
+8 / 16 / 8 on the rpcB configuration:
+
+| leg | slots | win1 | win2 | win3 | generator | occupancy / cycle | follower µs/tx |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| recB1 | 8 | 193,157 | 193,813 | 193,687 | 190-200k/s | 33% / 0.27 s | 2.17 |
+| recB16 | 16 | 179,287 | 179,291 | 179,292 | 217k/s at +5 s | 97-100% / 0.88-0.91 s | 2.18 |
+| recB2 | 8 | 195,567 | 193,534 | 191,876 | 189-199k/s | 33% / 0.27 s | 2.12 |
+
+With 8 slots the chain sits on the generator's ceiling: the flood's workers
+spend 85% of their time waiting for the ingest's answer, which in the
+asynchronous path is written only once a recovery slot is taken, so the
+ceiling is 8 slots x ~4.5 ms per 100-transaction frame per node. Sixteen
+slots lift the supply to 217k/s, the backlog fills the blocks, and the
+full-block cycle -- 0.9 s for 163k, leaders at 1.3-1.4 µs/tx and followers
+at 2.2 -- caps the chain at 179k. Partial blocks at the 250 ms floor
+(~203k/s of capacity) beat full ones (~180k); the curve is non-monotonic,
+and the regime switch is self-reinforcing once a backlog exists. So the
+generator cannot be raised alone: the pacing floor has to drop with it
+(125 ms with 16 slots is the next leg), or the block size has to be capped
+below the point where the cycle leaves the floor.
+
+## Round 36: the builder loop, bookended -- 190,161 in the full-block regime
+
+`fleet7-phases` on the full-block regime named the leader's build the
+critical path (median 805 ms against a 370-440 ms follower import; decide
+-> publish 758 ms median), and the build's own phases left ~295 ms a block
+in the loop around the executor: pool 108, exec 222, finish 57, assemble
+10, total 694, loop 625. Two things in that loop ran on every transaction:
+a state read of the sender's account to skip a stale transaction before
+executing it (redundant with a queue pruned by canonical blocks, and the
+executor refuses a stale one anyway), and a second clone of the
+transaction into the executor. Both removed (9ee6ce0eb; the read stays
+behind `N42_BUILDER_STALE_CHECK=1`).
+
+Bookend with yesterday's binary as the A legs (`target/release-old`),
+16 recovery slots so the fleet sits in the full-block regime, fresh
+datadirs every leg (so every leg is equally cold), phases per leg:
+
+| leg | binary | win1 | win2 | win3 | build median | loop residual | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| loopA1 | old | 178,754 | 173,857 | 184,470 | 803 ms | 306 ms | 0.88-0.94 s |
+| loopB | new | **190,161** | **190,155** | **190,161** | 734 ms | 232 ms | 0.857 s |
+| loopA2 | old | 179,293 | 179,293 | 179,294 | ~803 ms | ~306 ms | 0.909 s |
+
+The full-block ceiling moves from ~179k to 190k (+6%), and the numbers
+fit: the residual fell 74 ms, not the ~200 the two removals were priced
+at, so the state read was cheaper than assumed (a warm revm cache hit) and
+~232 ms a block -- 1.4 µs a transaction -- of loop bookkeeping remains
+unattributed, the next target on the leader. The follower's import
+(432-441 ms) is now within 70 ms of the build in this regime.
+
+## Round 37: past 200,000 -- the full-block tail, the own-block conversion, and where the leader's time really goes
+
+The user's target moved on 2026-09-03: **over 200k now, 300k later.** At
+163,000 transactions a block that is a cycle under 0.815 s, then under
+0.543 s.
+
+### Two leader-side fixes, bookended at 233-239k
+
+The loop residual of round 36 was the full block's tail: once the block
+was full the builder kept taking one candidate per queued sender (6,000)
+and each refusal scanned the 165,000 transactions the build had taken to
+drop the refused one. Now the queue pops the refused transaction when it
+is the last yielded (always) and the builder stops before taking anything
+once less than a transfer's gas is left (782334c92, 2e1e9611b for the
+"check before taking" order -- a transaction taken and left neither built
+nor returned is lost from the queue's lanes).
+
+The leader's own-block import (113 ms of the 0.78 s cycle) was half a
+redundant conversion: after the build was handed to the engine as
+executed, the engine's `newPayload` decoded the 163,000 transactions
+again to find the block already in its tree. Skipping that `newPayload`
+was **wrong** and the leg refused to start: the hand-off's acknowledgement
+means "queued", the `newPayload` is what proves the insert landed (and
+executes the block if it did not), and without it the next forkchoice
+read Syncing. Kept, made cheap instead: the hand-off registers the sealed
+block under its hash and the validator's conversion takes it from there
+(eaaf134c1). Own import 127 -> 71 ms.
+
+Same box, quiet, 16 recovery slots, fresh datadirs, `target/release-old`
+= round 36's binary:
+
+| leg | binary | win1 | win2 | win3 | build | loop | own import | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| loop2A1 | old | 193,617 | 195,594 | 190,160 | | | | 0.833 s |
+| loop2A2 | old | 195,593 | 190,155 | 190,160 | | | | 0.811-0.857 s |
+| loop3B | new | **233,625** | **228,192** | 169,728* | 544 ms | 476 | 71 | 0.682 s |
+| loop3A | old | 195,591 | 195,592 | 190,159 | 614 ms | 548 | 127 | 0.811-0.857 s |
+| loop3B2 | new | **239,052** | **228,192** | 158,862* | 531 ms | 470 | 72 | 0.667 s |
+
+(*) window 3 of the new legs is the flood's 24M budget (6,000 x 4,000)
+running out at +103 s, not the chain: `--pertx 6000` from here on. The old
+legs' same-binary spread is 1-3% on window 1; the new binary is +20% on
+the same window, and the cycle moved with it. **The goal of 200k is met
+in the full-block regime, bookended.**
+
+### The fast transfer path: right on the followers, invisible on the leader
+
+`N42_FAST_TRANSFER=1` (39810f139) applies a plain transfer -- a call with
+no calldata, no access list, no blob, no authorisation, between accounts
+without code, on Prague/Osaka -- without the interpreter: revm's own
+arithmetic in revm's order, the accounts its journal would return, the
+result its handler would build, tested byte-equal against the interpreter
+on the same pre-state. Everything else goes to the interpreter. Every
+node still executes every transaction.
+
+| leg | fast | win1 | win2 | build exec | follower engine | import barrier |
+| --- | --- | --- | --- | --- | --- | --- |
+| loop3B2 | off | 239,052 | 228,192 | 267 ms | 371 ms | 446 ms |
+| loop3F | on | 239,055 | 232,905 | 263 ms | 340 ms | 406 ms |
+
+Two readings. Window 1 matching to three transactions means both legs sit
+on the same bound. The first guess -- the ingest's ceiling at 16 recovery
+slots -- was wrong, and the 24-slot leg that was meant to lift it said so:
+228,174 / 217,324 / 201,026 with every block full and a 0.70-0.81 s
+cycle, i.e. *slower* -- eight more recovery threads take cores from the
+builder and the engine. The bound at 16 slots is the leader's build
+(531 ms + own import 72 + seal ~30 = the 0.667 s cycle), and the fast
+path's saving lands on the followers, off the critical path. The phases
+say the same: the followers' import barrier fell 40 ms (the interpreter
+was ~10% of their import), the leader's execution phase did not move at
+all. The builder's 1.6 µs a transaction is therefore
+not the interpreter; it is the state reads -- two million recipients,
+almost every one a cold miss on the parent state, read serially. A
+parallel prefetch of the next batch's accounts into the build's read
+cache (`N42_BUILDER_PREFETCH=<n>`, 2e1e9611b; a state provider per chunk,
+since the build's own is not `Sync`) is the answer to that, measured
+below.
+
+### 24 recovery slots: slower, and sloped
+
+| leg | slots | fast | win1 | win2 | win3 | cycle |
+| --- | --- | --- | --- | --- | --- | --- |
+| loop4S | 24 | off | 228,174 | 217,324 | 201,026 | 0.698-0.811 s |
+| loop4SF | 24 | on | 222,758 | | | 0.732 s |
+| loop4S2 | 24 | off | 222,752 | | | 0.714 s |
+| loop4SF2 | 24 | on | 228,192 | | | 0.714 s |
+
+Every block full, every leg below the 16-slot legs, and inside a leg the
+followers' import climbs 373 -> 465 ms by 20-block bucket (+25%; the
+build 527 -> 600, +14%) where the 16-slot legs drift 1-7%. Eight more
+niced recovery threads per node take cores from the builder and the
+engine, progressively. Out. (The gov5 session's rule, adopted here: a
+leg whose first-to-last bucket level moves more than ~20% has no level
+to compare; `bucket-report` prints the drift beside every leg.)
+
+### Builder prefetch: a net loss, and the fast path never fired on the leader
+
+| leg | prefetch | fast | win1 | win2 | build | exec | prefetch | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| loop5P | 4096 | off | 228,192 | 222,758 | 552 ms | 247 | 34 ms | 0.698 s |
+| loop5PF | 4096 | on | 228,152 | 222,757 | 552 ms | 248 | 33 ms | 0.714 s |
+| loop5N | 0 | off | **233,624** | **233,625** | ~531 ms | ~264 | 0 | 0.682 s |
+| loop5PF2 | 4096 | on | 228,192 | 228,172 | | | | 0.714 s |
+
+Reading the next batch's 8,000 accounts in parallel costs 34 ms a block
+of *waiting* -- the builder blocks on the batch before executing it, so
+`prefetch_ms` is critical-path delay, not background work -- and takes
+17 ms off the execution phase: the cold reads are not where the builder's
+1.5 µs a transaction goes either, and 17 ms is the most that removing
+them could ever buy. And the build's new `fast=`
+counter is **0** on every leader block with `N42_FAST_TRANSFER=1` -- the
+path that took 40 ms off the followers' import never applied on the
+builder, so the "interpreter is not the cost" verdict above was drawn
+from a leg where the interpreter was never bypassed on the leader. The
+refusal counters (fe393c159) and a `perf` profile of the leader's build
+(profiling binary, `--profile-node`) are the next instrument; the
+prefetch stays in the tree, off.
+
+### The builder never had the node's EVM -- fixed, and the fast path lands: 248,580 / 249,923
+
+The refusal counters answered the zero-hit question at once: the leader's
+builds showed `fast=0` with no refusals either, i.e. the builder never
+consulted the path. `spawn_payload_builder_service` constructed its own
+`EthEvmConfig::new(chain_spec)` and ignored the node's EVM configuration,
+so every leader-side EVM change of the day (and the sender-recovery
+cache attached in `build_evm`) had reached the engine only. The builder
+now takes the node's factory (9d95b8e0f). Same binary, 16 slots, the
+flag alone:
+
+| leg | fast | win1 | win2 | win3 | build (buckets) | exec | follower engine | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| loop7F | on | 244,531 | 152,093* | 146,615* | | 509 | 702 | 0.652 -> 1.11 s |
+| loop7N | off | 239,057 | 233,617 | 222,758 | 509-555 (+3.8%) | 248-270 | 357-385 | 0.667-0.732 s |
+| loop7F2 | on | **248,580** | **249,923** | **239,058** | 439-489 (+3.5%) | 177-202 | 329-349 | 0.638-0.682 s |
+
+The interpreter was ~70 ms of the builder's execution phase (0.43 µs a
+transfer) and ~30 ms of a follower's import; the cycle follows the
+builder, +4-7% on TPS. (*) loop7F collapsed after window 1 with 2.1
+million system-wide major faults and a page cache that did not grow
+(11 GB flat where every other leg reaches 57-69 GB), the round-34
+signature; the repeat did not, and the bundle written through revm's
+`State` is equal to the interpreter's field by field (tests
+17bf429c5), so it is not the path. Cause not established -- a
+`perf report` of the 2.3 GB profiling binary, without `--no-inline`,
+was running on the box at the time (that flag is now in
+`fleet7-profile.sh`; with it a report takes 35 s, without it it did not
+finish in 17 minutes).
+
+The engine thread's profile with the path on has no single hotspot: the
+transfer itself 12% (three account lookups and clones), revm's
+`CacheAccount::change` 7.5%, `State` lookups 6+3%, `TransitionAccount`
+and its maps ~7%, `Account::from` 3.4%, prometheus histogram + `quanta`
+timers ~4%, the receipt-root channel 1.3%. The remaining cost is revm's
+per-transaction state bookkeeping and reth's per-transaction
+instrumentation, spread thin.
+
+### The builder's own profile: a long tail, and a fifth of it reading the clock
+
+Profiles of one node (`--profile-node 0`) missed the leader's tenure
+twice -- node 0 leads 16 blocks in 112 -- so the builder's profile came
+from a `perf record` of all seven execution layers at once, 45 s into
+the flood (`bench-prof3/profile-all.data`; `--sort pid` names threads as
+`tid:comm`, and the builder's is `payload-builder`). Relative to that
+thread, fast path on:
+
+| share | where |
+| --- | --- |
+| 17.5% + 2% | `[vdso]` and `clock_gettime`: reading the clock (clocksource is tsc) |
+| 11.5% | libc, unsymbolised (memmove of the clones, most likely) |
+| ~15% | revm's `State`: `CacheAccount::change`, `TransitionAccount::update`, `apply_account_state`, the maps |
+| 5.1% | the transfer path itself (three account lookups, three `Account::from`) |
+| 4.3% + 1.9% + 1% | the pool transaction's clone to consensus, `TxEnv` from it, its drop |
+| 3% | SipHash: the queue's `HashMap<Address, Lane>` and `HashSet<Address>` on std's `RandomState` |
+| 2.4% + 1.1% | the queue's `drain_inbox` and `next` |
+| 2.1% | keccak |
+
+No single hotspot; the largest is the clock. The loop's own three
+`Instant::now()` a transaction (~2%, the `clock_gettime` line) do not
+account for 17% in the vDSO, and the frame-pointer chains do not say who
+does (they stop at the vDSO boundary); a DWARF-unwound profile of the
+`payload-builder` threads is the next leg. The two known parts are fixed
+(5976f6ef2: alloy's address hasher in the queue, one clock read per
+transaction boundary) and bookended in the same round.
+
+The followers' engine thread, same profile: the transfer path 9.9%,
+`CacheAccount::change` 7.3%, `State` 6.6%, `Account::from` 3.2%,
+`PrecompilesMap::get` 2.1% (the path's precompile check), prometheus
+histogram + `quanta` ~3%, the per-transaction channels to the receipt-root
+task and from the payload-convert thread ~3.5%. The persistence thread is
+RocksDB's memtable skip list (56%) -- off the critical path.
+
+### Convention on this box (2026-09-03)
+
+Whenever a session finishes a round or stops, the hardware goes to the
+other sessions; once every session's work is done, the datc job is
+started again and continues. Each session starts datc on its own user's
+say-so, not on a relayed instruction.
+
+### Who reads the clock: the loop itself (a counting shim where perf could not unwind)
+
+perf cannot unwind through the vDSO here (no DWARF for it, no LBR on this
+EPYC, uprobes need root), so the callers came from an `LD_PRELOAD` shim
+on `clock_gettime` that counts per thread and, one call in 512, records
+the Rust caller three frames up through `backtrace()`, dumping at thread
+exit (the build threads are short-lived; a periodic dump alone lost
+them). Legs prof5/prof6 ran it on the whole fleet -- **instruments, not
+measurements: their TPS is excluded** (interposition sends every clock
+read through the PLT).
+
+Result: 99.9% of the builder thread's clock reads are `payload.rs:241`,
+`default_n42_payload` inlined into `try_build` -- this loop's own
+per-transaction `Instant::now()`, 309,000 a block at two a transaction
+(9.9M reads over the 32 blocks one node built); jemalloc's decay ticker
+is 11 a block, tracing none. The pre-registered prediction ("the bulk is
+called from outside the loop; jemalloc, else tracing") was wrong on its
+main clause. A read costs 21 ns in a tight loop on this box (tsc,
+constant/nonstop), so 309k reads are ~6.5 ms a block against the 63 ms
+the profile charged to the vDSO: part of that share is sampling skid
+onto rdtsc. The timers are now sampled, one transaction in 32
+(cb169b2b7), and bookended; registered before the legs: build level
+-10 to -60 ms, TPS +1 to +9%, under 1% meaning the profile's share was
+mostly skid.
+
+Bookend of the two earlier fixes (hasher, one read per boundary),
+fast on, 16 slots: A 241,744 / 244,492 / 244,471, B 249,921 / 249,926 /
+239,058, A2 251,259 / 254,798 / 239,050, B2 251,218 / **255,353** /
+244,458 -- indistinguishable, as predicted (same-binary spread 4%); the
+fix validated on the profile instead: libc `clock_gettime` 2.05% ->
+0.20%, both SipHash symbols gone from the builder thread.
+
+### Sampled timers, bookended: 20 ms off the build, nothing off the cycle -- the critical path has moved
+
+| leg | binary | win1 | win2 | win3 | build buckets 120-200 |
+| --- | --- | --- | --- | --- | --- |
+| loop11A | two reads/tx | 252,617 | 255,358 | 244,488 | 423-433 ms |
+| loop11B | sampled | 250,955 | 254,642 | 244,398 | 395-412 ms |
+| loop11A2 | two reads/tx | 250,441 | 255,356 | 249,664 | |
+| loop11B2 | sampled | 249,925 | 255,352 | 243,161 | |
+
+Registered before the legs: a build level at least 40 ms lower means
+the profile's 63 ms was real, within ±10 ms means skid, between is
+undecided. It landed at ~20 ms: undecided by the letter, and the
+reading is that a third of the profile's vDSO share was real time and
+two thirds sampling skid onto rdtsc. (The one-in-32 sampling biased the
+pool/execution split itself -- the scaled sums overshot the build --
+so the split is now timed with rdtsc, d2d4692f6.)
+
+The cycle did not move at all, 0.638 s in all four legs, and the
+phases say why: publish -> receive 74 ms, receive -> vote 447 ms,
+vote -> decide 120 ms, sum 0.64 s. **The followers' import is the
+critical path now**; the leader's build (~410 ms) plus its own import
+(~70 ms) sits under the build-ahead and no longer sets the cycle. The
+vote -> decide 120 ms is the spread of the followers' imports (barrier
+median 460-479 ms, p90 570), since a decision needs five of seven.
+From here the target is the follower's 447 ms: decode 13, conversion
+62, execution ~300 with the fast path, the rest bookkeeping -- of which
+the engine thread's profile names the per-transaction metrics and
+`quanta` (~4%), the receipt-root and payload-convert channels (~3.5%)
+and the precompile lookup (2%, replaced by an address check,
+d1bca8315).

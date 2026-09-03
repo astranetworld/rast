@@ -31,6 +31,69 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// How many received buffers the listener keeps for reuse. A body is 13-15
+/// MB at the bench tier; a fresh `Vec` per block meant the kernel zeroed and
+/// mapped ~3,800 pages for every block on every follower, and those first
+/// touches were most of the runtime threads' page faults in round gate5.
+const POOLED_BUFFERS: usize = 8;
+
+/// Buffers handed out by [`listen`] and returned when a [`BodyBuf`] drops.
+#[derive(Debug, Default)]
+pub struct BufPool {
+    free: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl BufPool {
+    fn take(&self) -> Vec<u8> {
+        self.free.lock().unwrap_or_else(|p| p.into_inner()).pop().unwrap_or_default()
+    }
+
+    fn give(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        let mut free = self.free.lock().unwrap_or_else(|p| p.into_inner());
+        if free.len() < POOLED_BUFFERS {
+            free.push(buf);
+        }
+    }
+}
+
+/// A block body's bytes. From the channel they sit in a pooled buffer that
+/// goes back to the pool when this drops; from anywhere else they are a
+/// plain `Vec`. Dereferences to the bytes.
+#[derive(Debug)]
+pub struct BodyBuf {
+    buf: Vec<u8>,
+    pool: Option<Arc<BufPool>>,
+}
+
+impl BodyBuf {
+    /// The bytes as an owned `Vec`, copied.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.buf.clone()
+    }
+}
+
+impl std::ops::Deref for BodyBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl From<Vec<u8>> for BodyBuf {
+    fn from(buf: Vec<u8>) -> Self {
+        Self { buf, pool: None }
+    }
+}
+
+impl Drop for BodyBuf {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.give(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
 /// Largest body accepted, so a stray connection cannot make this node
 /// allocate without bound.
 const MAX_BODY_BYTES: u32 = 256 << 20;
@@ -43,9 +106,10 @@ const PER_PEER_QUEUE: usize = 4;
 /// Returns once bound; the accept loop runs on its own task. A body is
 /// delivered as the bytes that arrived, for the same decode a pushed body
 /// gets.
-pub async fn listen(addr: SocketAddr, sink: mpsc::Sender<Vec<u8>>) -> std::io::Result<()> {
+pub async fn listen(addr: SocketAddr, sink: mpsc::Sender<BodyBuf>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(target: "n42.h2.node", %addr, "body channel listening");
+    let pool = Arc::new(BufPool::default());
     tokio::spawn(async move {
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -56,8 +120,9 @@ pub async fn listen(addr: SocketAddr, sink: mpsc::Sender<Vec<u8>>) -> std::io::R
                 }
             };
             let sink = sink.clone();
+            let pool = Arc::clone(&pool);
             tokio::spawn(async move {
-                if let Err(err) = receive(stream, sink).await {
+                if let Err(err) = receive(stream, sink, pool).await {
                     debug!(target: "n42.h2.node", %peer, %err, "body channel connection ended");
                 }
             });
@@ -66,7 +131,7 @@ pub async fn listen(addr: SocketAddr, sink: mpsc::Sender<Vec<u8>>) -> std::io::R
     Ok(())
 }
 
-async fn receive(mut stream: TcpStream, sink: mpsc::Sender<Vec<u8>>) -> std::io::Result<()> {
+async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<BufPool>) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     loop {
         let len = match stream.read_u32_le().await {
@@ -77,8 +142,10 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<Vec<u8>>) -> std::io:
         if len == 0 || len > MAX_BODY_BYTES {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("body of {len} bytes")));
         }
-        let mut body = vec![0u8; len as usize];
+        let mut body = pool.take();
+        body.resize(len as usize, 0);
         stream.read_exact(&mut body).await?;
+        let body = BodyBuf { buf: body, pool: Some(Arc::clone(&pool)) };
         if sink.send(body).await.is_err() {
             return Ok(());
         }
@@ -209,9 +276,9 @@ mod tests {
         let body: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
         assert_eq!(pushers.push(Arc::new(body.clone())), 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
-        assert_eq!(got, body);
+        assert_eq!(&got[..], &body[..]);
         assert_eq!(pushers.push(Arc::new(vec![7u8; 10])), 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
-        assert_eq!(got, vec![7u8; 10]);
+        assert_eq!(&got[..], &[7u8; 10][..]);
     }
 }

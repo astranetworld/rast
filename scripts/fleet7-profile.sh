@@ -31,9 +31,9 @@ source "$HERE/fleet7-env.sh"
 # when nothing is being measured.
 if [[ ${1:-} == --report ]]; then
   prefix=${2:?output prefix}
-  perf report -i "$prefix.data" --stdio --no-children --percent-limit 0.5 2>/dev/null |
+  perf report -i "$prefix.data" --stdio --no-inline --no-children --percent-limit 0.5 2>/dev/null |
     grep -v '^#' | grep -v '^$' | head -40 > "$prefix.flat.txt" || true
-  perf report -i "$prefix.data" --stdio --children --percent-limit 1.0 2>/dev/null |
+  perf report -i "$prefix.data" --stdio --no-inline --children --percent-limit 1.0 2>/dev/null |
     grep -v '^#' | grep -v '^$' | head -60 > "$prefix.tree.txt" || true
   echo "top symbols in $prefix:"
   head -12 "$prefix.flat.txt" | sed 's/^/  /'
@@ -50,7 +50,7 @@ fi
 # the feature.
 #
 #   cargo build --profile profiling -p n42 --bin n42 --features jemalloc-prof
-#   MALLOC_CONF=prof:true,prof_active:true,lg_prof_interval:30,prof_prefix=<dir>/heap \
+#   MALLOC_CONF=prof:true,prof_active:true,lg_prof_interval:30,prof_prefix:<dir>/heap \
 #     F7_BIN=target/profiling scripts/fleet7-bench.sh --tag alloc
 #   scripts/fleet7-profile.sh --alloc <dir>/heap
 #

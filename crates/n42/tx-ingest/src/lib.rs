@@ -81,6 +81,59 @@ const MAX_FRAME_TXS: u32 = 10_000;
 /// block's demand: the length of the pool stall it is meant to cover.
 const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
 
+/// How many frames may be in sender recovery at once, node-wide:
+/// `N42_TX_INGEST_RECOVER_PARALLEL`, unlimited by default. Unlimited, 64
+/// connections with 8 frames in flight each are 512 blocking threads of
+/// secp256k1 on a node pinned to 16 cores, and the builder's thread -- and
+/// the engine's import -- get a slice of a core while the generator is busy.
+/// The nice value recovery threads run at: `N42_TX_INGEST_RECOVER_NICE`,
+/// 0 by default. At 10 or more, the scheduler gives the builder's and the
+/// engine's threads the core whenever they are runnable and recovery the
+/// cycles nobody else wants -- a budget that follows the load instead of a
+/// fixed one.
+fn recovery_nice() -> i32 {
+    static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *NICE.get_or_init(|| {
+        std::env::var("N42_TX_INGEST_RECOVER_NICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|n| n.clamp(0, 19))
+            .unwrap_or(0)
+    })
+}
+
+/// Lowers the calling thread's priority to [`recovery_nice`], once per
+/// thread; blocking-pool threads are reused, so this is a few syscalls a
+/// frame at most.
+fn apply_recovery_nice() {
+    thread_local! {
+        static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let nice = recovery_nice();
+    if nice == 0 || APPLIED.with(|a| a.replace(true)) {
+        return;
+    }
+    // SAFETY: setpriority on the calling thread (PRIO_PROCESS with a thread
+    // id) is a plain syscall with no memory effects; a failure leaves the
+    // priority as it was.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, nice);
+    }
+}
+
+fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let permits = std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS);
+        std::sync::Arc::new(tokio::sync::Semaphore::new(permits))
+    })
+}
+
 /// Largest single transaction, in bytes.
 const MAX_TX_BYTES: u32 = 1 << 20;
 
@@ -93,6 +146,83 @@ const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// sensible default for a fleet whose pool holds far more: a gate above the
 /// pool's own capacity never closes, and one far below it starves the builder.
 /// Sized by the round, which knows its own pool depth.
+/// What the gate measures: the builder-side queue's depth when one is
+/// installed (`N42_TX_QUEUE=1`), else the pool's pending count. The pool's
+/// count includes a block's transactions until the pool's maintenance hears
+/// of the block, which at this block size is long after the builder took
+/// them; the queue's count is what the next build can still use.
+/// `N42_TX_INGEST_DIRECT`, read once.
+fn direct_to_queue() -> bool {
+    static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIRECT.get_or_init(|| std::env::var("N42_TX_INGEST_DIRECT").is_ok())
+}
+
+/// Whether the gate lets a frame through: the queue's depth (the pool's
+/// pending without a queue) against the high-water mark, plus one block's
+/// allowance for each block the chain is ahead of the pool.
+fn gate_open<P: TransactionPool + 'static>(
+    pool: &P,
+    head: &std::sync::Arc<AtomicU64>,
+    gate: usize,
+    allowance: u64,
+) -> bool
+where
+    P::Transaction: 'static,
+{
+    let lag = head
+        .load(Ordering::Relaxed)
+        .saturating_sub(pool.block_info().last_seen_block_number)
+        .min(4);
+    u64::try_from(queue_depth(pool)).unwrap_or(u64::MAX) < gate as u64 + lag * allowance
+}
+
+/// The node's gate: connections held at the high-water mark wait here, and
+/// one watcher task ([`spawn_gate_watcher`]) wakes them when the depth is
+/// back under it.
+struct Gate {
+    open: tokio::sync::Notify,
+    waiting: AtomicU64,
+}
+
+static GATE: Gate = Gate { open: tokio::sync::Notify::const_new(), waiting: AtomicU64::new(0) };
+
+/// Polls the gate every `GATE_POLL` while anyone is waiting on it, and wakes
+/// every waiter when it is open; idles at a slower rate otherwise.
+fn spawn_gate_watcher<P>(pool: P, head: std::sync::Arc<AtomicU64>, gate: usize, allowance: u64)
+where
+    P: TransactionPool + 'static,
+    P::Transaction: 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            if GATE.waiting.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(GATE_POLL * 10).await;
+                continue;
+            }
+            tokio::time::sleep(GATE_POLL).await;
+            if gate_open(&pool, &head, gate, allowance) {
+                GATE.open.notify_waiters();
+            }
+        }
+    });
+}
+
+/// `N42_TX_INGEST_UNBUFFERED`, read once.
+fn unbuffered_reads() -> bool {
+    static UNBUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNBUFFERED.get_or_init(|| std::env::var("N42_TX_INGEST_UNBUFFERED").is_ok())
+}
+
+fn queue_depth<P: TransactionPool + 'static>(pool: &P) -> usize
+where
+    P::Transaction: 'static,
+{
+    match n42_tx_queue::global::<P::Transaction>() {
+        Some(queue) => queue.len(),
+        None => pool.pool_size().pending,
+    }
+}
+
 fn high_water() -> usize {
     std::env::var("N42_TX_INGEST_HIGH_WATER")
         .ok()
@@ -159,8 +289,16 @@ where
     P: TransactionPool + Clone + 'static,
 {
     spawn_stats_reporter();
+    spawn_gate_watcher(pool.clone(), std::sync::Arc::clone(&head), high_water(), block_txs_allowance());
     let listener = TcpListener::bind(addr).await?;
-    info!(target: "n42.tx_ingest", %addr, "binary transaction ingest listening");
+    info!(
+        target: "n42.tx_ingest",
+        %addr,
+        buffered_reads = !unbuffered_reads(),
+        direct_to_queue = direct_to_queue(),
+        asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok(),
+        "binary transaction ingest listening"
+    );
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -204,10 +342,41 @@ where
     // which is right for a generator that only sends valid transactions and
     // wrong for anything else, so this is not the default.
     let asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok();
-    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(ASYNC_FRAMES_IN_FLIGHT));
+    // Recovery runs in parallel, ASYNC_FRAMES_IN_FLIGHT frames at a time, but
+    // the pool takes a connection's frames in the order they arrived: one
+    // admitter per connection drains them in sequence. Admitting each frame
+    // as its recovery finished put a sender's frame k+1 into the pool before
+    // its frame k; a builder reading the queue in nonce order then stopped
+    // at the hole, and half of a full queue sat behind one (rounds queue3-4).
+    let (admit_tx, mut admit_rx) =
+        tokio::sync::mpsc::channel::<tokio::task::JoinHandle<Vec<P::Transaction>>>(ASYNC_FRAMES_IN_FLIGHT);
+    if asynchronous {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            while let Some(recovering) = admit_rx.recv().await {
+                let started = std::time::Instant::now();
+                match recovering.await {
+                    Ok(decoded) => {
+                        let _ = admit_decoded(&pool, decoded, started).await;
+                    }
+                    Err(err) => warn!(target: "n42.tx_ingest", %err, "sender recovery task failed"),
+                }
+            }
+        });
+    }
     // Nagle would batch the acknowledgements into the next read's latency, and
     // the point of this path is that nothing waits for a round trip.
     stream.set_nodelay(true)?;
+    // Reads go through a buffer: a frame is a 4-byte count and then, per
+    // transaction, a 4-byte length and ~110 bytes, and tokio's TcpStream
+    // makes a read(2) of each -- two syscalls a transaction, 400,000 a second
+    // a node at the flood's rate. Writes stay direct; an answer is 8 bytes
+    // and must not wait for company.
+    // N42_TX_INGEST_UNBUFFERED=1 restores a read(2) per field, for the A-B-A
+    // that separates the buffer from the box.
+    let (read_half, mut write_half) = stream.into_split();
+    let capacity = if unbuffered_reads() { 0 } else { 1 << 20 };
+    let mut stream = tokio::io::BufReader::with_capacity(capacity, read_half);
     loop {
         let count = match stream.read_u32_le().await {
             Ok(count) => count,
@@ -252,36 +421,50 @@ where
         // leader's ran short -- the generator, answered by all seven nodes,
         // throttled by a follower's stale count. So for each block the chain
         // is ahead of the pool, the gate allows one block's worth more.
+        // Waiting is on a node-wide notification, not a poll per connection.
+        // Sixty-four connections each sleeping 2 ms and re-reading the queue's
+        // depth is 32,000 wake-ups and lock takes a second on the node's tokio
+        // workers, and it happens only while the gate is shut -- i.e. exactly
+        // when a backlog has formed, which is when the followers' import was
+        // seen to double (80% of a follower's samples on the runtime's threads
+        // in one kernel address). One watcher polls; the waiters sleep.
         loop {
-            let lag = head
-                .load(Ordering::Relaxed)
-                .saturating_sub(pool.block_info().last_seen_block_number)
-                .min(4);
-            if u64::try_from(pool.pool_size().pending).unwrap_or(u64::MAX) < gate as u64 + lag * allowance {
+            let notified = GATE.open.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if gate_open(&pool, &head, gate, allowance) {
                 break;
             }
-            tokio::time::sleep(GATE_POLL).await;
+            GATE.waiting.fetch_add(1, Ordering::Relaxed);
+            notified.await;
+            GATE.waiting.fetch_sub(1, Ordering::Relaxed);
         }
         if asynchronous {
-            let permit = std::sync::Arc::clone(&in_flight)
+            let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
+            let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
+            let cache = cache.clone();
+            let slot = std::sync::Arc::clone(recovery_slots())
                 .acquire_owned()
                 .await
-                .expect("the in-flight semaphore is never closed");
-            let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
-            let pending = u32::try_from(pool.pool_size().pending).unwrap_or(u32::MAX);
-            let (pool, cache) = (pool.clone(), cache.clone());
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _ = admit(&pool, raws, cache).await;
+                .expect("the recovery semaphore is never closed");
+            let recovering = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                apply_recovery_nice();
+                decode_and_recover::<P>(raws, cache.as_ref())
             });
-            stream.write_u32_le(offered).await?;
-            stream.write_u32_le(pending).await?;
+            // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
+            // waiting for the pool: the answer waits for a slot, as before.
+            if admit_tx.send(recovering).await.is_err() {
+                return Ok(());
+            }
+            write_half.write_u32_le(offered).await?;
+            write_half.write_u32_le(pending).await?;
             continue;
         }
         let accepted = admit(&pool, raws, cache.clone()).await;
-        let pending = u32::try_from(pool.pool_size().pending).unwrap_or(u32::MAX);
-        stream.write_u32_le(accepted).await?;
-        stream.write_u32_le(pending).await?;
+        let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
+        write_half.write_u32_le(accepted).await?;
+        write_half.write_u32_le(pending).await?;
     }
 }
 
@@ -326,21 +509,62 @@ where
     // on that thread, and the pool's own futures, waited behind them. Blocking
     // threads are for exactly this.
     let started = std::time::Instant::now();
-    let decoded = match tokio::task::spawn_blocking(move || decode_and_recover::<P>(raws, cache.as_ref())).await {
+    let slot = std::sync::Arc::clone(recovery_slots())
+        .acquire_owned()
+        .await
+        .expect("the recovery semaphore is never closed");
+    let decoded = match tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        apply_recovery_nice();
+        decode_and_recover::<P>(raws, cache.as_ref())
+    })
+    .await
+    {
         Ok(decoded) => decoded,
         Err(err) => {
             warn!(target: "n42.tx_ingest", %err, "sender recovery task failed");
             return 0;
         }
     };
+    admit_decoded(pool, decoded, started).await
+}
+
+/// Puts recovered transactions into the pool and counts them; `started` is
+/// when their frame's recovery began.
+async fn admit_decoded<P>(pool: &P, decoded: Vec<P::Transaction>, started: std::time::Instant) -> u32
+where
+    P: TransactionPool + 'static,
+    P::Transaction: 'static,
+{
     if decoded.is_empty() {
         return 0;
+    }
+    let recovered_at = started.elapsed();
+    let count = decoded.len() as u64;
+    // N42_TX_INGEST_DIRECT=1: straight into the builder's queue, past the
+    // pool. At a 0.3 s block the pool's maintenance -- a block's removals
+    // under the write lock, 200-300 ms at 163,000 -- holds the lock most of
+    // the time, `add_transactions` starves behind it, and the generator's
+    // rate collapses in step with the chain's speed: the faster the chain,
+    // the less it is fed. The queue is nonce-ordered per sender, deduplicated,
+    // pruned by every canonical block on every node, and the pool then
+    // carries only RPC traffic. What is skipped is the pool's validation --
+    // balance and fee -- which the builder's execution catches by dropping;
+    // right for a generator that funds every sender, and the reason this is
+    // opt-in.
+    if direct_to_queue() {
+        if let Some(queue) = n42_tx_queue::global::<P::Transaction>() {
+            queue.push(decoded);
+            STATS.frames.fetch_add(1, Ordering::Relaxed);
+            STATS.txs.fetch_add(count, Ordering::Relaxed);
+            STATS.recover_ns.fetch_add(recovered_at.as_nanos() as u64, Ordering::Relaxed);
+            STATS.pool_ns.fetch_add((started.elapsed() - recovered_at).as_nanos() as u64, Ordering::Relaxed);
+            return u32::try_from(count).unwrap_or(u32::MAX);
+        }
     }
     // `External`, the same origin `eth_sendRawTransaction` uses for a
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
-    let recovered_at = started.elapsed();
-    let count = decoded.len() as u64;
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
     STATS.frames.fetch_add(1, Ordering::Relaxed);
     STATS.txs.fetch_add(count, Ordering::Relaxed);

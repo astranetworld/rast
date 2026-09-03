@@ -101,13 +101,24 @@ N x 30 s windows; `F7_BLOCK_INTERVAL_MS` paces in milliseconds and
 `F7_VIEW_TIMEOUT_MS` overrides the chain's baseTimeout, but a *tighter* one is
 worse: three runs each say 500 ms is 20% slower than the genesis 6,000 ms at
 250 ms pacing, because the timeout has to exceed the cycle a block actually
-takes and this fleet's is 1.4-2.5 s whatever the pacing asks for), `examples/tx_flood` (funds and floods a derived
+takes), `examples/tx_flood` (funds and floods a derived
 sender set, gov5's derivation so both clients draw on the same accounts),
 `scripts/fleet7-measure.py` (TPS **and** occupancy and full(>=95%), because the
 first is ambiguous without the others), `scripts/fleet7-phases.py` (where a
 block's cycle goes — run at the END of a round and compare whole rounds only)
 and `scripts/fleet7-profile.sh` (perf between windows; `--alloc` for jemalloc
 heap profiles, the instrument a CPU profile cannot replace).
+
+**Record (2026-09-03, round 37): 252,617 / 255,358 TPS** (win1/win2, 0.638 s cycle,
+163,000 tx/block, every follower executing) with `F7_LEADER_TENURE=16 F7_INGEST=1
+F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1 N42_TX_INGEST_ASYNC=1 F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250
+F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1 N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16
+N42_TX_INGEST_DIRECT=1 N42_FAST_TRANSFER=1` and `--gasceil 3423000000 --senders 6000 --pertx 6000
+--conc 64 --rpcbatch 100`. `N42_FAST_TRANSFER=1` applies plain transfers without the interpreter
+(byte-equal to revm, tested); the payload service must use the node's EVM factory for any EVM
+change to reach the builder (it had its own `EthEvmConfig::new` until 9d95b8e0f). The cycle is set
+by the followers' import (receive -> vote 447 ms), not the leader's build; 24 recovery slots and a
+parallel account prefetch both measured worse. `docs/NATIVE_FLEET7.md` "Where it stands today".
 
 **Never draw a conclusion from one round.** `scripts/fleet7-repeat.sh <n>` runs a
 configuration repeatedly and prints the spread. Measured over three runs: the

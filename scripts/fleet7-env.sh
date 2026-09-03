@@ -206,6 +206,14 @@ fi
 # credits one lever with another's saving.
 : "${F7_PROFILE:=lean}"
 [[ $F7_PROFILE == lean ]] && export MALLOC_CONF="$F7_JEMALLOC"
+# Every other profile: return freed pages after 1 s instead of jemalloc's
+# 10 s. At this tier a node churns 100-200 MB/s per block and held about a
+# gigabyte of dead pages while the box's page cache -- what the importers
+# read their state through -- was down to 9 GB. Bookended (jemA1/jemB/jemA2,
+# the variable verified in the EL's environ): followers 4.20 / 3.98 / 4.32
+# us/tx on full blocks, windows 2-3 130k/125k, 136k/136k, 119k/125k.
+: "${F7_JEMALLOC_DECAY:=dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true}"
+[[ $F7_PROFILE == lean ]] || export MALLOC_CONF="${MALLOC_CONF:-$F7_JEMALLOC_DECAY}"
 
 # Log level. The validator's own logs are the fleet's only progress record, so
 # they stay at info; debug costs real write bandwidth at seven nodes.
@@ -339,7 +347,7 @@ f7_el_args() {
       "${F7_EL_WORKERS[@]}"
 
       # The RPC caches serve queries this fleet does not make.
-      --rpc-cache.max-receipts 64
+      --rpc-cache.max-receipts "${F7_RPC_CACHE_RECEIPTS:-4}"
       --rpc-cache.max-headers 128
       --rpc-cache.max-cached-tx-hashes 2000
       --rpc-cache.max-concurrent-db-requests 32
@@ -378,7 +386,16 @@ f7_el_args() {
     validation_tasks=${F7_VALIDATION_TASKS:-4}
     # A block of this tier is worth more than the lean cache holds, and the
     # measurement reads every block back.
-    cache_blocks=256
+    # F7_RPC_CACHE_BLOCKS / F7_RPC_CACHE_RECEIPTS override the RPC caches for
+    # a round. reth's eth cache subscribes to canonical notifications and
+    # keeps the last N blocks with their decoded transactions -- ~130 MB a
+    # full block here -- whether or not anyone asks for them; at 256 that
+    # was most of a follower's 8 GB during a flood (round 33 addendum 9).
+    # 256 held 4-8 GB of decoded blocks per node; at 4 (rpcA1/rpcB/rpcA2:
+    # 159k/119k/114k, 196k/192k/191k, 155k/119k/119k) the fleet's page cache
+    # grew through the flood instead of collapsing and no block was ever
+    # full. Four is what the bench's own RPC reads need.
+    cache_blocks=${F7_RPC_CACHE_BLOCKS:-4}
     rpc_connections=512
     blocking_io=128
   fi

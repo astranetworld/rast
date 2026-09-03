@@ -218,7 +218,7 @@ where
         BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
             reth_evm_ethereum::RethReceiptBuilder,
             Arc<Client::ChainSpec>,
-            reth_evm::eth::EthEvmFactory,
+            crate::fast_transfer::N42EvmFactory,
         >,
     >,
     Client: StateProviderFactory
@@ -236,13 +236,23 @@ where
         args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         let started = std::time::Instant::now();
+        let parent_hash = args.config.parent_header.hash();
+    let block_number = args.config.parent_header.number + 1;
         let result = default_n42_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
             self.builder_config.clone(),
             args,
-            |attributes| self.pool.best_transactions_with_attributes(attributes),
+            |attributes| {
+                // The queue beside the pool, when installed (N42_TX_QUEUE=1):
+                // selection is a walk and taking is a pop, against 116-220 ms
+                // a build from the pool's ordered sets on a tenure leader.
+                match n42_tx_queue::global::<Pool::Transaction>() {
+                    Some(queue) => Box::new(queue.best_for_build(parent_hash)),
+                    None => self.pool.best_transactions_with_attributes(attributes),
+                }
+            },
             self.cons.clone(),
             self.qmdb.clone(),
         );
@@ -328,7 +338,7 @@ where
         BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
             reth_evm_ethereum::RethReceiptBuilder,
             Arc<Client::ChainSpec>,
-            reth_evm::eth::EthEvmFactory,
+            crate::fast_transfer::N42EvmFactory,
         >,
     >,
     Client: StateProviderFactory
@@ -459,6 +469,15 @@ where
     let mut exec_ns: u128 = 0;
     let setup_took = build_started.elapsed();
     let mut stale_txs: u64 = 0;
+    // Transactions taken from the pool ahead of execution so that the
+    // accounts they touch can be read in parallel first (`N42_BUILDER_PREFETCH`).
+    let prefetch = builder_prefetch();
+    let mut lookahead: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+    let mut prefetch_ns: u128 = 0;
+    let fast_hits_before = crate::fast_transfer::hits();
+    let ticks_at_start = ticks();
+    let mut pool_ticks: u64 = 0;
+    let mut exec_ticks: u64 = 0;
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -500,12 +519,86 @@ where
         .unwrap_or_default();
 
     loop {
-        let pool_at = std::time::Instant::now();
-        let Some(pool_tx) = best_txs.next() else { break };
-        pool_ns += pool_at.elapsed().as_nanos();
+        // Once the block cannot fit even the smallest transaction there is
+        // nothing left to take: every further candidate would only be
+        // refused, one refusal per queued sender -- thousands of them at the
+        // end of every full block (round 37). Checked before taking, so that
+        // nothing is taken from the queue and left neither built nor returned.
+        if block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
+            break;
+        }
+        // The pool/execution split is timed with the cycle counter, not the
+        // clock: round 37's clock-count shim found 99.9% of the builder
+        // thread's clock reads were this loop's own per-transaction timers
+        // (309,000 a block), and sampling one transaction in 32 biased the
+        // split. rdtsc is a register read; the ticks are converted once, at
+        // the end, against the build's wall clock.
+        let pool_at = ticks();
+        let pool_tx = if prefetch == 0 {
+            let Some(pool_tx) = best_txs.next() else { break };
+            pool_tx
+        } else {
+            if lookahead.is_empty() {
+                while lookahead.len() < prefetch {
+                    let Some(pool_tx) = best_txs.next() else { break };
+                    lookahead.push_back(pool_tx);
+                }
+                if lookahead.is_empty() {
+                    break;
+                }
+                let prefetch_at = std::time::Instant::now();
+                // The accounts these transactions read, fetched on the worker
+                // pool into the build's read cache: the serial execution then
+                // finds them there. At the bench tier almost every recipient is
+                // a cold miss, and those misses were most of the execution time.
+                {
+                    use rayon::prelude::*;
+                    let cached: &mut reth_revm::cached::CachedReads = builder.evm_mut().db_mut().database.cached;
+                    let mut wanted: Vec<alloy_primitives::Address> = Vec::with_capacity(lookahead.len() * 2);
+                    for pool_tx in &lookahead {
+                        let sender = pool_tx.sender();
+                        if !cached.accounts.contains_key(&sender) {
+                            wanted.push(sender);
+                        }
+                        if let Some(to) = pool_tx.to() {
+                            if !cached.accounts.contains_key(&to) {
+                                wanted.push(to);
+                            }
+                        }
+                    }
+                    wanted.sort_unstable();
+                    wanted.dedup();
+                    // The build's state provider is not shared across threads;
+                    // each chunk opens its own on the same parent.
+                    let parent_hash = parent_header.hash();
+                    let fetched: Vec<(alloy_primitives::Address, Option<Option<revm::state::AccountInfo>>)> = wanted
+                        .par_chunks(256)
+                        .flat_map_iter(|chunk| {
+                            let provider = client.state_by_block_hash(parent_hash).ok();
+                            chunk.iter().map(move |address| {
+                                let info = provider.as_ref().and_then(|provider| {
+                                    reth_storage_api::AccountReader::basic_account(provider, address).ok().map(|a| a.map(Into::into))
+                                });
+                                (*address, info)
+                            })
+                        })
+                        .collect();
+                    for (address, info) in fetched {
+                        // A read that failed is left for the execution to
+                        // repeat, and report.
+                        if let Some(info) = info {
+                            cached.accounts.entry(address).or_insert(reth_revm::cached::CachedAccount { info, storage: Default::default() });
+                        }
+                    }
+                }
+                prefetch_ns += prefetch_at.elapsed().as_nanos();
+            }
+            lookahead.pop_front().expect("checked non-empty")
+        };
+        let pulled_at = ticks();
+        pool_ticks += pulled_at.wrapping_sub(pool_at);
         tx_count += 1;
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
-
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -533,10 +626,16 @@ where
         // read it from, cached after the first transaction of each sender.
         // Skipped rather than marked invalid: marking drops the sender's later
         // transactions with it, and those are exactly the ones this block wants.
-        if let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender()) {
-            if pool_tx.nonce() < account.nonce {
-                stale_txs += 1;
-                continue;
+        // With the builder-side queue pruned by canonical blocks that finds
+        // ~0 stale transactions a block, the executor refuses a stale one
+        // anyway, and the read cost ~1 us on every transaction (round 36).
+        // Kept behind N42_BUILDER_STALE_CHECK=1 for the bookend.
+        if stale_check() {
+            if let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender()) {
+                if pool_tx.nonce() < account.nonce {
+                    stale_txs += 1;
+                    continue;
+                }
             }
         }
 
@@ -567,9 +666,13 @@ where
             }
         }
 
-        let exec_at = std::time::Instant::now();
-        let executed = builder.execute_transaction(tx.clone());
-        exec_ns += exec_at.elapsed().as_nanos();
+        // What the bookkeeping after execution needs, taken before the
+        // transaction is moved into the executor (it used to be cloned).
+        let tx_hash = *tx.hash();
+        let blob_count = tx.as_eip4844().map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
+        let miner_fee = tx.effective_tip_per_gas(base_fee);
+        let executed = builder.execute_transaction(tx);
+        exec_ticks += ticks().wrapping_sub(pulled_at);
         let gas_used = match executed {
             Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
@@ -577,17 +680,22 @@ where
             })) => {
                 if error.is_nonce_too_low() {
                     // if the nonce is too low, we can skip this transaction
-                    trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                    trace!(target: "payload_builder", %error, tx = ?tx_hash, "skipping nonce too low transaction");
                 } else {
                     // if the transaction is invalid, we can skip it and all of its
                     // descendants
-                    trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
-                    best_txs.mark_invalid(
-                        &pool_tx,
-                        InvalidPoolTransactionError::Consensus(
-                            InvalidTransactionError::TxTypeNotSupported,
-                        ),
-                    );
+                    trace!(target: "payload_builder", %error, tx = ?tx_hash, "skipping invalid transaction and its descendants");
+                    // reth reports every such refusal as an unsupported type.
+                    // A nonce above the account's is reported as what it is,
+                    // so a queue that orders by nonce can tell a hole from a
+                    // bad transaction and fill it.
+                    let kind = match reth_evm::InvalidTxError::as_invalid_tx_err(&*error) {
+                        Some(revm::context_interface::result::InvalidTransaction::NonceTooHigh { tx, state }) => {
+                            InvalidTransactionError::NonceNotConsistent { tx: *tx, state: *state }
+                        }
+                        _ => InvalidTransactionError::TxTypeNotSupported,
+                    };
+                    best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Consensus(kind));
                 }
                 continue;
             }
@@ -596,8 +704,8 @@ where
         };
 
         // add to the total blob gas used if the transaction successfully executed
-        if let Some(blob_tx) = tx.as_eip4844() {
-            block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
+        if let Some(tx_blob_count) = blob_count {
+            block_blob_count += tx_blob_count;
 
             // if we've reached the max blob count, we can skip blob txs entirely
             if block_blob_count == max_blob_count {
@@ -606,9 +714,7 @@ where
         }
 
         // update add to total fees
-        let miner_fee = tx
-            .effective_tip_per_gas(base_fee)
-            .expect("fee is always valid; execution succeeded");
+        let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");
         // EIP-8037 split gas into execution and state components; fees and the
         // block's cumulative counter both track the execution gas.
         let tx_gas_used = gas_used.tx_gas_used();
@@ -617,7 +723,22 @@ where
     }
 
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
+    // Whatever was taken ahead and not built goes back to the queue, last
+    // taken first so each is the queue's last and the return is O(1).
+    for pool_tx in lookahead.into_iter().rev() {
+        best_txs.mark_invalid(
+            &pool_tx,
+            InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
+        );
+    }
     let loop_done = build_started.elapsed();
+    // Ticks to nanoseconds, against the wall clock of the loop just run.
+    {
+        let elapsed_ticks = ticks().wrapping_sub(ticks_at_start).max(1);
+        let ns_per_tick = loop_done.as_nanos() as f64 / elapsed_ticks as f64;
+        pool_ns += (pool_ticks as f64 * ns_per_tick) as u128;
+        exec_ns += (exec_ticks as f64 * ns_per_tick) as u128;
+    }
 
     // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {
@@ -688,6 +809,12 @@ where
     let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
         state: db.take_bundle(),
         result: execution_result,
+    });
+    // How scattered the block is: accounts the bundle created against
+    // accounts it updated (a round's per-transaction cost was found to move
+    // with the block's shape, not its size).
+    let (created, updated) = execution_output.state.state.values().fold((0u64, 0u64), |(c, u), account| {
+        if account.original_info.is_none() { (c + 1, u) } else { (c, u + 1) }
     });
 
     // Blob sidecars, in whichever variant the pool holds them. Kept as the
@@ -791,11 +918,17 @@ where
     if tx_count >= 1000 {
         tracing::info!(
             target: "payload_builder",
+            number = block_number,
             txs = tx_count,
             gas = cumulative_gas_used,
             stale = stale_txs,
+            created,
+            updated,
             setup_ms = setup_took.as_millis() as u64,
             pool_ms = (pool_ns / 1_000_000) as u64,
+            prefetch_ms = (prefetch_ns / 1_000_000) as u64,
+            fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
+            refused = ?crate::fast_transfer::rejected(),
             exec_ms = (exec_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,
             finish_ms = finish_took.as_millis() as u64,
@@ -879,10 +1012,14 @@ where
         let chain = ctx.chain_spec().chain();
         let gas_limit = conf.gas_limit_for(chain);
 
+        // The same EVM factory the engine imports with (the fast transfer
+        // path lives in it). Until round 37 the builder had a plain
+        // `EthEvmConfig::new`, so nothing done to the node's EVM reached it.
+        let _ = evm_config;
         let payload_builder = N42PayloadBuilder::new(
             ctx.provider().clone(),
             pool.clone(),
-            EthEvmConfig::new(ctx.chain_spec()),
+            EthEvmConfig::new_with_evm_factory(ctx.chain_spec(), crate::fast_transfer::N42EvmFactory::from_env()),
             EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             consensus,
         )
@@ -927,3 +1064,39 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
     }
 }
 */
+
+/// Whether the builder reads each sender's account before executing, to
+/// skip stale transactions early: `N42_BUILDER_STALE_CHECK=1`; off by
+/// default (see the loop).
+fn stale_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILDER_STALE_CHECK").is_ok_and(|v| v == "1"))
+}
+
+/// The gas of the cheapest transaction (a plain transfer). A block with less
+/// than this left cannot take anything more.
+const MIN_TRANSACTION_GAS: u64 = 21_000;
+
+/// `N42_BUILDER_PREFETCH=<n>`: how many transactions the builder takes ahead
+/// of execution to read their accounts in parallel first; 0 (the default)
+/// executes straight from the pool.
+fn builder_prefetch() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("N42_BUILDER_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// The CPU's cycle counter: a register read, where a clock read is a vDSO
+/// call. Monotonic enough for sums over one build on the same thread.
+#[inline(always)]
+fn ticks() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: rdtsc has no preconditions on x86_64.
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}

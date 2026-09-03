@@ -25,6 +25,7 @@ pub mod built_executions;
 //mod metrics;
 mod consensus;
 pub mod engine_validator;
+pub mod fast_transfer;
 pub mod hotstuff_consensus;
 mod network;
 

@@ -19,6 +19,7 @@ Whether developing financial applications, interoperable dApps, or custom execut
 - **WebAssembly Smart Contracts:** Supports smart contract development through WebAssembly (Wasm), enabling language-agnostic contract implementation with near-native performance.
 
 - **Enterprise-Grade Performance:** Engineered for high transaction throughput with optimized data structures and processing algorithms to support demanding enterprise workloads.
+  Measured on the all-Rust seven-node native fleet (2026-09-03): **255,358 transactions per second** in a 30 s window at a 0.638 s block cycle, every node executing every transaction (`docs/NATIVE_FLEET7.md`, "Where it stands today").
 
 - **Cross-Chain Compatibility:** Integrates seamlessly with existing blockchain ecosystems through standardized interoperability protocols and cross-chain messaging.
 

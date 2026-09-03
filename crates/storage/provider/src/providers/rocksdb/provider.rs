@@ -140,6 +140,19 @@ const DEFAULT_WRITE_BUFFER_SIZE: usize = 128 << 20;
 /// memtable arena usage exceeds the budget.
 const DEFAULT_WRITE_BUFFER_MANAGER_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
+/// The memtable budget in force: `N42_ROCKSDB_WRITE_BUFFER_MB`, else the
+/// default. A seven-node bench fleet on one box held 7 x 4 GiB of memtables
+/// while its importers read their state through a page cache squeezed to
+/// 9 GB (docs/NATIVE_FLEET7.md, round 33 addendum 8); an override lets a
+/// round bookend the budget.
+fn write_buffer_manager_size() -> usize {
+    std::env::var("N42_ROCKSDB_WRITE_BUFFER_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map_or(DEFAULT_WRITE_BUFFER_MANAGER_SIZE, |mb| mb << 20)
+}
+
 /// Default buffer capacity for compression in batches.
 /// 4 KiB matches common block/page sizes and comfortably holds typical history values,
 /// reducing the first few reallocations without over-allocating.
@@ -224,7 +237,7 @@ impl RocksDBBuilder {
         options.set_max_background_jobs(DEFAULT_MAX_BACKGROUND_JOBS);
         options.set_bytes_per_sync(DEFAULT_BYTES_PER_SYNC);
         let write_buffer_manager =
-            WriteBufferManager::new_write_buffer_manager(DEFAULT_WRITE_BUFFER_MANAGER_SIZE, true);
+            WriteBufferManager::new_write_buffer_manager(write_buffer_manager_size(), true);
         options.set_write_buffer_manager(&write_buffer_manager);
 
         options.set_bottommost_compression_type(DBCompressionType::Zstd);

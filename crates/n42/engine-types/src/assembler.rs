@@ -150,12 +150,24 @@ pub fn parallel_ordered_trie_root<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 {
         }
     }
 
-    // Subtrie roots, in parallel.
+    // Subtrie roots, in parallel. A group's root is handed up as a branch
+    // node at its prefix, so it has to *be* one: its members must diverge at
+    // the first nibble past the prefix. A group whose members all share that
+    // nibble -- the last, partial group when the item count is 2 to 16 past
+    // a multiple of 256 -- has an extension node for a root, and the parent
+    // would put a second extension in front of it: block 319 of round
+    // direct1, 8,200 transactions, sealed a root no follower could
+    // reproduce. Such a group's few members go to the top-level builder as
+    // leaves instead.
     let roots: Vec<Option<B256>> = pieces
         .par_iter()
         .map(|piece| match piece {
             Piece::Leaf(..) => None,
             Piece::Group(prefix, members) if members.len() > 1 => {
+                let first = members[0].0.get(prefix.len());
+                if members.iter().all(|(key, _)| key.get(prefix.len()) == first) {
+                    return None;
+                }
                 let mut hb = HashBuilder::default();
                 for (key, index) in members {
                     hb.add_leaf(key.slice(prefix.len()..), items[*index].as_ref());
@@ -171,8 +183,9 @@ pub fn parallel_ordered_trie_root<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 {
         match (piece, root) {
             (Piece::Leaf(key, index), _) => hb.add_leaf(*key, items[*index].as_ref()),
             (Piece::Group(_, members), None) => {
-                let (key, index) = &members[0];
-                hb.add_leaf(*key, items[*index].as_ref());
+                for (key, index) in members {
+                    hb.add_leaf(*key, items[*index].as_ref());
+                }
             }
             (Piece::Group(prefix, _), Some(root)) => hb.add_branch(*prefix, root, false),
         }
@@ -246,6 +259,27 @@ mod tests {
                 .map(|i| {
                     let len = 40 + (i * 7) % 90;
                     (0..len).map(|j| ((i * 31 + j * 17) % 251) as u8).collect()
+                })
+                .collect();
+            let want = alloy_trie::root::ordered_trie_root_with_encoder(&items, |item, buf| buf.extend_from_slice(item));
+            assert_eq!(parallel_ordered_trie_root(&items), want, "n = {n}");
+        }
+    }
+
+    /// Block 319 of round direct1 (8,200 transfers) sealed a transactions root
+    /// no follower could reproduce. Every size around it, at a transfer's
+    /// encoded length.
+    #[test]
+    fn parallel_ordered_trie_is_alloys_at_every_residue_mod_256() {
+        // Every residue of the item count modulo 256 -- the size of a full
+        // group -- at three-byte keys (past 2,048) and at four-byte keys
+        // (past 65,536), plus the sizes around block 319's 8,200.
+        let sizes = (2_048..2_048 + 300).chain(65_536 - 20..65_536 + 300).chain(8_150..8_250);
+        for n in sizes {
+            let items: Vec<Vec<u8>> = (0..n)
+                .map(|i| {
+                    let len = 108 + (i * 7) % 12;
+                    (0..len).map(|j| ((i * 31 + j * 17 + n) % 251) as u8).collect()
                 })
                 .collect();
             let want = alloy_trie::root::ordered_trie_root_with_encoder(&items, |item, buf| buf.extend_from_slice(item));

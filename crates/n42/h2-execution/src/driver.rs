@@ -520,6 +520,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     }
 
     /// Imports a block this node built and waits for the verdict.
+    /// Drops a build prepared ahead, if any. A leader whose proposal timed out
+    /// prepared its next build on the block that was not voted for; the next
+    /// proposal extends the last QC's block instead, and a build on the wrong
+    /// parent is discarded on the mismatch anyway -- this only stops the
+    /// execution layer finishing a build nobody will collect.
+    pub fn discard_prepared(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            prepared.task.abort();
+        }
+    }
+
     /// The channel [`Self::spawn_import_own_block`] reports on, once.
     pub fn take_own_imports(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<B256>> {
         self.own_imports_rx.take()
