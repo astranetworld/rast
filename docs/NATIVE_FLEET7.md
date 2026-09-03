@@ -3829,11 +3829,16 @@ node still executes every transaction.
 | loop3F | on | 239,055 | 232,905 | 263 ms | 340 ms | 406 ms |
 
 Two readings. Window 1 matching to three transactions means both legs sit
-on the same ceiling -- the ingest's, at 16 recovery slots (217-238k/s by
-the supply session's measurements) -- so the pair cannot separate the path
-at this ceiling. And the phases can: the followers' import barrier fell
-40 ms (the interpreter was ~10% of their import), the leader's execution
-phase did not move at all. The builder's 1.6 µs a transaction is therefore
+on the same bound. The first guess -- the ingest's ceiling at 16 recovery
+slots -- was wrong, and the 24-slot leg that was meant to lift it said so:
+228,174 / 217,324 / 201,026 with every block full and a 0.70-0.81 s
+cycle, i.e. *slower* -- eight more recovery threads take cores from the
+builder and the engine. The bound at 16 slots is the leader's build
+(531 ms + own import 72 + seal ~30 = the 0.667 s cycle), and the fast
+path's saving lands on the followers, off the critical path. The phases
+say the same: the followers' import barrier fell 40 ms (the interpreter
+was ~10% of their import), the leader's execution phase did not move at
+all. The builder's 1.6 µs a transaction is therefore
 not the interpreter; it is the state reads -- two million recipients,
 almost every one a cold miss on the parent state, read serially. A
 parallel prefetch of the next batch's accounts into the build's read
