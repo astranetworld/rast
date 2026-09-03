@@ -3691,3 +3691,22 @@ window, 0.273 s cycles, a third of occupancy), every follower executing,
 no collapse, the page cache growing through the flood instead of
 collapsing. The cache at four is now the fleet default. The neighbour is
 still on the box; the residual to a quiet box is unmeasured.
+
+### The distribution, and the neighbour
+
+Three rounds with the cache at four (rpcB, rpc4a, rpc4b), the datc job's
+residency sampled every 5 s beside them:
+
+| round | win1 | win2 | win3 | total | follower µs/tx | datc GB | page cache |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rpcB | 195,508 | 192,226 | 190,984 | 17.4M | 2.14 | 41-46 | 16 → 53 GB |
+| rpc4a | 155,666 | 141,217 | 130,246 | 12.8M | 3.00 | 40-66 | 24 → 11 GB |
+| rpc4b | 191,324 | 189,246 | 103,185 | 14.5M | 2.62 | 41-63 | 25 → 11 GB |
+
+Medians 191,324 / 189,246 / 130,246. Two rounds of three hold above 189,000
+for two windows; the third window of rpc4b and all of rpc4a fall when the
+neighbour's residency passes ~50 GB and the page cache is back at 11 GB.
+With the fleet's own retention gone, sustained throughput on this box is
+set by what the page cache has left after the neighbour: at ~45 GB it is
+above 190,000 for three windows; at 60 GB and more the eviction returns.
+The generator's ~195k/s is the ceiling of the good rounds, not the chain.
