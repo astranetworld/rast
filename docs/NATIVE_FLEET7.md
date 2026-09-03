@@ -3885,3 +3885,41 @@ from a leg where the interpreter was never bypassed on the leader. The
 refusal counters (fe393c159) and a `perf` profile of the leader's build
 (profiling binary, `--profile-node`) are the next instrument; the
 prefetch stays in the tree, off.
+
+### The builder never had the node's EVM -- fixed, and the fast path lands: 248,580 / 249,923
+
+The refusal counters answered the zero-hit question at once: the leader's
+builds showed `fast=0` with no refusals either, i.e. the builder never
+consulted the path. `spawn_payload_builder_service` constructed its own
+`EthEvmConfig::new(chain_spec)` and ignored the node's EVM configuration,
+so every leader-side EVM change of the day (and the sender-recovery
+cache attached in `build_evm`) had reached the engine only. The builder
+now takes the node's factory (9d95b8e0f). Same binary, 16 slots, the
+flag alone:
+
+| leg | fast | win1 | win2 | win3 | build (buckets) | exec | follower engine | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| loop7F | on | 244,531 | 152,093* | 146,615* | | 509 | 702 | 0.652 -> 1.11 s |
+| loop7N | off | 239,057 | 233,617 | 222,758 | 509-555 (+3.8%) | 248-270 | 357-385 | 0.667-0.732 s |
+| loop7F2 | on | **248,580** | **249,923** | **239,058** | 439-489 (+3.5%) | 177-202 | 329-349 | 0.638-0.682 s |
+
+The interpreter was ~70 ms of the builder's execution phase (0.43 µs a
+transfer) and ~30 ms of a follower's import; the cycle follows the
+builder, +4-7% on TPS. (*) loop7F collapsed after window 1 with 2.1
+million system-wide major faults and a page cache that did not grow
+(11 GB flat where every other leg reaches 57-69 GB), the round-34
+signature; the repeat did not, and the bundle written through revm's
+`State` is equal to the interpreter's field by field (tests
+17bf429c5), so it is not the path. Cause not established -- a
+`perf report` of the 2.3 GB profiling binary, without `--no-inline`,
+was running on the box at the time (that flag is now in
+`fleet7-profile.sh`; with it a report takes 35 s, without it it did not
+finish in 17 minutes).
+
+The engine thread's profile with the path on has no single hotspot: the
+transfer itself 12% (three account lookups and clones), revm's
+`CacheAccount::change` 7.5%, `State` lookups 6+3%, `TransitionAccount`
+and its maps ~7%, `Account::from` 3.4%, prometheus histogram + `quanta`
+timers ~4%, the receipt-root channel 1.3%. The remaining cost is revm's
+per-transaction state bookkeeping and reth's per-transaction
+instrumentation, spread thin.
