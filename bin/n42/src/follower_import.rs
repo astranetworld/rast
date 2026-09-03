@@ -43,8 +43,8 @@ const CARRY_CAP: usize = 1_000_000;
 
 /// Executes and checks `sealed` on its parent's state. See the module docs.
 /// Returns the executed block and the phase timings in milliseconds:
-/// senders, execution, the post-execution checks, state root, hashed state;
-/// then the number of senders the recovery cache held.
+/// header checks, senders, execution, the post-execution checks, state root,
+/// hashed state; then the number of senders the recovery cache held.
 #[allow(clippy::too_many_arguments)]
 pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     sealed: SealedBlock<Block>,
@@ -55,7 +55,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 6]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 7]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header>,
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
@@ -76,7 +76,13 @@ where
     consensus
         .validate_header_against_parent(sealed.sealed_header(), &parent)
         .map_err(|err| format!("header against parent: {err}"))?;
-    consensus.validate_block_pre_execution(&sealed).map_err(|err| format!("body: {err}"))?;
+    // The transactions root was computed and matched against the sealed hash
+    // by the payload's conversion; the body check takes it as known.
+    consensus
+        .validate_block_pre_execution_with_tx_root(&sealed, Some(sealed.transactions_root))
+        .map_err(|err| format!("body: {err}"))?;
+    let header_ms = started.elapsed().as_millis() as u64;
+    let senders_at = std::time::Instant::now();
 
     // Senders: the recovery cache the ingest fills (what the engine's own
     // path reads), the rest recovered on the worker pool.
@@ -99,7 +105,7 @@ where
     };
     let cache_hits = cache_hits.into_inner();
     let recovered = RecoveredBlock::new_sealed(sealed, senders);
-    let senders_ms = started.elapsed().as_millis() as u64;
+    let senders_ms = senders_at.elapsed().as_millis() as u64;
 
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header.
@@ -155,6 +161,6 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         }),
-        [senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits],
+        [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits],
     ))
 }

@@ -48,6 +48,14 @@ use reth_primitives_traits::{BlockBody as _, GotExpected, RecoveredBlock, Sealed
 use std::sync::{Arc, RwLock};
 
 /// gov5's HotStuff-2 block rules, for reth.
+thread_local! {
+    /// A transactions root already computed and checked for the block being
+    /// validated on this thread, so the body check does not compute it again
+    /// (163,000 encodings and a trie at the bench tier). Set only for the
+    /// span of `validate_block_pre_execution_with_tx_root`.
+    static KNOWN_TX_ROOT: std::cell::Cell<Option<B256>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Debug)]
 pub struct HotStuffConsensus<ChainSpec> {
     chain_spec: Arc<ChainSpec>,
@@ -241,7 +249,12 @@ where
             ));
         }
 
-        let tx_root = body.calculate_tx_root();
+        let tx_root = match KNOWN_TX_ROOT.with(|known| known.get()) {
+            // A root the caller has already computed and matched against the
+            // sealed hash (the payload's conversion did): not computed twice.
+            Some(root) => root,
+            None => body.calculate_tx_root(),
+        };
         if header.transactions_root != tx_root {
             return Err(ConsensusError::BodyTransactionRootDiff(
                 GotExpected {
@@ -289,6 +302,17 @@ where
             validate_cancun_gas(block)?;
         }
         Ok(())
+    }
+
+    fn validate_block_pre_execution_with_tx_root(
+        &self,
+        block: &SealedBlock<EthBlock>,
+        transaction_root: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        KNOWN_TX_ROOT.with(|known| known.set(transaction_root));
+        let result = self.validate_block_pre_execution(block);
+        KNOWN_TX_ROOT.with(|known| known.set(None));
+        result
     }
 
     fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
