@@ -161,7 +161,7 @@ pub struct OwnBlockReuse {
 pub type ForeignImport = dyn Fn(
         SealedBlock<reth_ethereum_primitives::Block>,
     ) -> Result<
-        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<reth_ethereum_primitives::EthPrimitives>>, [u64; 5]),
+        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<reth_ethereum_primitives::EthPrimitives>>, [u64; 6]),
         String,
     > + Send
     + Sync;
@@ -461,7 +461,7 @@ where
                     // Another node's block: executed here and handed to the
                     // engine as executed, when configured. Any failure logs
                     // and leaves the block to the engine's own path.
-                    let mut direct_ms: Option<[u64; 7]> = None;
+                    let mut direct_ms: Option<[u64; 8]> = None;
                     if let Some(reuse) = reuse.as_ref().filter(|r| !reused && r.import_foreign.is_some()) {
                         let import = reuse.import_foreign.clone().expect("checked");
                         let validator = reuse.validator.clone();
@@ -490,7 +490,7 @@ where
                                 let landed = sent
                                     && matches!(tokio::time::timeout(std::time::Duration::from_secs(2), handed).await, Ok(Ok(true)));
                                 if landed {
-                                    direct_ms = Some([converted, phases[0], phases[1], phases[2], phases[3], phases[4], started.elapsed().as_millis() as u64]);
+                                    direct_ms = Some([converted, phases[0], phases[1], phases[2], phases[3], phases[4], started.elapsed().as_millis() as u64, phases[5]]);
                                 } else {
                                     warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
                                 }
@@ -568,6 +568,7 @@ where
                                     root_ms = ms[4],
                                     hashed_ms = ms[5],
                                     total_ms = ms[6],
+                                    senders_cached = ms[7],
                                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[6]),
                                     status = ?status.status,
                                     "direct import: executed here, handed to the engine as executed"

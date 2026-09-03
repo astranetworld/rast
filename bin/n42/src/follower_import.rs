@@ -43,7 +43,8 @@ const CARRY_CAP: usize = 1_000_000;
 
 /// Executes and checks `sealed` on its parent's state. See the module docs.
 /// Returns the executed block and the phase timings in milliseconds:
-/// senders, execution, the post-execution checks, state root, hashed state.
+/// senders, execution, the post-execution checks, state root, hashed state;
+/// then the number of senders the recovery cache held.
 #[allow(clippy::too_many_arguments)]
 pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     sealed: SealedBlock<Block>,
@@ -54,7 +55,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 5]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 6]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header>,
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
@@ -79,6 +80,7 @@ where
 
     // Senders: the recovery cache the ingest fills (what the engine's own
     // path reads), the rest recovered on the worker pool.
+    let cache_hits = std::sync::atomic::AtomicU64::new(0);
     let senders: Vec<Address> = {
         use rayon::prelude::*;
         sealed
@@ -86,12 +88,16 @@ where
             .transactions()
             .collect::<Vec<_>>()
             .par_iter()
-            .map(|tx| match senders_cache {
-                Some(cache) => cache.recover(*tx).map_err(|err| format!("sender of {}: {err}", tx.tx_hash())),
-                None => tx.recover_signer().map_err(|err| format!("sender of {}: {err}", tx.tx_hash())),
+            .map(|tx| {
+                if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
+                    cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(sender);
+                }
+                tx.recover_signer().map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
             })
             .collect::<Result<Vec<_>, String>>()?
     };
+    let cache_hits = cache_hits.into_inner();
     let recovered = RecoveredBlock::new_sealed(sealed, senders);
     let senders_ms = started.elapsed().as_millis() as u64;
 
@@ -149,6 +155,6 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         }),
-        [senders_ms, exec_ms, checks_ms, root_ms, hashed_ms],
+        [senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits],
     ))
 }
