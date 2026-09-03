@@ -516,6 +516,13 @@ where
         tx_count += 1;
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
 
+        // Once the block cannot fit even the smallest transaction there is
+        // nothing left to take: every further candidate would only be
+        // refused, one refusal per queued sender -- thousands of them at the
+        // end of every full block (round 37).
+        if block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
+            break;
+        }
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -968,3 +975,7 @@ fn stale_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_BUILDER_STALE_CHECK").is_ok_and(|v| v == "1"))
 }
+
+/// The gas of the cheapest transaction (a plain transfer). A block with less
+/// than this left cannot take anything more.
+const MIN_TRANSACTION_GAS: u64 = 21_000;

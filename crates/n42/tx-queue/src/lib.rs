@@ -415,7 +415,16 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
         }
         let mut inner = self.queue.inner.lock();
         if let Some((_, taken)) = inner.last_build.as_mut() {
-            taken.retain(|t| !Arc::ptr_eq(t, transaction));
+            // The refused transaction is the one just yielded, all but
+            // always; a scan of everything the build took (165,000 at the
+            // bench tier, once per refused sender) was most of a full
+            // block's loop tail.
+            match taken.last() {
+                Some(last) if Arc::ptr_eq(last, transaction) => {
+                    taken.pop();
+                }
+                _ => taken.retain(|t| !Arc::ptr_eq(t, transaction)),
+            }
         }
         if let InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
             tx,
