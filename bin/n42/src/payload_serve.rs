@@ -131,6 +131,19 @@ pub struct OwnBlockReuse {
     /// on the critical path instead of beside it. The pool's per-transaction
     /// removal is the wall, not when it happens.
     pub prune_pool: Option<std::sync::Arc<dyn Fn(Vec<alloy_primitives::B256>) + Send + Sync>>,
+    /// `N42_FOLLOWER_EXEC_PROBE=1`: after the engine has imported a block of
+    /// another node's, execute it once more with the plain block executor on
+    /// the parent's state and log how long that takes -- the time an import
+    /// without the engine's payload-processor plumbing would cost. An
+    /// instrument: it adds its own time to the import, and a leg run with it
+    /// is not a measurement of the chain. Returns (ms, gas used, receipts).
+    pub exec_probe: Option<
+        std::sync::Arc<
+            dyn Fn(reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>) -> Result<(u64, u64, usize), String>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for OwnBlockReuse {
@@ -423,8 +436,35 @@ where
                     // The transactions' bytes, kept for the prune below; the
                     // payload itself goes to the engine.
                     let raw_transactions = data.payload.as_v1().transactions.clone();
+                    let probe = reuse.as_ref().and_then(|r| r.exec_probe.clone()).filter(|_| !reused && txs > 10_000);
+                    let probe_data = probe.as_ref().map(|_| data.clone());
                     match engine.new_payload(data).await {
                         Ok(status) => {
+                            if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
+                                let validator = reuse.as_ref().map(|r| r.validator.clone());
+                                if let Some(validator) = validator {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let converted = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, probe_data) {
+                                            Ok(block) => block,
+                                            Err(err) => { warn!(target: "n42.payload_serve", %err, "exec probe: conversion failed"); return; }
+                                        };
+                                        let recovered = match converted.try_recover() {
+                                            Ok(block) => block,
+                                            Err(_) => { warn!(target: "n42.payload_serve", "exec probe: sender recovery failed"); return; }
+                                        };
+                                        let header_gas = recovered.gas_used;
+                                        match probe(recovered) {
+                                            Ok((exec_ms, gas, receipts)) => info!(
+                                                target: "n42.payload_serve",
+                                                number, txs, exec_ms, gas, header_gas, receipts,
+                                                "follower exec probe: the block executed again with the plain executor"
+                                            ),
+                                            Err(err) => warn!(target: "n42.payload_serve", %err, "exec probe failed"),
+                                        }
+                                    })
+                                    .await;
+                                }
+                            }
                             // A block this node now holds: its transactions
                             // leave the pool at once rather than when the
                             // pool's maintenance gets to them. On a follower

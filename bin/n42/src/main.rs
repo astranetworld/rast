@@ -235,6 +235,21 @@ fn main() {
                                 // same per-transaction removal the pool's own maintenance
                                 // pays later -- so doing it on the import path moves the
                                 // cost onto the critical path rather than removing it.
+                                exec_probe: (std::env::var("N42_FOLLOWER_EXEC_PROBE").is_ok()).then(|| {
+                                    let provider = node.provider.clone();
+                                    let evm_config = node.evm_config.clone();
+                                    std::sync::Arc::new(move |block: reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>| {
+                                        use reth_evm::execute::Executor as _;
+                                        use reth_evm::ConfigureEvm as _;
+                                        use reth_provider::StateProviderFactory as _;
+                                        let state = provider.state_by_block_hash(block.parent_hash).map_err(|e| e.to_string())?;
+                                        let db = reth_revm::database::StateProviderDatabase::new(&state);
+                                        let started = std::time::Instant::now();
+                                        let mut executor = evm_config.executor(db);
+                                        let out = executor.execute_one(&block).map_err(|e| e.to_string())?;
+                                        Ok((started.elapsed().as_millis() as u64, out.gas_used, out.receipts.len()))
+                                    }) as std::sync::Arc<dyn Fn(reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>) -> Result<(u64, u64, usize), String> + Send + Sync>
+                                }),
                                 prune_pool: (std::env::var("N42_PRUNE_POOL_ON_IMPORT").is_ok()).then(|| {
                                     let pool = node.pool.clone();
                                     std::sync::Arc::new(move |hashes: Vec<alloy_primitives::B256>| {
