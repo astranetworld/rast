@@ -475,7 +475,9 @@ where
     let mut lookahead: std::collections::VecDeque<_> = std::collections::VecDeque::new();
     let mut prefetch_ns: u128 = 0;
     let fast_hits_before = crate::fast_transfer::hits();
-    let mut last_at = std::time::Instant::now();
+    let ticks_at_start = ticks();
+    let mut pool_ticks: u64 = 0;
+    let mut exec_ticks: u64 = 0;
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -525,13 +527,13 @@ where
         if block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
-        // The pool/execution split is sampled: one transaction in
-        // `TIMED_EVERY` is timed and the sum scaled. Round 37's clock-count
-        // shim found 99.9% of the builder thread's clock reads were this
-        // loop's own per-transaction timers -- 17% of the thread at three a
-        // transaction, 13.6% at two, ~200 ns a read on this box.
-        let timed = tx_count % TIMED_EVERY == 0;
-        let pool_at = if timed { std::time::Instant::now() } else { last_at };
+        // The pool/execution split is timed with the cycle counter, not the
+        // clock: round 37's clock-count shim found 99.9% of the builder
+        // thread's clock reads were this loop's own per-transaction timers
+        // (309,000 a block), and sampling one transaction in 32 biased the
+        // split. rdtsc is a register read; the ticks are converted once, at
+        // the end, against the build's wall clock.
+        let pool_at = ticks();
         let pool_tx = if prefetch == 0 {
             let Some(pool_tx) = best_txs.next() else { break };
             pool_tx
@@ -593,10 +595,8 @@ where
             }
             lookahead.pop_front().expect("checked non-empty")
         };
-        if timed {
-            last_at = std::time::Instant::now();
-            pool_ns += last_at.duration_since(pool_at).as_nanos() * TIMED_EVERY as u128;
-        }
+        let pulled_at = ticks();
+        pool_ticks += pulled_at.wrapping_sub(pool_at);
         tx_count += 1;
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
         // ensure we still have capacity for this transaction
@@ -672,9 +672,7 @@ where
         let blob_count = tx.as_eip4844().map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let executed = builder.execute_transaction(tx);
-        if timed {
-            exec_ns += last_at.elapsed().as_nanos() * TIMED_EVERY as u128;
-        }
+        exec_ticks += ticks().wrapping_sub(pulled_at);
         let gas_used = match executed {
             Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
@@ -734,6 +732,13 @@ where
         );
     }
     let loop_done = build_started.elapsed();
+    // Ticks to nanoseconds, against the wall clock of the loop just run.
+    {
+        let elapsed_ticks = ticks().wrapping_sub(ticks_at_start).max(1);
+        let ns_per_tick = loop_done.as_nanos() as f64 / elapsed_ticks as f64;
+        pool_ns += (pool_ticks as f64 * ns_per_tick) as u128;
+        exec_ns += (exec_ticks as f64 * ns_per_tick) as u128;
+    }
 
     // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {
@@ -1080,5 +1085,18 @@ fn builder_prefetch() -> usize {
     *N.get_or_init(|| std::env::var("N42_BUILDER_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
-/// One transaction in this many is timed for the build's pool/execution split.
-const TIMED_EVERY: u64 = 32;
+/// The CPU's cycle counter: a register read, where a clock read is a vDSO
+/// call. Monotonic enough for sums over one build on the same thread.
+#[inline(always)]
+fn ticks() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: rdtsc has no preconditions on x86_64.
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
