@@ -347,7 +347,7 @@ f7_el_args() {
       "${F7_EL_WORKERS[@]}"
 
       # The RPC caches serve queries this fleet does not make.
-      --rpc-cache.max-receipts 64
+      --rpc-cache.max-receipts "${F7_RPC_CACHE_RECEIPTS:-64}"
       --rpc-cache.max-headers 128
       --rpc-cache.max-cached-tx-hashes 2000
       --rpc-cache.max-concurrent-db-requests 32
@@ -386,7 +386,12 @@ f7_el_args() {
     validation_tasks=${F7_VALIDATION_TASKS:-4}
     # A block of this tier is worth more than the lean cache holds, and the
     # measurement reads every block back.
-    cache_blocks=256
+    # F7_RPC_CACHE_BLOCKS / F7_RPC_CACHE_RECEIPTS override the RPC caches for
+    # a round. reth's eth cache subscribes to canonical notifications and
+    # keeps the last N blocks with their decoded transactions -- ~130 MB a
+    # full block here -- whether or not anyone asks for them; at 256 that
+    # was most of a follower's 8 GB during a flood (round 33 addendum 9).
+    cache_blocks=${F7_RPC_CACHE_BLOCKS:-256}
     rpc_connections=512
     blocking_io=128
   fi
