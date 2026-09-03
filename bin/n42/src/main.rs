@@ -238,13 +238,14 @@ fn main() {
                                 import_foreign: (std::env::var("N42_FOLLOWER_DIRECT_IMPORT").is_ok()).then(|| {
                                     let provider = node.provider.clone();
                                     let evm_config = node.evm_config.clone();
-                                    let pool = node.pool.clone();
+                                    let senders_cache = node.evm_config.sender_recovery_cache.clone();
+                                    let carry: std::sync::Arc<n42::follower_import::CarriedReads> = Default::default();
                                     let qmdb = qmdb_for_startup.clone();
                                     let consensus = consensus.clone();
                                     let chain_spec = node.chain_spec();
                                     std::sync::Arc::new(move |sealed: reth_primitives_traits::SealedBlock<reth_ethereum_primitives::Block>| {
                                         n42::follower_import::import_foreign_block(
-                                            sealed, &provider, &evm_config, &pool, qmdb.as_ref(), consensus.as_ref(), &chain_spec,
+                                            sealed, &provider, &evm_config, senders_cache.as_ref(), &carry, qmdb.as_ref(), consensus.as_ref(), &chain_spec,
                                         )
                                     }) as std::sync::Arc<n42::payload_serve::ForeignImport>
                                 }),

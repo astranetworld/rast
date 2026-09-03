@@ -26,27 +26,38 @@ use reth_primitives_traits::{RecoveredBlock, SealedBlock, SignerRecoverable};
 use reth_provider::{HeaderProvider, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
 use reth_provider::HashedPostStateProvider;
-use reth_transaction_pool::{PoolTransaction, TransactionPool};
+use reth_revm::cached::CachedReads;
 use reth_trie::updates::TrieUpdates;
+use std::sync::Mutex;
+
+/// The read cache carried from one direct import to the next: the previous
+/// block's post-state (its senders above all -- every sender of the next
+/// block is one of the same 6,000 at the bench tier), keyed by the block it
+/// is the state of. What reth's payload builder does with its `pre_cached`.
+pub type CarriedReads = Mutex<Option<(B256, CachedReads)>>;
+
+/// Above this many cached accounts the carry starts again from the block's
+/// own post-state: a follower sees every block, and the reads would grow
+/// without bound.
+const CARRY_CAP: usize = 1_000_000;
 
 /// Executes and checks `sealed` on its parent's state. See the module docs.
 /// Returns the executed block and the phase timings in milliseconds:
-/// senders, execution (with the post-execution checks), state root, hashed
-/// state.
+/// senders, execution, the post-execution checks, state root, hashed state.
 #[allow(clippy::too_many_arguments)]
-pub fn import_foreign_block<Provider, Evm, Pool, ChainSpec>(
+pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     sealed: SealedBlock<Block>,
     provider: &Provider,
     evm_config: &Evm,
-    pool: &Pool,
+    senders_cache: Option<&reth_evm::SenderRecoveryCache>,
+    carry: &CarriedReads,
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 4]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 5]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header>,
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     ChainSpec: reth_chainspec::EthereumHardforks,
 {
     let qmdb = qmdb.ok_or("no QMDB state: the direct import needs the chain's root")?;
@@ -66,14 +77,8 @@ where
         .map_err(|err| format!("header against parent: {err}"))?;
     consensus.validate_block_pre_execution(&sealed).map_err(|err| format!("body: {err}"))?;
 
-    // Senders: the pool knows most of them (every node ingests the flood);
-    // the rest are recovered on the worker pool.
-    let hashes: Vec<B256> = sealed.body().transactions().map(|tx| *tx.tx_hash()).collect();
-    let known: alloy_primitives::map::B256Map<Address> = pool
-        .get_all(hashes.clone())
-        .into_iter()
-        .map(|tx| (*tx.hash(), tx.sender()))
-        .collect();
+    // Senders: the recovery cache the ingest fills (what the engine's own
+    // path reads), the rest recovered on the worker pool.
     let senders: Vec<Address> = {
         use rayon::prelude::*;
         sealed
@@ -81,10 +86,9 @@ where
             .transactions()
             .collect::<Vec<_>>()
             .par_iter()
-            .zip(hashes.par_iter())
-            .map(|(tx, hash)| match known.get(hash) {
-                Some(sender) => Ok(*sender),
-                None => tx.recover_signer().map_err(|err| format!("sender of {hash}: {err}")),
+            .map(|tx| match senders_cache {
+                Some(cache) => cache.recover(*tx).map_err(|err| format!("sender of {}: {err}", tx.tx_hash())),
+                None => tx.recover_signer().map_err(|err| format!("sender of {}: {err}", tx.tx_hash())),
             })
             .collect::<Result<Vec<_>, String>>()?
     };
@@ -95,14 +99,35 @@ where
     // against the header.
     let state = provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}"))?;
     let executed_at = std::time::Instant::now();
+    let mut cached = match carry.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        Some((of, cached)) if of == parent_hash => cached,
+        _ => CachedReads::default(),
+    };
     let output = evm_config
-        .executor(StateProviderDatabase::new(&state))
+        .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
         .execute(&recovered)
         .map_err(|err| format!("execution: {err}"))?;
+    let exec_ms = executed_at.elapsed().as_millis() as u64;
+    let checks_at = std::time::Instant::now();
     consensus
         .validate_block_post_execution(&recovered, &output.result, None, None)
         .map_err(|err| format!("post-execution: {err}"))?;
-    let exec_ms = executed_at.elapsed().as_millis() as u64;
+    let checks_ms = checks_at.elapsed().as_millis() as u64;
+    // The carry for the next block: this block's post-state over the reads.
+    {
+        if cached.accounts.len() > CARRY_CAP {
+            cached = CachedReads::default();
+        }
+        for (address, account) in &output.state.state {
+            match &account.info {
+                Some(info) => cached.insert_account(*address, info.clone(), Default::default()),
+                None => {
+                    cached.accounts.insert(*address, reth_revm::cached::CachedAccount { info: None, storage: Default::default() });
+                }
+            }
+        }
+        *carry.lock().unwrap_or_else(|p| p.into_inner()) = Some((block_hash, cached));
+    }
 
     // The QMDB root against the header's, which also files the block's tree
     // under its hash for the engine and the next block.
@@ -124,6 +149,6 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         }),
-        [senders_ms, exec_ms, root_ms, hashed_ms],
+        [senders_ms, exec_ms, checks_ms, root_ms, hashed_ms],
     ))
 }
