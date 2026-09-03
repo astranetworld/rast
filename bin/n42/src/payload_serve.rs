@@ -144,7 +144,27 @@ pub struct OwnBlockReuse {
                 + Sync,
         >,
     >,
+    /// `N42_FOLLOWER_DIRECT_IMPORT=1`: another node's block is executed here
+    /// with the plain block executor, checked against its header by the
+    /// consensus rules and the QMDB root, and handed to the engine as
+    /// executed -- the leader's own-block mechanism, for every block. The
+    /// engine's `newPayload` still follows, finds the block in its tree and
+    /// answers; it is the proof the insert landed and the fallback when it
+    /// did not. Round 38 measured the plain executor at 121 ms a block
+    /// against ~340 ms in the engine's payload-processor path.
+    pub import_foreign: Option<std::sync::Arc<ForeignImport>>,
 }
+
+/// Executes and checks another node's block; see [`OwnBlockReuse::import_foreign`].
+/// Returns the executed block for the engine and the phase timings in
+/// milliseconds: senders, execution, state root, hashed state.
+pub type ForeignImport = dyn Fn(
+        SealedBlock<reth_ethereum_primitives::Block>,
+    ) -> Result<
+        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<reth_ethereum_primitives::EthPrimitives>>, [u64; 4]),
+        String,
+    > + Send
+    + Sync;
 
 impl std::fmt::Debug for OwnBlockReuse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -438,6 +458,46 @@ where
                     let raw_transactions = data.payload.as_v1().transactions.clone();
                     let probe = reuse.as_ref().and_then(|r| r.exec_probe.clone()).filter(|_| !reused && txs > 10_000);
                     let probe_data = probe.as_ref().map(|_| data.clone());
+                    // Another node's block: executed here and handed to the
+                    // engine as executed, when configured. Any failure logs
+                    // and leaves the block to the engine's own path.
+                    let mut direct_ms: Option<[u64; 6]> = None;
+                    if let Some(reuse) = reuse.as_ref().filter(|r| !reused && r.import_foreign.is_some()) {
+                        let import = reuse.import_foreign.clone().expect("checked");
+                        let validator = reuse.validator.clone();
+                        let inserts = reuse.inserts.clone();
+                        let payload = data.clone();
+                        let started = std::time::Instant::now();
+                        let handed = tokio::task::spawn_blocking(move || {
+                            let sealed = <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
+                                .map_err(|err| format!("conversion: {err}"))?;
+                            let converted = started.elapsed().as_millis() as u64;
+                            // The engine's newPayload, next, converts the same
+                            // payload: let it take this block instead.
+                            n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
+                            let (executed, phases) = import(sealed)?;
+                            Ok::<_, String>((executed, phases, converted))
+                        })
+                        .await
+                        .map_err(|err| err.to_string())
+                        .and_then(|r| r);
+                        match handed {
+                            Ok((executed, phases, converted)) => {
+                                let (done, handed) = tokio::sync::oneshot::channel();
+                                let sent = inserts
+                                    .send(reth_node_builder::executed_inserts::ExecutedInsert { block: executed, done })
+                                    .is_ok();
+                                let landed = sent
+                                    && matches!(tokio::time::timeout(std::time::Duration::from_secs(2), handed).await, Ok(Ok(true)));
+                                if landed {
+                                    direct_ms = Some([converted, phases[0], phases[1], phases[2], phases[3], started.elapsed().as_millis() as u64]);
+                                } else {
+                                    warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
+                                }
+                            }
+                            Err(err) => warn!(target: "n42.payload_serve", number, %err, "direct import failed; importing the ordinary way"),
+                        }
+                    }
                     match engine.new_payload(data).await {
                         Ok(status) => {
                             if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
@@ -495,6 +555,22 @@ where
                                         "imported block's transactions taken out of the pool"
                                     );
                                 }
+                            }
+                            if let Some(ms) = direct_ms {
+                                info!(
+                                    target: "n42.payload_serve",
+                                    number,
+                                    txs,
+                                    convert_ms = ms[0],
+                                    senders_ms = ms[1],
+                                    exec_ms = ms[2],
+                                    root_ms = ms[3],
+                                    hashed_ms = ms[4],
+                                    total_ms = ms[5],
+                                    engine_ms = started.elapsed().saturating_sub(decoded).as_millis() as u64 - ms[5],
+                                    status = ?status.status,
+                                    "direct import: executed here, handed to the engine as executed"
+                                );
                             }
                             if txs > 10_000 {
                                 info!(

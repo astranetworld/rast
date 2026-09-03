@@ -235,6 +235,19 @@ fn main() {
                                 // same per-transaction removal the pool's own maintenance
                                 // pays later -- so doing it on the import path moves the
                                 // cost onto the critical path rather than removing it.
+                                import_foreign: (std::env::var("N42_FOLLOWER_DIRECT_IMPORT").is_ok()).then(|| {
+                                    let provider = node.provider.clone();
+                                    let evm_config = node.evm_config.clone();
+                                    let pool = node.pool.clone();
+                                    let qmdb = qmdb_for_startup.clone();
+                                    let consensus = consensus.clone();
+                                    let chain_spec = node.chain_spec();
+                                    std::sync::Arc::new(move |sealed: reth_primitives_traits::SealedBlock<reth_ethereum_primitives::Block>| {
+                                        n42::follower_import::import_foreign_block(
+                                            sealed, &provider, &evm_config, &pool, qmdb.as_ref(), consensus.as_ref(), &chain_spec,
+                                        )
+                                    }) as std::sync::Arc<n42::payload_serve::ForeignImport>
+                                }),
                                 exec_probe: (std::env::var("N42_FOLLOWER_EXEC_PROBE").is_ok()).then(|| {
                                     let provider = node.provider.clone();
                                     let evm_config = node.evm_config.clone();
