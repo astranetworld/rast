@@ -433,6 +433,79 @@ mod tests {
         assert_eq!(evm.transfer(&tx).expect("no database error").is_some(), expect_fast, "the path taken");
     }
 
+    /// The two paths through revm's `State`, the layer the node persists
+    /// from: the bundle (accounts, their statuses, the reverts) must be the
+    /// same, or the block written to the database is not.
+    fn bundles(tx: TxEnv) -> Vec<revm::database::BundleState> {
+        use revm::database::{states::bundle_state::BundleRetention, State};
+        [true, false]
+            .into_iter()
+            .map(|fast| {
+                let mut state = State::builder().with_database(db()).with_bundle_update().build();
+                {
+                    let mut evm = N42EvmFactory::with_fast_transfers(fast).create_evm(&mut state, env());
+                    let out = evm.transact_raw(tx.clone()).expect("the transaction executes");
+                    evm.db_mut().commit(out.state);
+                }
+                state.merge_transitions(BundleRetention::Reverts);
+                state.take_bundle()
+            })
+            .collect()
+    }
+
+    fn assert_same_bundle(tx: TxEnv) {
+        let b = bundles(tx);
+        let (fast, slow) = (&b[0], &b[1]);
+        assert_eq!(fast.state.len(), slow.state.len(), "accounts in the bundle");
+        for (address, account) in &slow.state {
+            let ours = fast.state.get(address).expect("account in our bundle");
+            assert_eq!(ours.info, account.info, "info {address}");
+            assert_eq!(ours.original_info, account.original_info, "original info {address}");
+            assert_eq!(ours.status, account.status, "status {address}");
+            assert_eq!(ours.storage, account.storage, "storage {address}");
+        }
+        assert_eq!(fast.reverts, slow.reverts, "reverts");
+        assert_eq!(fast.contracts.len(), slow.contracts.len(), "contracts");
+    }
+
+    #[test]
+    fn bundle_of_a_transfer_to_a_new_account() {
+        assert_same_bundle(tx(RECIPIENT, 12_345, 2, 5_000, Some(300)));
+    }
+
+    #[test]
+    fn bundle_of_a_transfer_to_an_existing_account() {
+        assert_same_bundle(tx(EXISTING, 1, 2, 5_000, Some(300)));
+    }
+
+    #[test]
+    fn bundle_of_two_transfers_in_one_block() {
+        use revm::database::{states::bundle_state::BundleRetention, State};
+        let b: Vec<revm::database::BundleState> = [true, false]
+            .into_iter()
+            .map(|fast| {
+                let mut state = State::builder().with_database(db()).with_bundle_update().build();
+                {
+                    let mut evm = N42EvmFactory::with_fast_transfers(fast).create_evm(&mut state, env());
+                    for (nonce, to) in [(7u64, RECIPIENT), (8u64, RECIPIENT)] {
+                        let mut t = tx(to, 5, 2, 5_000, Some(300));
+                        t.nonce = nonce;
+                        let out = evm.transact_raw(t).expect("executes");
+                        evm.db_mut().commit(out.state);
+                    }
+                }
+                state.merge_transitions(BundleRetention::Reverts);
+                state.take_bundle()
+            })
+            .collect();
+        assert_eq!(b[0].state.len(), b[1].state.len());
+        for (address, account) in &b[1].state {
+            let ours = &b[0].state[address];
+            assert_eq!((&ours.info, &ours.original_info, ours.status), (&account.info, &account.original_info, account.status), "{address}");
+        }
+        assert_eq!(b[0].reverts, b[1].reverts, "reverts");
+    }
+
     #[test]
     fn eip1559_transfer_to_a_new_account() {
         assert_same(tx(RECIPIENT, 12_345, 2, 5_000, Some(300)), true);
