@@ -3737,3 +3737,33 @@ and the regime switch is self-reinforcing once a backlog exists. So the
 generator cannot be raised alone: the pacing floor has to drop with it
 (125 ms with 16 slots is the next leg), or the block size has to be capped
 below the point where the cycle leaves the floor.
+
+## Round 36: the builder loop, bookended -- 190,161 in the full-block regime
+
+`fleet7-phases` on the full-block regime named the leader's build the
+critical path (median 805 ms against a 370-440 ms follower import; decide
+-> publish 758 ms median), and the build's own phases left ~295 ms a block
+in the loop around the executor: pool 108, exec 222, finish 57, assemble
+10, total 694, loop 625. Two things in that loop ran on every transaction:
+a state read of the sender's account to skip a stale transaction before
+executing it (redundant with a queue pruned by canonical blocks, and the
+executor refuses a stale one anyway), and a second clone of the
+transaction into the executor. Both removed (9ee6ce0eb; the read stays
+behind `N42_BUILDER_STALE_CHECK=1`).
+
+Bookend with yesterday's binary as the A legs (`target/release-old`),
+16 recovery slots so the fleet sits in the full-block regime, fresh
+datadirs every leg (so every leg is equally cold), phases per leg:
+
+| leg | binary | win1 | win2 | win3 | build median | loop residual | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| loopA1 | old | 178,754 | 173,857 | 184,470 | 803 ms | 306 ms | 0.88-0.94 s |
+| loopB | new | **190,161** | **190,155** | **190,161** | 734 ms | 232 ms | 0.857 s |
+| loopA2 | old | 179,293 | 179,293 | 179,294 | ~803 ms | ~306 ms | 0.909 s |
+
+The full-block ceiling moves from ~179k to 190k (+6%), and the numbers
+fit: the residual fell 74 ms, not the ~200 the two removals were priced
+at, so the state read was cheaper than assumed (a warm revm cache hit) and
+~232 ms a block -- 1.4 µs a transaction -- of loop bookkeeping remains
+unattributed, the next target on the leader. The follower's import
+(432-441 ms) is now within 70 ms of the build in this regime.
