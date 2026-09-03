@@ -567,7 +567,7 @@ where
                                     root_ms = ms[3],
                                     hashed_ms = ms[4],
                                     total_ms = ms[5],
-                                    engine_ms = started.elapsed().saturating_sub(decoded).as_millis() as u64 - ms[5],
+                                    engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[5]),
                                     status = ?status.status,
                                     "direct import: executed here, handed to the engine as executed"
                                 );
