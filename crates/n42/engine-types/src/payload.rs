@@ -543,10 +543,16 @@ where
         // read it from, cached after the first transaction of each sender.
         // Skipped rather than marked invalid: marking drops the sender's later
         // transactions with it, and those are exactly the ones this block wants.
-        if let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender()) {
-            if pool_tx.nonce() < account.nonce {
-                stale_txs += 1;
-                continue;
+        // With the builder-side queue pruned by canonical blocks that finds
+        // ~0 stale transactions a block, the executor refuses a stale one
+        // anyway, and the read cost ~1 us on every transaction (round 36).
+        // Kept behind N42_BUILDER_STALE_CHECK=1 for the bookend.
+        if stale_check() {
+            if let Ok(Some(account)) = builder.evm_mut().db_mut().basic(pool_tx.sender()) {
+                if pool_tx.nonce() < account.nonce {
+                    stale_txs += 1;
+                    continue;
+                }
             }
         }
 
@@ -577,8 +583,13 @@ where
             }
         }
 
+        // What the bookkeeping after execution needs, taken before the
+        // transaction is moved into the executor (it used to be cloned).
+        let tx_hash = *tx.hash();
+        let blob_count = tx.as_eip4844().map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
+        let miner_fee = tx.effective_tip_per_gas(base_fee);
         let exec_at = std::time::Instant::now();
-        let executed = builder.execute_transaction(tx.clone());
+        let executed = builder.execute_transaction(tx);
         exec_ns += exec_at.elapsed().as_nanos();
         let gas_used = match executed {
             Ok(gas_used) => gas_used,
@@ -587,11 +598,11 @@ where
             })) => {
                 if error.is_nonce_too_low() {
                     // if the nonce is too low, we can skip this transaction
-                    trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                    trace!(target: "payload_builder", %error, tx = ?tx_hash, "skipping nonce too low transaction");
                 } else {
                     // if the transaction is invalid, we can skip it and all of its
                     // descendants
-                    trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
+                    trace!(target: "payload_builder", %error, tx = ?tx_hash, "skipping invalid transaction and its descendants");
                     // reth reports every such refusal as an unsupported type.
                     // A nonce above the account's is reported as what it is,
                     // so a queue that orders by nonce can tell a hole from a
@@ -611,8 +622,8 @@ where
         };
 
         // add to the total blob gas used if the transaction successfully executed
-        if let Some(blob_tx) = tx.as_eip4844() {
-            block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
+        if let Some(tx_blob_count) = blob_count {
+            block_blob_count += tx_blob_count;
 
             // if we've reached the max blob count, we can skip blob txs entirely
             if block_blob_count == max_blob_count {
@@ -621,9 +632,7 @@ where
         }
 
         // update add to total fees
-        let miner_fee = tx
-            .effective_tip_per_gas(base_fee)
-            .expect("fee is always valid; execution succeeded");
+        let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");
         // EIP-8037 split gas into execution and state components; fees and the
         // block's cumulative counter both track the execution gas.
         let tx_gas_used = gas_used.tx_gas_used();
@@ -951,3 +960,11 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
     }
 }
 */
+
+/// Whether the builder reads each sender's account before executing, to
+/// skip stale transactions early: `N42_BUILDER_STALE_CHECK=1`; off by
+/// default (see the loop).
+fn stale_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILDER_STALE_CHECK").is_ok_and(|v| v == "1"))
+}
