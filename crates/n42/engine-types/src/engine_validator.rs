@@ -92,6 +92,11 @@ where
         }
 
         let expected_hash = payload.block_hash();
+        // A block this node built and has just handed to the engine as
+        // executed: the payload is its own, and the block is already made.
+        if let Some(block) = crate::built_executions::take_sealed(expected_hash) {
+            return Ok(block);
+        }
         let started = std::time::Instant::now();
         let tx_count = payload.payload.as_v1().transactions.len();
 

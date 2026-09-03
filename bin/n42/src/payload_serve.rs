@@ -197,6 +197,12 @@ where
         return None;
     }
     let body = built.block.body().clone();
+    // For the engine's newPayload of this block, which follows the hand-off:
+    // its conversion finds the block here instead of decoding the payload.
+    n42_engine_types::built_executions::remember_sealed(
+        sealed_hash,
+        SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
+    );
     let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(
         SealedBlock::from_sealed_parts(sealed_header, body),
         built.block.senders().to_vec(),

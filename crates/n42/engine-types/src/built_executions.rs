@@ -17,7 +17,7 @@
 use alloy_primitives::B256;
 use reth_ethereum_primitives::{Block, Receipt};
 use reth_execution_types::BlockExecutionOutput;
-use reth_primitives_traits::RecoveredBlock;
+use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{
     collections::VecDeque,
@@ -78,4 +78,33 @@ pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
                 && header.gas_used == gas_used
         })
         .cloned()
+}
+
+/// The sealed blocks this node has handed to the engine as executed, kept
+/// for the engine's own `newPayload` of the same block, which follows the
+/// hand-off as the check that the insert landed (and the fallback when it
+/// did not). Its conversion of the payload would decode every transaction
+/// again -- 48 ms at 163,000 transactions, on the leader's path between one
+/// proposal and the next build -- to produce the block that is already here.
+fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedBlock<Block>)>> {
+    static STORE: OnceLock<Mutex<VecDeque<(B256, SealedBlock<Block>)>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(VecDeque::with_capacity(KEEP)))
+}
+
+/// Keeps the sealed block under its sealed hash.
+pub fn remember_sealed(sealed_hash: B256, block: SealedBlock<Block>) {
+    let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    store.retain(|(hash, _)| *hash != sealed_hash);
+    while store.len() >= KEEP {
+        store.pop_front();
+    }
+    store.push_back((sealed_hash, block));
+}
+
+/// The sealed block under this hash, if one was kept; taken out, so a
+/// payload converted twice decodes the second time.
+pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
+    let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
+    store.remove(at).map(|(_, block)| block)
 }
