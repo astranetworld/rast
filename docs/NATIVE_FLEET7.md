@@ -4090,3 +4090,95 @@ the engine thread's profile names the per-transaction metrics and
 `quanta` (~4%), the receipt-root and payload-convert channels (~3.5%)
 and the precompile lookup (2%, replaced by an address check,
 d1bca8315).
+
+## Supply session, A-B-A one: the A-B-A on buffer reuse, and what it settled
+
+Three legs back to back on e3eca2e95 + the supply commits, direct
+configuration (tenure 16, ingest-all, async ingest, recovery cap 8 / nice
+10, queue, direct-to-queue, --pertx 4000), conditions sampled every 5 s
+inside the script. Prediction, written first: if reusing the raw payload
+channel's ~19 MB frames is the mechanism behind reuse1's full windows 2-3,
+the A legs' followers import flat and B's rise across the round.
+
+| leg | frames | win1 / win2 / win3 | follower import (full blocks) | datc RSS |
+|---|---|---|---|---|
+| A1 | retained | 189,853 / 124,650 / 114,004 | 3.6-5.4 µs/tx, ~4.4 | 64 -> 42 GB |
+| B1 | fresh | 154,115 / 124,927 / 119,493 | 3.1-5.0, ~4.2 | 43 -> 42 |
+| A2 | retained | 167,248 / 124,919 / 119,465 | 3.3-5.4, ~4.3 | 42 -> 39 |
+
+The bookends agree (followers within ~3%, windows 2-3 to the block), so the
+middle leg is readable, and it says **no**: with fresh frames the follower
+is as flat and windows 2-3 as full as with retained ones. Frame reuse is
+not the mechanism; it stays as hygiene. What all three legs share, and the
+collapsing rounds (gate1-3, direct3-5) did not have, is e3eca2e95 -- the
+validator's body store cut from 4,096 bodies to 64, i.e. several
+gigabytes of retained block bodies per validator gone from a box whose
+page cache is the contended resource -- and that is the other session's
+finding to confirm with its own bookends. (The EL's environment carried no
+jemalloc variable in these legs -- none was set -- which says nothing
+about the other session's jemalloc rounds; an earlier reading of this as
+"those experiments were null" was an over-read and is withdrawn.)
+
+Where the ceiling now sits: a full block imports in ~700 ms on a follower
+(4.3 µs/tx), which fixes the full-block cycle at 1.3-1.4 s -- 120-125k in
+windows 2-3 -- against the 2.0-2.6 µs/tx the same followers showed early
+in earlier rounds. Whether that is the neighbour's page-cache pressure
+(the datc job at 40-70 GB through these legs, the machine at 13-59k major
+faults a second) or something of ours is the next A-B-A, and it needs a
+quiet box to be readable. Window 1, at the pacing floor and a third
+occupancy, quantises at 61-100 blocks and is not a comparison.
+
+## Supply session, A-B-A two: the within-round collapse was the ingest's unbuffered reads
+
+A-B-A on one binary (feat/supply-direct f0f6f7bdb: e3eca2e95 + the supply
+commits) with one flag, `N42_TX_INGEST_UNBUFFERED`, on the direct
+configuration; conditions sampled every 5 s inside the launcher, one EL's
+environment dumped per leg (the flag present in B's only). Prediction,
+written before the round: if the 1 MiB read buffer on the ingest is what
+kept round 34's legs flat, the unbuffered leg's followers rise to 5-9 µs a
+transaction by windows 2-3 and those windows fall to the 70-125k band,
+while both buffered legs hold ~4.3 and ~120k.
+
+| leg | ingest reads | win1 / win2 / win3 | follower import (full blocks) | machine major faults | datc RSS |
+|---|---|---|---|---|---|
+| bufA1 | buffered | 169,233 / 119,435 / 119,486 | 3.8-5.1 µs/tx, flat | 32-35k/s | 47 -> 35 GB |
+| **bufB1** | **unbuffered** | 190,445 / **97,765 / 84,932** | **5.9-8.1 µs/tx** | **87-112k/s** | 29-39 GB |
+| bufA2 | buffered | 194,753 / 123,149 / 124,889 | 4.0-5.2 µs/tx, flat | 33-36k/s | 32-36 GB |
+
+The bookends agree (followers 4.4 against 4.7, window 3 to within a
+block), and the middle leg does what the prediction said, under the
+lightest neighbour of the three legs. So the mechanism of the collapse
+that rounds 33-34 chased through jemalloc, the queue's lock, the gate's
+poll, persistence, the sender cache and the body store is this: tokio's
+`TcpStream` is unbuffered, and the ingest read a frame as one `read(2)`
+for the count and then, per transaction, one for the length and one for
+the bytes -- two syscalls a transaction, ~400,000 a second on every node at
+the generator's rate. Uncontended that is a core or two; on a box taking
+20-100k major faults a second from a 30-90 GB neighbour it is the sixteen
+runtime workers at 92% in the kernel that the profiles showed, on the
+same cores the follower imports on, and the import doubles. The buffer
+(`0a8a64097`) takes it to a syscall per megabyte.
+
+Provenance: this bookend, this binary, the flag verified in the EL's
+environment per leg. The other session's body-store cut (4,096 -> 64) is
+a separate, large, bookended improvement (their s64/s4096 legs); frame
+reuse in the raw payload channel is hygiene (round 34). What limits
+windows 2-3 now is the follower's import at ~4.5 µs a transaction -- 730
+ms a full block, a 1.3-1.4 s cycle, ~120-125k -- against 2.0-2.6 early in
+the s64 legs on the other tree; whether that gap is the neighbour's page
+cache or ours is the next A-B-A, and it wants a quiet box.
+
+### Correction: the two clients' workloads were never the same
+
+From the gov5 session, having read `cmd/txflood`: their flood sends every
+transfer to one hard-coded address, so a full 22,857-transaction block on
+their rig writes ~1,201 accounts (1,200 senders and the sink). Ours writes
+~163,000 recipients per block out of 2,000,000 -- about 136x the state
+writes. The recipient spread was adopted in round 19 in the belief that
+it matched gov5; it did the opposite. Consequences, recorded rather than
+adjusted: every per-transaction figure compared between the clients in
+this file (gov5's 3.135 µs/tx among them) is void; the neighbour's 2.5x
+effect on this fleet against 5% on theirs needs no mechanism beyond
+working-set size (1,201 accounts survive any eviction, 2,000,000 cannot);
+and this fleet's numbers are on the heavier, more realistic workload. The
+2,000,000-recipient workload stays.
