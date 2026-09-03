@@ -3873,8 +3873,11 @@ to compare; `bucket-report` prints the drift beside every leg.)
 | loop5PF2 | 4096 | on | 228,192 | 228,172 | | | | 0.714 s |
 
 Reading the next batch's 8,000 accounts in parallel costs 34 ms a block
-and takes 17 ms off the execution phase: the cold reads are not where the
-builder's 1.5 µs a transaction goes either. And the build's new `fast=`
+of *waiting* -- the builder blocks on the batch before executing it, so
+`prefetch_ms` is critical-path delay, not background work -- and takes
+17 ms off the execution phase: the cold reads are not where the builder's
+1.5 µs a transaction goes either, and 17 ms is the most that removing
+them could ever buy. And the build's new `fast=`
 counter is **0** on every leader block with `N42_FAST_TRANSFER=1` -- the
 path that took 40 ms off the followers' import never applied on the
 builder, so the "interpreter is not the cost" verdict above was drawn
