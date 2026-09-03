@@ -417,22 +417,7 @@ where
                     // The transactions' bytes, kept for the prune below; the
                     // payload itself goes to the engine.
                     let raw_transactions = data.payload.as_v1().transactions.clone();
-                    // A build of ours the engine has just been handed as
-                    // executed is in its tree before anything sent after it,
-                    // and the engine's newPayload would only convert the
-                    // payload again (48 ms of decoding 163,000 transactions
-                    // at the bench tier) to find the block known. Answer
-                    // Valid here; the forkchoice update that follows on the
-                    // same channel reports it if the tree refused the insert.
-                    let status = if reused && !own_block_recheck() {
-                        Ok(alloy_rpc_types_engine::PayloadStatus::new(
-                            alloy_rpc_types_engine::PayloadStatusEnum::Valid,
-                            Some(data.payload.block_hash()),
-                        ))
-                    } else {
-                        engine.new_payload(data).await
-                    };
-                    match status {
+                    match engine.new_payload(data).await {
                         Ok(status) => {
                             // A block this node now holds: its transactions
                             // leave the pool at once rather than when the
@@ -582,13 +567,4 @@ mod tests {
         let sealed = SealedBlock::seal_slow(block);
         assert_eq!(encode_block_parallel(&sealed), alloy_rlp::encode(&sealed));
     }
-}
-
-
-/// `N42_OWN_BLOCK_RECHECK=1` sends a build of ours through the engine's
-/// newPayload after it was handed over as executed, the way it was done
-/// before round 37, instead of answering Valid at the hand-off.
-fn own_block_recheck() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_OWN_BLOCK_RECHECK").map(|v| v == "1").unwrap_or(false))
 }
