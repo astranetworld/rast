@@ -3997,3 +3997,34 @@ fast on, 16 slots: A 241,744 / 244,492 / 244,471, B 249,921 / 249,926 /
 244,458 -- indistinguishable, as predicted (same-binary spread 4%); the
 fix validated on the profile instead: libc `clock_gettime` 2.05% ->
 0.20%, both SipHash symbols gone from the builder thread.
+
+### Sampled timers, bookended: 20 ms off the build, nothing off the cycle -- the critical path has moved
+
+| leg | binary | win1 | win2 | win3 | build buckets 120-200 |
+| --- | --- | --- | --- | --- | --- |
+| loop11A | two reads/tx | 252,617 | 255,358 | 244,488 | 423-433 ms |
+| loop11B | sampled | 250,955 | 254,642 | 244,398 | 395-412 ms |
+| loop11A2 | two reads/tx | 250,441 | 255,356 | 249,664 | |
+| loop11B2 | sampled | 249,925 | 255,352 | 243,161 | |
+
+Registered before the legs: a build level at least 40 ms lower means
+the profile's 63 ms was real, within ±10 ms means skid, between is
+undecided. It landed at ~20 ms: undecided by the letter, and the
+reading is that a third of the profile's vDSO share was real time and
+two thirds sampling skid onto rdtsc. (The one-in-32 sampling biased the
+pool/execution split itself -- the scaled sums overshot the build --
+so the split is now timed with rdtsc, d2d4692f6.)
+
+The cycle did not move at all, 0.638 s in all four legs, and the
+phases say why: publish -> receive 74 ms, receive -> vote 447 ms,
+vote -> decide 120 ms, sum 0.64 s. **The followers' import is the
+critical path now**; the leader's build (~410 ms) plus its own import
+(~70 ms) sits under the build-ahead and no longer sets the cycle. The
+vote -> decide 120 ms is the spread of the followers' imports (barrier
+median 460-479 ms, p90 570), since a decision needs five of seven.
+From here the target is the follower's 447 ms: decode 13, conversion
+62, execution ~300 with the fast path, the rest bookkeeping -- of which
+the engine thread's profile names the per-transaction metrics and
+`quanta` (~4%), the receipt-root and payload-convert channels (~3.5%)
+and the precompile lookup (2%, replaced by an address check,
+d1bca8315).
