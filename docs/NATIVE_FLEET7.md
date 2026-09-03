@@ -3662,3 +3662,32 @@ constant.
 Levers, in order: the fleet's own memory per node (allocator decay under
 test; retained blocks; the queue's 400k transactions), then the neighbour,
 then residency of the maps (mlock needs a memlock limit this user lacks).
+
+## Round 34: 190,000 TPS sustained -- the RPC block cache was eating the page cache
+
+The chain of evidence (addenda 8-9): a follower's engine thread costs a
+constant 2.2-2.5 µs per transaction; on full blocks it waited a quarter of
+the time on file pages (D state, `folio_wait_bit_common`), reading MDBX
+through its mapping at 26 MB/s because the box's page cache had fallen to
+9 GB; it fell because the fourteen node processes grew 50-60 GB during a
+flood; the EL's share was 4.24 GB of decoded transactions of every block
+imported since the flood began (jemalloc heap profile, `prof_prefix:` with a
+colon), held by a canonical-notification subscriber -- the tree stayed at
+7-9 blocks and our own subscribers and the pool's maintenance task never
+lagged (`Receiver::len()` logged) -- and the one subscriber left was reth's
+RPC eth cache, which `fleet7-env.sh` set to 256 blocks at the bench tier.
+
+A-B-A, `--rpc-cache.max-blocks` 256 / 4 / 256 (receipts 64 / 4 / 64), direct
+configuration, the datc neighbour at 45-71 GB throughout:
+
+| leg | cache | win1 | win2 | win3 | follower µs/tx | EL RSS | page cache |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rpcA1 | 256 | 159,120 | 119,346 | 113,997 | 4.35 full / 2.56 | 1.8 → 6.9 GB | 35 → 11 GB |
+| rpcB | 4 | **195,508** | **192,226** | **190,984** | 2.14 (no full block) | 1.3 → 2.5 GB | 16 → 50 GB |
+| rpcA2 | 256 | 155,277 | 119,435 | 119,496 | 4.22 full / 2.32 | 1.4 → 7.0 GB | 28 → 11 GB |
+
+Three consecutive windows above 190,000 at the pacing floor (110 blocks a
+window, 0.273 s cycles, a third of occupancy), every follower executing,
+no collapse, the page cache growing through the flood instead of
+collapsing. The cache at four is now the fleet default. The neighbour is
+still on the box; the residual to a quiet box is unmeasured.
