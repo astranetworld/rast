@@ -56,6 +56,21 @@ pub fn hits() -> u64 {
     HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Why transfers were sent to the interpreter instead, by reason, so a
+/// fleet that shows no hits says which check refused them.
+static REJECTED: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// The refusals so far, by reason: shape, fork, configuration, limits, fees,
+/// parties, sender, balance, recipient, beneficiary, arithmetic, inspecting.
+pub fn rejected() -> [u64; 12] {
+    std::array::from_fn(|i| REJECTED[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn refused<T, E>(reason: usize) -> Result<Option<T>, E> {
+    REJECTED[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(None)
+}
+
 /// Whether `N42_FAST_TRANSFER=1` is set.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -131,7 +146,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
     /// account.
     fn transfer(&mut self, tx: &TxEnv) -> Result<Option<ResultAndState>, DB::Error> {
         // The transaction's shape.
-        let TxKind::Call(to) = tx.kind else { return Ok(None) };
+        let TxKind::Call(to) = tx.kind else { return refused(0) };
         if !tx.data.is_empty()
             || tx.tx_type > 2
             || !tx.access_list.0.is_empty()
@@ -139,7 +154,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
             || !tx.blob_hashes.is_empty()
             || tx.gas_limit < TRANSFER_GAS
         {
-            return Ok(None);
+            return refused(0);
         }
         let cfg = self.inner.cfg_env();
         let block = self.inner.block();
@@ -148,7 +163,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
         // (Amsterdam).
         let spec = cfg.spec();
         if !spec.is_enabled_in(SpecId::PRAGUE) || spec.is_enabled_in(SpecId::AMSTERDAM) {
-            return Ok(None);
+            return refused(1);
         }
         // Every check revm makes before executing, as revm makes it; a
         // configuration that relaxes any of them is not modelled here.
@@ -161,69 +176,69 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
             || cfg.is_block_gas_limit_disabled()
             || cfg.is_eip7623_disabled()
         {
-            return Ok(None);
+            return refused(2);
         }
         if tx.chain_id.is_some_and(|id| id != cfg.chain_id())
             || tx.gas_limit > cfg.tx_gas_limit_cap()
             || tx.gas_limit > block.gas_limit()
         {
-            return Ok(None);
+            return refused(3);
         }
         let basefee = block.basefee() as u128;
         if tx.gas_price < basefee || tx.gas_priority_fee.is_some_and(|tip| tip > tx.gas_price) {
-            return Ok(None);
+            return refused(4);
         }
         let caller = tx.caller;
         let beneficiary = block.beneficiary();
         if to == caller || to == beneficiary || caller == beneficiary {
-            return Ok(None);
+            return refused(5);
         }
         if self.inner.precompiles().get(&to).is_some() {
-            return Ok(None);
+            return refused(5);
         }
 
         // The accounts, loaded the way the journal would load them: through
         // the same database, so its cache holds them as the pre-state.
         let value = tx.value;
         let db = self.inner.db_mut();
-        let Some(sender) = db.basic(caller)? else { return Ok(None) };
+        let Some(sender) = db.basic(caller)? else { return refused(6) };
         if !sender.is_code_hash_empty_or_zero() || sender.nonce != tx.nonce || sender.nonce == u64::MAX {
-            return Ok(None);
+            return refused(6);
         }
-        let Ok(max_spending) = tx.max_balance_spending() else { return Ok(None) };
+        let Ok(max_spending) = tx.max_balance_spending() else { return refused(7) };
         if max_spending > sender.balance {
-            return Ok(None);
+            return refused(7);
         }
         let recipient = db.basic(to)?;
         match &recipient {
-            Some(info) if !info.is_code_hash_empty_or_zero() => return Ok(None),
+            Some(info) if !info.is_code_hash_empty_or_zero() => return refused(8),
             // An account that stays empty after being touched is deleted
             // (EIP-161); the interpreter models that, this does not.
-            Some(info) if value.is_zero() && info.is_empty() => return Ok(None),
-            None if value.is_zero() => return Ok(None),
+            Some(info) if value.is_zero() && info.is_empty() => return refused(8),
+            None if value.is_zero() => return refused(8),
             _ => {}
         }
-        let Some(coinbase) = db.basic(beneficiary)? else { return Ok(None) };
+        let Some(coinbase) = db.basic(beneficiary)? else { return refused(9) };
         if coinbase.is_empty() {
-            return Ok(None);
+            return refused(9);
         }
 
         // revm's arithmetic: the caller pays gas_limit at the effective price
         // and the value, then gets the unused gas back at the same price; the
         // beneficiary receives the used gas at the price above the base fee.
         let effective_price = tx.effective_gas_price(basefee);
-        let Some(gas_cost) = effective_price.checked_mul(TRANSFER_GAS as u128) else { return Ok(None) };
+        let Some(gas_cost) = effective_price.checked_mul(TRANSFER_GAS as u128) else { return refused(10) };
         let Some(sender_balance) = sender.balance.checked_sub(value).and_then(|b| b.checked_sub(U256::from(gas_cost)))
         else {
-            return Ok(None);
+            return refused(10);
         };
         let Some(recipient_balance) = recipient.as_ref().map_or(U256::ZERO, |r| r.balance).checked_add(value)
         else {
-            return Ok(None);
+            return refused(10);
         };
         let tip = effective_price.saturating_sub(basefee);
-        let Some(reward) = tip.checked_mul(TRANSFER_GAS as u128) else { return Ok(None) };
-        let Some(coinbase_balance) = coinbase.balance.checked_add(U256::from(reward)) else { return Ok(None) };
+        let Some(reward) = tip.checked_mul(TRANSFER_GAS as u128) else { return refused(10) };
+        let Some(coinbase_balance) = coinbase.balance.checked_add(U256::from(reward)) else { return refused(10) };
 
         // The accounts as the journal would return them: touched, with the
         // pre-state kept as the original, and a recipient that did not exist
@@ -286,6 +301,9 @@ where
     }
 
     fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
+        if self.fast && self.inspecting {
+            REJECTED[11].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if self.fast && !self.inspecting {
             if let Some(done) = self.transfer(&tx).map_err(EVMError::Database)? {
                 HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

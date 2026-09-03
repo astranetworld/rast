@@ -912,6 +912,7 @@ where
             pool_ms = (pool_ns / 1_000_000) as u64,
             prefetch_ms = (prefetch_ns / 1_000_000) as u64,
             fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
+            refused = ?crate::fast_transfer::rejected(),
             exec_ms = (exec_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,
             finish_ms = finish_took.as_millis() as u64,
