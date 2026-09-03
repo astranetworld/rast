@@ -3767,3 +3767,76 @@ at, so the state read was cheaper than assumed (a warm revm cache hit) and
 ~232 ms a block -- 1.4 µs a transaction -- of loop bookkeeping remains
 unattributed, the next target on the leader. The follower's import
 (432-441 ms) is now within 70 ms of the build in this regime.
+
+## Round 37: past 200,000 -- the full-block tail, the own-block conversion, and where the leader's time really goes
+
+The user's target moved on 2026-09-03: **over 200k now, 300k later.** At
+163,000 transactions a block that is a cycle under 0.815 s, then under
+0.543 s.
+
+### Two leader-side fixes, bookended at 233-239k
+
+The loop residual of round 36 was the full block's tail: once the block
+was full the builder kept taking one candidate per queued sender (6,000)
+and each refusal scanned the 165,000 transactions the build had taken to
+drop the refused one. Now the queue pops the refused transaction when it
+is the last yielded (always) and the builder stops before taking anything
+once less than a transfer's gas is left (782334c92, 2e1e9611b for the
+"check before taking" order -- a transaction taken and left neither built
+nor returned is lost from the queue's lanes).
+
+The leader's own-block import (113 ms of the 0.78 s cycle) was half a
+redundant conversion: after the build was handed to the engine as
+executed, the engine's `newPayload` decoded the 163,000 transactions
+again to find the block already in its tree. Skipping that `newPayload`
+was **wrong** and the leg refused to start: the hand-off's acknowledgement
+means "queued", the `newPayload` is what proves the insert landed (and
+executes the block if it did not), and without it the next forkchoice
+read Syncing. Kept, made cheap instead: the hand-off registers the sealed
+block under its hash and the validator's conversion takes it from there
+(eaaf134c1). Own import 127 -> 71 ms.
+
+Same box, quiet, 16 recovery slots, fresh datadirs, `target/release-old`
+= round 36's binary:
+
+| leg | binary | win1 | win2 | win3 | build | loop | own import | cycle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| loop2A1 | old | 193,617 | 195,594 | 190,160 | | | | 0.833 s |
+| loop2A2 | old | 195,593 | 190,155 | 190,160 | | | | 0.811-0.857 s |
+| loop3B | new | **233,625** | **228,192** | 169,728* | 544 ms | 476 | 71 | 0.682 s |
+| loop3A | old | 195,591 | 195,592 | 190,159 | 614 ms | 548 | 127 | 0.811-0.857 s |
+| loop3B2 | new | **239,052** | **228,192** | 158,862* | 531 ms | 470 | 72 | 0.667 s |
+
+(*) window 3 of the new legs is the flood's 24M budget (6,000 x 4,000)
+running out at +103 s, not the chain: `--pertx 6000` from here on. The old
+legs' same-binary spread is 1-3% on window 1; the new binary is +20% on
+the same window, and the cycle moved with it. **The goal of 200k is met
+in the full-block regime, bookended.**
+
+### The fast transfer path: right on the followers, invisible on the leader
+
+`N42_FAST_TRANSFER=1` (39810f139) applies a plain transfer -- a call with
+no calldata, no access list, no blob, no authorisation, between accounts
+without code, on Prague/Osaka -- without the interpreter: revm's own
+arithmetic in revm's order, the accounts its journal would return, the
+result its handler would build, tested byte-equal against the interpreter
+on the same pre-state. Everything else goes to the interpreter. Every
+node still executes every transaction.
+
+| leg | fast | win1 | win2 | build exec | follower engine | import barrier |
+| --- | --- | --- | --- | --- | --- | --- |
+| loop3B2 | off | 239,052 | 228,192 | 267 ms | 371 ms | 446 ms |
+| loop3F | on | 239,055 | 232,905 | 263 ms | 340 ms | 406 ms |
+
+Two readings. Window 1 matching to three transactions means both legs sit
+on the same ceiling -- the ingest's, at 16 recovery slots (217-238k/s by
+the supply session's measurements) -- so the pair cannot separate the path
+at this ceiling. And the phases can: the followers' import barrier fell
+40 ms (the interpreter was ~10% of their import), the leader's execution
+phase did not move at all. The builder's 1.6 µs a transaction is therefore
+not the interpreter; it is the state reads -- two million recipients,
+almost every one a cold miss on the parent state, read serially. A
+parallel prefetch of the next batch's accounts into the build's read
+cache (`N42_BUILDER_PREFETCH=<n>`, 2e1e9611b; a state provider per chunk,
+since the build's own is not `Sync`) is the answer to that, measured
+below.
