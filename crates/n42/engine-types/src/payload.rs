@@ -218,7 +218,7 @@ where
         BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
             reth_evm_ethereum::RethReceiptBuilder,
             Arc<Client::ChainSpec>,
-            reth_evm::eth::EthEvmFactory,
+            crate::fast_transfer::N42EvmFactory,
         >,
     >,
     Client: StateProviderFactory
@@ -338,7 +338,7 @@ where
         BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
             reth_evm_ethereum::RethReceiptBuilder,
             Arc<Client::ChainSpec>,
-            reth_evm::eth::EthEvmFactory,
+            crate::fast_transfer::N42EvmFactory,
         >,
     >,
     Client: StateProviderFactory
@@ -996,10 +996,14 @@ where
         let chain = ctx.chain_spec().chain();
         let gas_limit = conf.gas_limit_for(chain);
 
+        // The same EVM factory the engine imports with (the fast transfer
+        // path lives in it). Until round 37 the builder had a plain
+        // `EthEvmConfig::new`, so nothing done to the node's EVM reached it.
+        let _ = evm_config;
         let payload_builder = N42PayloadBuilder::new(
             ctx.provider().clone(),
             pool.clone(),
-            EthEvmConfig::new(ctx.chain_spec()),
+            EthEvmConfig::new_with_evm_factory(ctx.chain_spec(), crate::fast_transfer::N42EvmFactory::from_env()),
             EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             consensus,
         )
