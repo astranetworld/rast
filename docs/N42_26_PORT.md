@@ -509,6 +509,25 @@ Consensus state across restarts is covered in "Restarting a validator" above.
 
 ## Joining a Go fleet: a Rust node in gov5's consensus
 
+### A leader whose QC moved during its build (both clients, 2026-09-03)
+
+Both clients choose a proposal's parent when the build starts and attach
+the justify QC when the proposal is made; a QC that arrives in between
+(a leader that was behind when its tenure began, at a fast cycle) pairs
+a newer justify with an older parent, and every voter refuses the block
+as not extending its justify QC -- repeated each view, the chain halts
+(observed on this fleet at a 0.43 s cycle; gov5's window is wider, its
+sync gate lets a leader two blocks behind produce and its build is
+1.6-2 s). The fixes are leader-local and differ deliberately: this
+client compares the parent with the block the QC certifies after the
+build and **rebuilds** on a mismatch (d24618e9a; a build is ~0.4 s);
+gov5 **drops** the proposal before journalling it and lets the next
+leader take the view (bdc76990; a rebuild there would cost most of a
+view), with a counter `hotstuff_proposal_stale_parent_total`. Nothing
+crosses the wire differently, so a mixed fleet is unaffected; this
+client's rebuilds show as the warn "the QC moved during the build".
+
+
 Measured end state (`scripts/devnet-fleet.sh mixed 90 --gov5`: one QMDB `n42`,
 three Rust validators, one gov5 validator, the checked-in devnet genesis):
 90 s, 37 blocks, both clients at height 37 with the same head hash, the Go
