@@ -31,10 +31,10 @@
 //! [`global`].
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{map::{AddressHashMap, AddressHashSet}, Address, B256};
 use parking_lot::Mutex;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_transaction_pool::{
@@ -52,7 +52,9 @@ struct Lane<T: PoolTransaction> {
 }
 
 struct Inner<T: PoolTransaction> {
-    lanes: HashMap<Address, Lane<T>>,
+    // Keyed by address with alloy's fixed-bytes hasher: the builder looks a
+    // lane up per transaction, and std's SipHash was 3% of its thread.
+    lanes: AddressHashMap<Lane<T>>,
     /// Senders with queued transactions, in the order their queued run began;
     /// a sender taken from the front goes to the back if it has more.
     arrivals: VecDeque<Address>,
@@ -128,7 +130,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                lanes: HashMap::new(),
+                lanes: AddressHashMap::default(),
                 arrivals: VecDeque::new(),
                 next_sender_id: 1,
                 len: 0,
@@ -231,7 +233,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             inner.last_build = Some((parent, Vec::new()));
             inner.current = None;
         }
-        QueueBest { queue: self.clone(), skipped: HashSet::new() }
+        QueueBest { queue: self.clone(), skipped: AddressHashSet::default() }
     }
 }
 
@@ -315,7 +317,7 @@ impl<T: PoolTransaction> Inner<T> {
 
     /// The next transaction: the lowest nonce of the sender at the front of
     /// the arrival order, skipping senders the build marked.
-    fn next_ready(&mut self, skipped: &HashSet<Address>) -> Option<Arc<ValidPoolTransaction<T>>> {
+    fn next_ready(&mut self, skipped: &AddressHashSet) -> Option<Arc<ValidPoolTransaction<T>>> {
         // Continue the current sender's run first.
         if let Some((sender, left)) = self.current.take() {
             if left > 0 && !skipped.contains(&sender) {
@@ -383,7 +385,7 @@ impl<T: PoolTransaction> Inner<T> {
 /// pool's.
 pub struct QueueBest<T: PoolTransaction> {
     queue: TxQueue<T>,
-    skipped: HashSet<Address>,
+    skipped: AddressHashSet,
 }
 
 impl<T: PoolTransaction> std::fmt::Debug for QueueBest<T> {

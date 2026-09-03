@@ -475,6 +475,7 @@ where
     let mut lookahead: std::collections::VecDeque<_> = std::collections::VecDeque::new();
     let mut prefetch_ns: u128 = 0;
     let fast_hits_before = crate::fast_transfer::hits();
+    let mut last_at = std::time::Instant::now();
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -524,7 +525,10 @@ where
         if block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
-        let pool_at = std::time::Instant::now();
+        // One clock read per transaction boundary (the previous execution's
+        // end is this pull's start): the builder thread spent 17% of its
+        // time reading the clock in round 37's profile.
+        let pool_at = last_at;
         let pool_tx = if prefetch == 0 {
             let Some(pool_tx) = best_txs.next() else { break };
             pool_tx
@@ -586,7 +590,9 @@ where
             }
             lookahead.pop_front().expect("checked non-empty")
         };
-        pool_ns += pool_at.elapsed().as_nanos();
+        let pulled_at = std::time::Instant::now();
+        pool_ns += pulled_at.duration_since(pool_at).as_nanos();
+        last_at = pulled_at;
         tx_count += 1;
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
         // ensure we still have capacity for this transaction
@@ -661,9 +667,10 @@ where
         let tx_hash = *tx.hash();
         let blob_count = tx.as_eip4844().map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
         let miner_fee = tx.effective_tip_per_gas(base_fee);
-        let exec_at = std::time::Instant::now();
         let executed = builder.execute_transaction(tx);
-        exec_ns += exec_at.elapsed().as_nanos();
+        let executed_at = std::time::Instant::now();
+        exec_ns += executed_at.duration_since(last_at).as_nanos();
+        last_at = executed_at;
         let gas_used = match executed {
             Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
