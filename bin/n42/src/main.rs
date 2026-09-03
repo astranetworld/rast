@@ -185,6 +185,10 @@ fn main() {
                     loop {
                         match canonical.recv().await {
                             Ok(notification) => {
+                                let behind = canonical.len();
+                                if behind > 8 {
+                                    warn!(target: "reth::cli", behind, "canonical subscriber lag: qmdb head follower");
+                                }
                                 let tip = notification.tip().hash();
                                 if let Err(error) = follower.on_canonical(tip) {
                                     error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
@@ -307,6 +311,10 @@ fn main() {
                     loop {
                         match canonical.recv().await {
                             Ok(notification) => {
+                                let behind = canonical.len();
+                                if behind > 8 {
+                                    warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
+                                }
                                 let started = std::time::Instant::now();
                                 let mut mined = 0usize;
                                 for (_, block) in notification.committed().blocks_iter().map(|b| (b.number(), b)) {
@@ -353,6 +361,7 @@ fn main() {
                                 while let Some(notification) = canonical.next().await {
                                     head.store(notification.tip().number, std::sync::atomic::Ordering::Relaxed);
                                 }
+                                // (a stream over the broadcast; its lag is not readable here)
                             });
                         }
                         tokio::spawn(async move {
