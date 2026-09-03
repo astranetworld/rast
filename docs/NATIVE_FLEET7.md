@@ -3710,3 +3710,30 @@ With the fleet's own retention gone, sustained throughput on this box is
 set by what the page cache has left after the neighbour: at ~45 GB it is
 above 190,000 for three windows; at 60 GB and more the eviction returns.
 The generator's ~195k/s is the ceiling of the good rounds, not the chain.
+
+### Round 35: the quiet box, and throughput is not monotonic in block size
+
+The datc job left the box at 04:08 (0 GB, 115 GB available) and the armed
+launcher took the window under the claim protocol agreed with the gov5
+session (claim file, randomised 20-50 s wait, re-check; the older claim
+wins, ties to them, claims older than 30 min are stale). Recovery slots
+8 / 16 / 8 on the rpcB configuration:
+
+| leg | slots | win1 | win2 | win3 | generator | occupancy / cycle | follower µs/tx |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| recB1 | 8 | 193,157 | 193,813 | 193,687 | 190-200k/s | 33% / 0.27 s | 2.17 |
+| recB16 | 16 | 179,287 | 179,291 | 179,292 | 217k/s at +5 s | 97-100% / 0.88-0.91 s | 2.18 |
+| recB2 | 8 | 195,567 | 193,534 | 191,876 | 189-199k/s | 33% / 0.27 s | 2.12 |
+
+With 8 slots the chain sits on the generator's ceiling: the flood's workers
+spend 85% of their time waiting for the ingest's answer, which in the
+asynchronous path is written only once a recovery slot is taken, so the
+ceiling is 8 slots x ~4.5 ms per 100-transaction frame per node. Sixteen
+slots lift the supply to 217k/s, the backlog fills the blocks, and the
+full-block cycle -- 0.9 s for 163k, leaders at 1.3-1.4 µs/tx and followers
+at 2.2 -- caps the chain at 179k. Partial blocks at the 250 ms floor
+(~203k/s of capacity) beat full ones (~180k); the curve is non-monotonic,
+and the regime switch is self-reinforcing once a backlog exists. So the
+generator cannot be raised alone: the pacing floor has to drop with it
+(125 ms with 16 slots is the next leg), or the block size has to be capped
+below the point where the cycle leaves the floor.
