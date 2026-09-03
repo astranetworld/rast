@@ -4182,3 +4182,30 @@ effect on this fleet against 5% on theirs needs no mechanism beyond
 working-set size (1,201 accounts survive any eviction, 2,000,000 cannot);
 and this fleet's numbers are on the heavier, more realistic workload. The
 2,000,000-recipient workload stays.
+
+## Round 38: a follower's block executes in 121 ms outside the engine
+
+The followers' import is the critical path (round 37), and its engine
+phase costs ~2.1 µs a transfer where the builder's loop costs 1.2 µs on
+the same fast path. `N42_FOLLOWER_EXEC_PROBE=1` (c6c819a30) executes
+each imported block once more with reth's plain `BasicBlockExecutor` on
+the parent's state, after the engine has taken it, and logs the time --
+an instrument (leg `probe1`, TPS excluded: 149k, the probe's own load).
+
+| | median | p90 | n |
+| --- | ---: | ---: | ---: |
+| engine (`raw newPayload engine_ms`, under the probe's load) | 854 ms | 941 | 582 |
+| plain executor, same blocks (`exec_ms`) | **121 ms** | 146 | 582 |
+
+Gas and receipt counts match the header on every block. Without the
+probe's load the engine phase is ~340 ms (round 37), so the engine's
+payload-processor path -- transactions streamed through a channel,
+receipts to the receipt-root task, per-transaction state hooks into the
+cache, per-transaction metrics -- is roughly two thirds of a follower's
+execution. The plain executor does not compute the state root, the
+hashed post-state or the receipts root (some 40 ms together), nor verify
+the header; those are what a follower-side executed insert has to add,
+on the mechanism the leader's own block already uses (`payload_serve`:
+execute, verify the roots against the header, hand the block to the
+engine as executed, let the engine's `newPayload` find it). Expected:
+import 447 -> ~250 ms, cycle 0.64 -> ~0.45 s.
