@@ -3923,3 +3923,45 @@ and its maps ~7%, `Account::from` 3.4%, prometheus histogram + `quanta`
 timers ~4%, the receipt-root channel 1.3%. The remaining cost is revm's
 per-transaction state bookkeeping and reth's per-transaction
 instrumentation, spread thin.
+
+### The builder's own profile: a long tail, and a fifth of it reading the clock
+
+Profiles of one node (`--profile-node 0`) missed the leader's tenure
+twice -- node 0 leads 16 blocks in 112 -- so the builder's profile came
+from a `perf record` of all seven execution layers at once, 45 s into
+the flood (`bench-prof3/profile-all.data`; `--sort pid` names threads as
+`tid:comm`, and the builder's is `payload-builder`). Relative to that
+thread, fast path on:
+
+| share | where |
+| --- | --- |
+| 17.5% + 2% | `[vdso]` and `clock_gettime`: reading the clock (clocksource is tsc) |
+| 11.5% | libc, unsymbolised (memmove of the clones, most likely) |
+| ~15% | revm's `State`: `CacheAccount::change`, `TransitionAccount::update`, `apply_account_state`, the maps |
+| 5.1% | the transfer path itself (three account lookups, three `Account::from`) |
+| 4.3% + 1.9% + 1% | the pool transaction's clone to consensus, `TxEnv` from it, its drop |
+| 3% | SipHash: the queue's `HashMap<Address, Lane>` and `HashSet<Address>` on std's `RandomState` |
+| 2.4% + 1.1% | the queue's `drain_inbox` and `next` |
+| 2.1% | keccak |
+
+No single hotspot; the largest is the clock. The loop's own three
+`Instant::now()` a transaction (~2%, the `clock_gettime` line) do not
+account for 17% in the vDSO, and the frame-pointer chains do not say who
+does (they stop at the vDSO boundary); a DWARF-unwound profile of the
+`payload-builder` threads is the next leg. The two known parts are fixed
+(5976f6ef2: alloy's address hasher in the queue, one clock read per
+transaction boundary) and bookended in the same round.
+
+The followers' engine thread, same profile: the transfer path 9.9%,
+`CacheAccount::change` 7.3%, `State` 6.6%, `Account::from` 3.2%,
+`PrecompilesMap::get` 2.1% (the path's precompile check), prometheus
+histogram + `quanta` ~3%, the per-transaction channels to the receipt-root
+task and from the payload-convert thread ~3.5%. The persistence thread is
+RocksDB's memtable skip list (56%) -- off the critical path.
+
+### Convention on this box (2026-09-03)
+
+Whenever a session finishes a round or stops, the hardware goes to the
+other sessions; once every session's work is done, the datc job is
+started again and continues. Each session starts datc on its own user's
+say-so, not on a relayed instruction.
