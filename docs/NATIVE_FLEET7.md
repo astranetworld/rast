@@ -25,6 +25,44 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
 
+## Where it stands today: 255,358 TPS (2026-09-03)
+
+The record on this fleet, bookended (round 37, `loop11A`/`loop11A2`):
+
+| window | TPS | blocks | cycle | occupancy |
+| --- | ---: | ---: | ---: | ---: |
+| win1 | **252,617** | 47 | 0.638 s | 98.9% |
+| win2 | **255,358** | 47 | 0.638 s | 100% |
+| win3 | 244,488 | 45 | 0.667 s | 100% |
+
+Seven nodes, every follower executing every transaction and computing the
+QMDB root, senders recovered on every node, bodies over direct push with
+GossipSub as the fallback, 163,000 transactions a block at the 480M gas
+ceiling. Same-binary spread on window 1 is 1-4%, so nothing under ~5% is a
+result. The configuration, all in the environment of `fleet7-bench.sh`:
+
+```bash
+F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1 N42_TX_INGEST_ASYNC=1 \
+F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250 F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1 \
+N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DIRECT=1 \
+N42_FAST_TRANSFER=1 \
+scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 6000 --conc 64 --rpcbatch 100
+```
+
+How it got here, in the order the rounds found it (each has its section
+below): the RPC block cache evicting the page cache (round 34, 4 blocks);
+the builder's per-transaction state read and clone (round 36); the full
+block's refusal tail and the own-block conversion (round 37: 190k -> 233-239k);
+the plain-transfer path without the interpreter, which only reached the
+builder once the payload service used the node's EVM factory (round 37:
+248-255k). Measured and rejected on the way: 24 recovery slots (slower and
+sloped), a parallel account prefetch (cold reads are 17 ms a block), a
+tighter view timeout, jemalloc knobs, RocksDB memtable size.
+
+The cycle is now set by the followers -- publish -> receive 74 ms,
+receive -> vote 447 ms, vote -> decide 120 ms -- not by the leader's build,
+which the build-ahead hides. The next 300k is a follower-side job.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
@@ -1259,7 +1297,8 @@ summary of what they say, not a re-measurement.
 
 | client | figure | what it measures |
 | --- | ---: | --- |
-| this fleet | ~13,700–16,000 tps | 7 nodes, full signature recovery, QMDB root computed per block, bodies over GossipSub, 480M gas, 250 ms pacing |
+| this fleet, round 13 | ~13,700–16,000 tps | 7 nodes, full signature recovery, QMDB root computed per block, bodies over GossipSub, 480M gas, 250 ms pacing |
+| **this fleet, round 37** | **252,617 / 255,358** | same path (every follower executes, QMDB root per block, senders recovered), direct push, queue-fed builder, plain transfers applied without the interpreter (`N42_FAST_TRANSFER=1`), 0.638 s cycle |
 | gov5 | 22,089 @ 0.98 s | 7 nodes, same 480M tier, full path (`docs/QS_TPS_BENCHMARK.md`) |
 | gov5 | 32,381 @ 0.496 s | as above at half the block interval |
 | N42-26 | **13,858** | "2s slot, all optimizations" — the row their own records call *more production-like* |
@@ -1275,9 +1314,12 @@ records**". Its first flag disables transaction verification. Every round in thi
 document recovers every sender and computes a real state commitment.
 
 Against the row N42-26 itself labels production-like — 13,858 at a 2 s slot —
-this fleet's 13,714–16,000 is the same order, at a quarter of the block
-interval, and at 1.4–2.0 GB of resident memory against the 39.1 GiB their round
-38 records for seven nodes.
+this fleet's round-13 figure of 13,714–16,000 was the same order at a quarter
+of the block interval. As of round 37 the fleet's **255,358** is 1.6x N42-26's
+*controlled* 156,500, on the path their own records call production-like:
+every follower executes, every sender is recovered, every block carries a real
+state commitment (the section on round 37 has the bookends and the
+same-binary spread).
 
 What is worth taking from their work is not the number but two of the levers
 behind it. The first is already here: their round 42 "partitions the 256 logical
@@ -1294,9 +1336,11 @@ and it is a feature rather than a flag.
 ## Where it stands
 
 Seven all-Rust members produce the native chain at its 3 s period, agree on
-every head hash, restart one at a time without losing their place, sustain 200
-transactions a second without refusing one, and cost between 1.37 and 1.70 GB
-between them depending on load. What is measured here is a chain from genesis; the
+every head hash, restart one at a time without losing their place, and on the
+bench chain sustain **252,617-255,358 transactions a second** (round 37,
+bookended; 200 tx/s of gossiped load without refusing one on the 3 s chain).
+Resident memory was 1.37-1.70 GB between them at that early load and is 3-4 GB
+per execution layer at the bench tier. What is measured here is a chain from genesis; the
 flagship chain is thirteen million blocks and thirty-five gigabytes of state,
 and three things stand between this and it.
 

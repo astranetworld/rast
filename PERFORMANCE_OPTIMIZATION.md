@@ -6,6 +6,14 @@
 
 ---
 
+## Status (2026-09-03)
+
+This guide is a point-in-time plan from 2025-12-20; its targets are long
+passed. The measured figure is **255,358 TPS** on the all-Rust seven-node
+native fleet (round 37 in `docs/NATIVE_FLEET7.md`), every node executing every
+transaction; that document records what each round changed and what it was
+worth. Read the tables below as history.
+
 ## Executive Summary
 
 This document outlines the comprehensive performance optimization strategy for N42-rs blockchain implementation, focusing on improving TPS (Transactions Per Second) and RPC response times.
