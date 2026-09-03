@@ -4209,3 +4209,37 @@ on the mechanism the leader's own block already uses (`payload_serve`:
 execute, verify the roots against the header, hand the block to the
 engine as executed, let the engine's `newPayload` find it). Expected:
 import 447 -> ~250 ms, cycle 0.64 -> ~0.45 s.
+
+### The direct import on the fleet: 262,083, and pacing is flat
+
+`N42_FOLLOWER_DIRECT_IMPORT=1` with `N42_SENDER_CACHE_MULT=4` (reth's
+recovery cache holds 131k entries, less than one block; at 4x, 95% of
+senders hit), the body check taking the transactions root the conversion
+proved (798c65adb), and a read cache carried from the previous block's
+post-state (52e64f6ae). Per block: convert 35, header 1, senders 37,
+execution 140, checks 7, root 11, hashed 4 = **263 ms**, against ~340-390
+in the engine's path. Two things it exposed: a first-try `senders 509`
+was the pool not holding the block's transactions (every sender
+recovered), and a first-try `exec 284` was the 121 ms probe having run on
+caches the engine had just warmed. And two leader-side faults at the
+faster cycle: a build prepared ahead that resolved with a block on the
+previous parent, trusted and proposed (c6aa9294d checks the delivered
+parent), and the QC-moved race (d24618e9a) -- see `N42_26_PORT.md`.
+
+| leg | pacing | win1 | win2 | win3 | cycle | occupancy |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| loop17D2 | 250 ms | 252,999 | **262,083** | 256,912 | 0.385-0.44 s | 60-70% |
+| loop18P400 | 400 ms | 256,045 | 259,757 | 254,943 | 0.48-0.51 s | 76-81% |
+| loop18P450 | 450 ms | 243,868 | 251,039 | 242,186 | 0.49-0.55 s | 73-84% |
+| loop18P500 | 500 ms | 254,217 | 239,964 | 230,896 | 0.56-0.59 s | 82-88% |
+
+The blocks are not full because the proposal cuts the build-ahead -- the
+pool sat at its 407k gate throughout (the supply session's read, confirmed
+in the builds log: 102k transactions in a 179 ms loop) -- and the pacing
+curve is flat: a longer cycle buys a bigger block at a lower rate, because
+the builder slows as the block grows (383 ms for 163k against 179 ms for
+102k) and every cycle carries ~130 ms that is not building (own import
+66, seal and body ~10, vote and decide). The lever is the builder's
+throughput: at 1.75 µs a transaction, ~100 ms of a full block is the
+queue's per-transaction lock and inbox drain, now batched
+(`N42_TX_QUEUE_BATCH`, 0311b30b3), to be measured.
