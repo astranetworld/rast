@@ -363,26 +363,42 @@ if [[ $F7_PRECREATE == 1 ]]; then
   fi
 fi
 
-setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
-  "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
-  --senders "$SENDERS" --pertx "$PERTX" --offset "$OFFSET" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
-  --conc "$CONC" --rpcbatch "$RPCBATCH" $SHARD \
-  > "$OUT/flood.log" 2>&1 < /dev/null 9>&- &
-FLOOD=$!
-echo "flood        : pid $FLOOD, log $OUT/flood.log"
-
-# Wait for funding to mine before the first window, or window 1 measures the
-# funding phase instead of the flood.
-for _ in $(seq 1 180); do
-  grep -aq "mined through nonce" "$OUT/flood.log" 2>/dev/null && break
-  # Only the flood giving up ends the round. Matching the word "error" caught
-  # the flood's own diagnostics -- "submit failed: error decoding response
-  # body" is one refused batch out of thousands, not a dead round -- and
-  # aborted a round that was working.
-  grep -aq "^Error:" "$OUT/flood.log" 2>/dev/null && { cat "$OUT/flood.log"; exit 1; }
-  sleep 1
+# F7_FLOOD_PROCS=<n>: the flood as n processes over disjoint sender ranges,
+# each with its share of the workers. One process tops out at ~195k tx/s
+# with its workers 85% waiting for the ingest's answer; a second doubles the
+# frames in flight without doubling anything on a node. Funding is serial
+# -- every process funds its senders from the one faucet account, and two
+# funding at once race on its nonce -- so process i+1 starts once process
+# i reports its funding mined. flood.log is the first process's log; the
+# others are flood-<i>.log.
+FLOOD_PROCS=${F7_FLOOD_PROCS:-1}
+FLOODS=()
+for ((fp = 0; fp < FLOOD_PROCS; fp++)); do
+  fp_senders=$(( SENDERS / FLOOD_PROCS ))
+  fp_offset=$(( OFFSET + fp * fp_senders ))
+  fp_conc=$(( CONC / FLOOD_PROCS )); (( fp_conc < 1 )) && fp_conc=1
+  fp_log=$OUT/flood.log; (( fp > 0 )) && fp_log=$OUT/flood-$fp.log
+  setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
+    "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
+    --senders "$fp_senders" --pertx "$PERTX" --offset "$fp_offset" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
+    --conc "$fp_conc" --rpcbatch "$RPCBATCH" $SHARD \
+    > "$fp_log" 2>&1 < /dev/null 9>&- &
+  FLOODS+=($!)
+  echo "flood        : pid ${FLOODS[-1]}, $fp_senders senders from $fp_offset, $fp_conc workers, log $fp_log"
+  # Wait for funding to mine before the next process (and before the first
+  # window, or window 1 measures the funding phase instead of the flood).
+  for _ in $(seq 1 180); do
+    grep -aq "mined through nonce" "$fp_log" 2>/dev/null && break
+    # Only the flood giving up ends the round. Matching the word "error" caught
+    # the flood's own diagnostics -- "submit failed: error decoding response
+    # body" is one refused batch out of thousands, not a dead round -- and
+    # aborted a round that was working.
+    grep -aq "^Error:" "$fp_log" 2>/dev/null && { cat "$fp_log"; exit 1; }
+    sleep 1
+  done
+  grep -a "faucet\|funding" "$fp_log"
 done
-grep -a "faucet\|funding" "$OUT/flood.log"
+FLOOD=${FLOODS[0]}
 
 for ((w = 1; w <= WINDOWS; w++)); do
   "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w"
@@ -394,6 +410,6 @@ done
 
 echo "--- resources at the end of the round ---"
 "$HERE/fleet7.sh" stats | tail -3
-kill "$FLOOD" 2>/dev/null || true
+for fp_pid in "${FLOODS[@]}"; do kill "$fp_pid" 2>/dev/null || true; done
 tail -3 "$OUT/flood.log"
 echo "round recorded in $OUT/round.txt"
