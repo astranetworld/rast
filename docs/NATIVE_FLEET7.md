@@ -3965,3 +3965,35 @@ Whenever a session finishes a round or stops, the hardware goes to the
 other sessions; once every session's work is done, the datc job is
 started again and continues. Each session starts datc on its own user's
 say-so, not on a relayed instruction.
+
+### Who reads the clock: the loop itself (a counting shim where perf could not unwind)
+
+perf cannot unwind through the vDSO here (no DWARF for it, no LBR on this
+EPYC, uprobes need root), so the callers came from an `LD_PRELOAD` shim
+on `clock_gettime` that counts per thread and, one call in 512, records
+the Rust caller three frames up through `backtrace()`, dumping at thread
+exit (the build threads are short-lived; a periodic dump alone lost
+them). Legs prof5/prof6 ran it on the whole fleet -- **instruments, not
+measurements: their TPS is excluded** (interposition sends every clock
+read through the PLT).
+
+Result: 99.9% of the builder thread's clock reads are `payload.rs:241`,
+`default_n42_payload` inlined into `try_build` -- this loop's own
+per-transaction `Instant::now()`, 309,000 a block at two a transaction
+(9.9M reads over the 32 blocks one node built); jemalloc's decay ticker
+is 11 a block, tracing none. The pre-registered prediction ("the bulk is
+called from outside the loop; jemalloc, else tracing") was wrong on its
+main clause. A read costs 21 ns in a tight loop on this box (tsc,
+constant/nonstop), so 309k reads are ~6.5 ms a block against the 63 ms
+the profile charged to the vDSO: part of that share is sampling skid
+onto rdtsc. The timers are now sampled, one transaction in 32
+(cb169b2b7), and bookended; registered before the legs: build level
+-10 to -60 ms, TPS +1 to +9%, under 1% meaning the profile's share was
+mostly skid.
+
+Bookend of the two earlier fixes (hasher, one read per boundary),
+fast on, 16 slots: A 241,744 / 244,492 / 244,471, B 249,921 / 249,926 /
+239,058, A2 251,259 / 254,798 / 239,050, B2 251,218 / **255,353** /
+244,458 -- indistinguishable, as predicted (same-binary spread 4%); the
+fix validated on the profile instead: libc `clock_gettime` 2.05% ->
+0.20%, both SipHash symbols gone from the builder thread.
