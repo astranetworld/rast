@@ -456,7 +456,32 @@ where
         // spawn txpool maintenance task
         {
             let pool = transaction_pool.clone();
-            let chain_events = ctx.provider().canonical_state_stream();
+            // The same stream `canonical_state_stream()` would give, over a
+            // receiver whose backlog is visible: a follower's heap held the
+            // decoded transactions of every block of a flood (4.2 GB), and
+            // tokio's broadcast keeps a value for its slowest receiver. This
+            // says when the maintenance task is that receiver.
+            let chain_events = {
+                let rx = ctx.provider().subscribe_to_canonical_state();
+                let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(notification) => {
+                                let behind = rx.len();
+                                if behind > 8 {
+                                    tracing::warn!(target: "reth::cli", behind, "canonical subscriber lag: txpool maintenance");
+                                }
+                                return Some((notification, rx));
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(target: "reth::cli", skipped, "txpool maintenance fell behind canonical notifications");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                });
+                futures_util::StreamExt::boxed(stream)
+            };
             let client = ctx.provider().clone();
             // Only spawn backup task if not disabled
             if !ctx.config().txpool.disable_transactions_backup {
