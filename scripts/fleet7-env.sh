@@ -347,7 +347,7 @@ f7_el_args() {
       "${F7_EL_WORKERS[@]}"
 
       # The RPC caches serve queries this fleet does not make.
-      --rpc-cache.max-receipts "${F7_RPC_CACHE_RECEIPTS:-64}"
+      --rpc-cache.max-receipts "${F7_RPC_CACHE_RECEIPTS:-4}"
       --rpc-cache.max-headers 128
       --rpc-cache.max-cached-tx-hashes 2000
       --rpc-cache.max-concurrent-db-requests 32
@@ -391,7 +391,11 @@ f7_el_args() {
     # keeps the last N blocks with their decoded transactions -- ~130 MB a
     # full block here -- whether or not anyone asks for them; at 256 that
     # was most of a follower's 8 GB during a flood (round 33 addendum 9).
-    cache_blocks=${F7_RPC_CACHE_BLOCKS:-256}
+    # 256 held 4-8 GB of decoded blocks per node; at 4 (rpcA1/rpcB/rpcA2:
+    # 159k/119k/114k, 196k/192k/191k, 155k/119k/119k) the fleet's page cache
+    # grew through the flood instead of collapsing and no block was ever
+    # full. Four is what the bench's own RPC reads need.
+    cache_blocks=${F7_RPC_CACHE_BLOCKS:-4}
     rpc_connections=512
     blocking_io=128
   fi
