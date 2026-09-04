@@ -210,10 +210,11 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
         let mut inner = self.inner.lock();
         self.drain_inbox(&mut inner);
-        let mut pairs: std::collections::HashSet<(Address, u64)> = std::collections::HashSet::new();
+        let mut highest: AddressHashMap<u64> = AddressHashMap::default();
         for (sender, nonce) in mined {
             inner.remove_mined(sender, nonce);
-            pairs.insert((sender, nonce));
+            let entry = highest.entry(sender).or_insert(nonce);
+            *entry = (*entry).max(nonce);
         }
         // What a build has taken is not in the lanes, so the removal above
         // misses it; when the build is superseded its transactions are
@@ -222,7 +223,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         // 38). Forget the mined ones here.
         if let Some((_, taken)) = inner.last_build.as_mut() {
             if !taken.is_empty() {
-                taken.retain(|t| !pairs.contains(&(t.sender(), t.nonce())));
+                taken.retain(|t| highest.get(&t.sender()).is_none_or(|mined| t.nonce() > *mined));
             }
         }
     }
@@ -568,8 +569,19 @@ mod tests {
         let again: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
         assert_eq!(again.len(), 5);
         assert_eq!(again[0], (1, 0));
-        // A new parent: the previous build was committed, nothing comes back.
+        // A new parent before the chain pruned anything: the previous build
+        // may have been superseded, so what it took is offered again.
         let mut best = queue.best_for_build(B256::repeat_byte(8));
+        assert_eq!(best.next().map(|t| t.nonce()), Some(0));
+        drop(best);
+        // The chain mined the lot: pruned from the lanes and from the build's
+        // taken list alike, so a build on yet another parent gets nothing.
+        queue.remove_mined_batch([
+            (Address::repeat_byte(1), 2),
+            (Address::repeat_byte(2), 0),
+            (Address::repeat_byte(3), 5),
+        ]);
+        let mut best = queue.best_for_build(B256::repeat_byte(9));
         assert!(best.next().is_none());
     }
 
@@ -588,7 +600,12 @@ mod tests {
         best.mark_invalid(&second, InvalidPoolTransactionError::Underpriced);
         assert!(best.next().is_none());
         assert_eq!(queue.len(), 1);
+        drop(best);
+        // The chain mined sender 1's nonce 2 (taken by the build above): a
+        // build on the next block gets only the refused one back.
+        queue.remove_mined_batch([(Address::repeat_byte(1), 2)]);
         let mut best = queue.best_for_build(B256::repeat_byte(1));
         assert_eq!(best.next().unwrap().nonce(), 4);
+        assert!(best.next().is_none());
     }
 }
