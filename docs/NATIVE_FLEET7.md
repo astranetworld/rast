@@ -4314,3 +4314,38 @@ write-path win from dropping theirs has no Rust analogue -- and
 persistence 0.89 s median per 3-block batch (RocksDB commit 0.32-0.71 s),
 300-410 ms a block against a 0.51 s cycle: off the critical path, the
 number to watch if the cycle drops toward 0.4 s.
+
+### Pacing is flat again, and this time it is the supply
+
+| leg | pacing | win1 | win2 | win3 | occupancy |
+| --- | ---: | ---: | ---: | ---: | --- |
+| loop24P450 | 450 ms | 268,198 | 254,058 | 251,437 | 77-88% |
+| loop24P470 | 470 ms | 263,845 | 257,994 | 258,920 | 85-88% |
+| loop24P425 | 425 ms | 267,054 | 253,859 | 255,894 | 81-83% |
+
+The registered prediction (450 ms fills the blocks to 95%) was
+falsified, and by the premise rather than the arithmetic: the build did
+not grow with the block (378 ms, build ahead on 363 of 365 proposals),
+but the queue did not hold a block's worth when the build started -- p10
+70k, median 148k after each prune -- while the ingest accepted 255k/s
+(p90 279k) per node against the 326k/s a full block every 0.5 s consumes.
+"The pool sat at its 407k gate" had been read as "supply is not
+binding"; the gate holds reth's pool, and what the builder reads is the
+queue, which drains at the ingest's rate. One hop upstream of the
+constraint, the same shape as the instruments both sessions were
+corrected on earlier in the night.
+
+What bounds the ingest is not the slot count as such. Every node ingests
+and recovers every transaction (`F7_INGEST_ALL=1`; a follower cannot vote
+on signatures it has not checked, and ECDSA has no cheaper check than a
+recovery), so the fleet recovers each signature seven times. Raw
+ecrecover on this EPYC, one thread, the crate's default build, is
+36.5-43.1 µs (`-O3 -march=native` makes it slower, 59-79 µs), so the
+ingest's 45 µs a transaction is the library's floor -- but, as the supply
+session found from the code, that figure is *latency*: the timer starts
+before the recovery slot is acquired, so it is slot wait plus recovery,
+and the flood's own signing (pure-Rust k256, ~80 µs a signature on 16
+physical cores) caps the generator near 300k/s. Their split of the timer
+and a libsecp256k1 signer are the next legs; whether the slots are busy
+(CPU: the box's physical ceiling, 7 x 14.7 of 128 physical cores) or
+idle between frames (pipeline) decides where the remaining lever is.
