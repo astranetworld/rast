@@ -25,16 +25,17 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
 
-## Where it stands today: 316,905 TPS (2026-09-04)
+## Where it stands today: 316,289 TPS, every window past 300,000 (2026-09-04)
 
-The record on this fleet (round 39, `loop31E400b`; `loop31E400a` and
-`loop31E450a` around it read 316,905 and 314,823 on window 1):
+The record on this fleet (round 39, `loop33H400a`, bookended by `loop33H400b`
+at 314,690 / 297,856 / 299,955; `loop31E400a` read 316,905 on window 1 and
+`loop31E400b` 315,121 on a window with every block full):
 
 | window | TPS | blocks | cycle | occupancy |
 | --- | ---: | ---: | ---: | ---: |
-| win1 | **313,188** | 64 | 0.469 s | 90.1% |
-| win2 | **315,121** | 58 | 0.517 s | 100% |
-| win3 | 285,755 | 54 | 0.556 s | 97.4% |
+| win1 | **316,289** | 70 | 0.429 s | 83.2% |
+| win2 | **304,541** | 71 | 0.423 s | 78.9% |
+| win3 | **302,823** | 70 | 0.429 s | 79.6% |
 
 Seven nodes, every follower executing every transaction and computing the
 QMDB root, senders recovered on every node, bodies over direct push with
@@ -4592,3 +4593,46 @@ step that has just awaited a 280-340 ms import comes back to a transport
 phase of 120-140 ms (`slow step transport_ms=121 transport_events=15`),
 during which the queued PrepareQC waits. loop32 splits that phase into
 polling and handling with the slowest handler's kind.
+
+### loop32-33: the second round was six redundant 19 MB decodes, and every window is past 300k
+
+The split of the transport phase (loop32, `slow step ... poll_ms=0
+handle_ms=103 slowest_ms=22 slowest_kind="other"`) put the whole of it in
+event *handling*, not in polling the swarm, with 8-26 events a step at
+~7 ms each. The "other" events are `BlockFetched`: a proposal reaches a
+follower 30-40 ms before the leader's pushed body does, the follower asks
+*every* peer for the body at once (`PayloadMissing`, as gov5 does), and
+then decodes each of the five or six 19 MB answers inline on the service
+loop -- 100-180 ms a view on every follower, during which the queued
+PrepareQC waited. Two changes: a fetched body this node already holds is
+not decoded, and the request waits `N42_BODY_REQUEST_GRACE_MS` (120 ms by
+default; 0 restores the immediate ask) for the push to land -- in a round
+of ~210 views node1 asked once.
+
+    leg      grace   win1     win2     win3     cycle    R2 p50   slow steps (node1)
+    H400a    120     316,289  304,541  302,823  0.429 s  6 ms     0
+    H400g0   0       303,589  298,857  295,173  0.435 s  6 ms     0
+    H400b    120     314,690  297,856  299,955  0.429 s  6 ms     0
+
+R2 81 -> 6 ms and R1 400 -> 303 ms in both settings (the decode skip is
+the larger part); the grace is worth another 3-4% on window 1 (the six
+served copies a view are still memcpy and wire). Every window of H400a
+is past 300,000. The chain now cycles in 0.43 s at 78-83% occupancy, so
+the supply is the bound: the flood's closed loop (64 workers x 3,000 in
+flight, reply 0.6-0.8 s) delivers ~300k/s and a deeper window (8, 10) only
+lengthens the reply. Per node that is 16 recovery slots serving ~300k
+signatures a second at 37 us busy each; the fleet recovers every signature
+seven times (`F7_INGEST_ALL=1`; a voter cannot skip the check), which is
+~100 of the box's 128 physical cores. That is this box's ceiling for a
+seven-member fleet that verifies everything, and it is where the number
+stands.
+
+Also seen: the page cache grows ~60 GB in two minutes (seven RocksDB
+execution layers writing ~420 MB/s of bodies, receipts and state), and
+`MemFree` bottoms near 14 GB at the end of a round. Three legs (E400a,
+G400a, G400b) hit a `pgmajfault` storm (700,000 in a minute) in windows 2-3
+with the execution phase drifting 160 -> 440 ms; the legs around them did
+not. Reads of evicted SSTs under the same NVMe's write load is the
+reading; a longer run than 2 minutes will meet it every time, and the
+fix is on the RocksDB side (direct I/O or `fadvise` on the written
+files), not the consensus side.

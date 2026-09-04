@@ -252,6 +252,14 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// Bodies a proposal named that this node has not seen, with when it
+    /// first missed them: the request to peers goes out only after
+    /// `body_grace`, because the leader's direct push is normally 30-40 ms
+    /// behind its proposal and a request sent at once made every follower
+    /// fetch and decode five or six 19 MB copies a view (round 39: 100-180
+    /// ms of every step's transport phase, and the PrepareQC behind it).
+    body_wait: std::collections::HashMap<B256, std::time::Instant>,
+    body_grace: Duration,
     /// When each block's body was last asked of every peer, so a body that
     /// arrives and still does not let the block execute cannot start the
     /// request over immediately. Bounded; insertion order in
@@ -581,6 +589,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            body_wait: std::collections::HashMap::new(),
+            body_grace: body_request_grace(),
             direct_push: false,
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
@@ -933,7 +943,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Nothing happened; the builder is asked again at the top of
                 // the next step.
             }
+            () = tokio::time::sleep(self.body_grace), if !self.body_wait.is_empty() => {
+                // A body's grace may have run out; checked below.
+            }
         }
+        self.request_overdue_bodies(&mut events);
 
         // Everything the transport already has, not one event per step.
         //
@@ -1197,6 +1211,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
             TransportEvent::BlockFetched { peer, hash, reply } => match reply {
+                Ok(_) if self.body_store.contains_key(&hash) => {
+                    // Already here, pushed or fetched from another peer: a
+                    // 19 MB decode for nothing.
+                    debug!(target: "n42.h2.node", %peer, ?hash, "peer answered a block request this node no longer needs");
+                }
                 Ok(chunk) => {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
@@ -1804,7 +1823,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // schedule, because a caller that logs every pass is how the
                 // spin was found and a gigabyte of log is not a better signal
                 // than one line.
-                if self.body_request_due(block_hash) {
+                if !self.body_grace.is_zero() && !self.body_store.contains_key(&block_hash) {
+                    // Deferred: `request_overdue_bodies` asks once the grace
+                    // has passed without the body arriving on its own.
+                    self.body_wait.entry(block_hash).or_insert_with(std::time::Instant::now);
+                } else if self.body_request_due(block_hash) {
                     self.awaiting_bodies.insert(block_hash);
                     for peer in self.transport.connected_peer_ids() {
                         self.transport.request_block(peer, block_hash);
@@ -2129,6 +2152,35 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// arrives, and a leader publishes the body before the proposal, so on
     /// every follower the body sat in the cache while the proposal crossed the
     /// mesh -- measured on the seven-node fleet as ~240 ms between a body
+    /// Asks peers for the bodies whose grace has run out without them
+    /// arriving on their own (see `body_wait`).
+    fn request_overdue_bodies(&mut self, events: &mut Vec<ServiceEvent>) {
+        if self.body_wait.is_empty() {
+            return;
+        }
+        let grace = self.body_grace;
+        let overdue: Vec<B256> = self
+            .body_wait
+            .iter()
+            .filter(|(_, since)| since.elapsed() >= grace)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for block_hash in overdue {
+            self.body_wait.remove(&block_hash);
+            if self.body_store.contains_key(&block_hash) || self.imported.contains(&block_hash) {
+                continue;
+            }
+            if self.body_request_due(block_hash) {
+                info!(target: "n42.h2.node", ?block_hash, grace_ms = grace.as_millis() as u64, "body did not arrive within the grace; asking peers");
+                self.awaiting_bodies.insert(block_hash);
+                for peer in self.transport.connected_peer_ids() {
+                    self.transport.request_block(peer, block_hash);
+                }
+                events.push(ServiceEvent::PayloadMissing { block_hash });
+            }
+        }
+    }
+
     /// arriving and its vote leaving that the execution layer's own import did
     /// not account for. A body is self-validating; importing it early risks
     /// nothing but the work, and the vote still waits for the proposal.
@@ -2137,6 +2189,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             debug!(target: "n42.h2.node", ?block_hash, waited_ms = at.elapsed().as_millis() as u64, "eager import queued");
         }
         self.awaiting_bodies.remove(&block_hash);
+        self.body_wait.remove(&block_hash);
         if !self.imported.contains(&block_hash) && !self.ready_bodies.contains(&block_hash) {
             self.ready_bodies.push(block_hash);
         }
@@ -2455,4 +2508,14 @@ fn transport_event_kind(event: &TransportEvent) -> &'static str {
         TransportEvent::Block { .. } => "block",
         _ => "other",
     }
+}
+
+/// `N42_BODY_REQUEST_GRACE_MS`: how long a follower waits for a proposal's
+/// body to arrive on its own (the leader's push, the block topic) before
+/// asking peers for it. Default 120 ms; 0 asks at once, as before.
+fn body_request_grace() -> Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("N42_BODY_REQUEST_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(120)
+    }))
 }
