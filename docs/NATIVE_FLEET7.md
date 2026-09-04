@@ -25,16 +25,16 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
 
-## Where it stands today: 305,556 TPS (2026-09-04)
+## Where it stands today: 316,905 TPS (2026-09-04)
 
-The record on this fleet, bookended (round 39, `loop27B2`, with `loop27A1`
-and `loop27A2` at 288/288/277 and 291/283/283 around the puller legs):
+The record on this fleet (round 39, `loop31E400b`; `loop31E400a` and
+`loop31E450a` around it read 316,905 and 314,823 on window 1):
 
 | window | TPS | blocks | cycle | occupancy |
 | --- | ---: | ---: | ---: | ---: |
-| win1 | **305,556** | 57 | 0.526 s | 98.7% |
-| win2 | **298,824** | 55 | 0.545 s | 100% |
-| win3 | 277,045 | 51 | 0.588 s | 100% |
+| win1 | **313,188** | 64 | 0.469 s | 90.1% |
+| win2 | **315,121** | 58 | 0.517 s | 100% |
+| win3 | 285,755 | 54 | 0.556 s | 97.4% |
 
 Seven nodes, every follower executing every transaction and computing the
 QMDB root, senders recovered on every node, bodies over direct push with

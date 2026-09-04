@@ -109,9 +109,9 @@ block's cycle goes — run at the END of a round and compare whole rounds only)
 and `scripts/fleet7-profile.sh` (perf between windows; `--alloc` for jemalloc
 heap profiles, the instrument a CPU profile cannot replace).
 
-**Record (2026-09-04, round 39): 305,556 / 298,824 TPS** (win1/win2, 0.526 s cycle,
-163,000 tx/block, every follower executing, bookended by 288/288/277 and 291/283/283 without the
-puller) with `F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1
+**Record (2026-09-04, round 39): 313,188 / 315,121 TPS** (win1/win2 of loop31E400b, 0.517 s cycle
+with every block full, 163,000 tx/block, every follower executing; 316,905 and 314,823 on window 1 of
+the legs around it) with `F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1
 N42_TX_INGEST_ASYNC=1 F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=400 F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1
 N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DIRECT=1
 N42_FAST_TRANSFER=1 N42_FOLLOWER_DIRECT_IMPORT=1 F7_SENDER_CACHE_MULT=4 N42_TX_QUEUE_BATCH=1024
