@@ -257,7 +257,7 @@ fn spawn_stats_reporter() {
     tokio::spawn(async move {
         let slots = recovery_slot_count();
         let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64);
-        let mut last_reply = (0u64, 0u64, 0u64);
+        let mut last_reply = (0u64, 0u64, 0u64, 0u64, 0u64);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let now = std::time::Instant::now();
@@ -280,17 +280,21 @@ fn spawn_stats_reporter() {
                 // problem); at 100% they are the ceiling (a CPU problem).
                 let slots_busy_pct = slots
                     .map(|slots| (dbusy as f64 / 1e9 / (slots as f64 * secs) * 100.0) as u64);
-                let (reply, gate_ns, chan) = (
+                let (reply, gate_ns, chan, acq, spawn) = (
                     STATS.reply_ns.load(Ordering::Relaxed),
                     STATS.gate_ns.load(Ordering::Relaxed),
                     STATS.chan_ns.load(Ordering::Relaxed),
+                    STATS.acq_ns.load(Ordering::Relaxed),
+                    STATS.spawn_ns.load(Ordering::Relaxed),
                 );
-                let (reply_us, gate_us, chan_us) = (
+                let (reply_us, gate_us, chan_us, acq_us, spawn_us) = (
                     (reply - last_reply.0) / dframes / 1_000,
                     (gate_ns - last_reply.1) / dframes / 1_000,
                     (chan - last_reply.2) / dframes / 1_000,
+                    (acq - last_reply.3) / dframes / 1_000,
+                    (spawn - last_reply.4) / dframes / 1_000,
                 );
-                last_reply = (reply, gate_ns, chan);
+                last_reply = (reply, gate_ns, chan, acq, spawn);
                 info!(
                     target: "n42.tx_ingest",
                     frames = dframes,
@@ -306,6 +310,8 @@ fn spawn_stats_reporter() {
                     reply_us_per_frame = reply_us,
                     gate_us_per_frame = gate_us,
                     chan_us_per_frame = chan_us,
+                    acq_us_per_frame = acq_us,
+                    spawn_us_per_frame = spawn_us,
                     "ingest"
                 );
             }
@@ -490,14 +496,18 @@ where
             let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
             let cache = cache.clone();
+            let acquiring = std::time::Instant::now();
             let slot = std::sync::Arc::clone(recovery_slots())
                 .acquire_owned()
                 .await
                 .expect("the recovery semaphore is never closed");
+            let granted = std::time::Instant::now();
+            STATS.acq_ns.fetch_add(granted.duration_since(acquiring).as_nanos() as u64, Ordering::Relaxed);
             let recovering = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
                 apply_recovery_nice();
                 let busy = std::time::Instant::now();
+                STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
                 let decoded = decode_and_recover::<P>(raws, cache.as_ref());
                 STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 decoded
@@ -550,6 +560,11 @@ struct IngestStats {
     reply_ns: AtomicU64,
     gate_ns: AtomicU64,
     chan_ns: AtomicU64,
+    /// Waiting for a recovery slot (`acq_ns`), and from the slot granted to
+    /// the recovery task actually running on a blocking thread (`spawn_ns`):
+    /// the hand-off through the runtime, paid once per frame.
+    acq_ns: AtomicU64,
+    spawn_ns: AtomicU64,
 }
 
 static STATS: IngestStats = IngestStats {
@@ -561,6 +576,8 @@ static STATS: IngestStats = IngestStats {
     reply_ns: AtomicU64::new(0),
     gate_ns: AtomicU64::new(0),
     chan_ns: AtomicU64::new(0),
+    acq_ns: AtomicU64::new(0),
+    spawn_ns: AtomicU64::new(0),
 };
 
 
