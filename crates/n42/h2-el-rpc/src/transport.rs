@@ -192,14 +192,33 @@ impl JsonRpcTransport for HttpTransport {
             "params": params,
         });
 
-        let response = self
-            .client
-            .post(self.url.clone())
-            .header(reqwest::header::AUTHORIZATION, self.bearer()?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| TransportError::Transport(e.to_string()))?;
+        // A send that fails before any response -- a pooled keep-alive
+        // connection the server closed meanwhile, a reset -- is retried once
+        // on a fresh connection; a timeout is not (the request may have been
+        // acted on). Round 38: three such failures on a tenure leader's
+        // forkchoiceUpdated each cost a view (10 s of timeout) and a window.
+        let mut response = None;
+        for attempt in 0..2u8 {
+            match self
+                .client
+                .post(self.url.clone())
+                .header(reqwest::header::AUTHORIZATION, self.bearer()?)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    response = Some(r);
+                    break;
+                }
+                Err(e) if attempt == 0 && !e.is_timeout() && (e.is_connect() || e.is_request()) => {
+                    tracing::warn!(target: "n42.h2.el", method, %e, "engine request failed before a response; retrying once");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => return Err(TransportError::Transport(e.to_string())),
+            }
+        }
+        let response = response.expect("set on the successful attempt");
 
         // A 401 here is the JWT, not the payload, and saying so saves a long
         // detour through Engine API version differences.
