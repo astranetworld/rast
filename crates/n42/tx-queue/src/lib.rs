@@ -228,6 +228,16 @@ impl<T: PoolTransaction> TxQueue<T> {
                     inner.give_back(taken);
                     tracing::info!(target: "n42.tx_queue", count, "previous build on the same parent was not committed; its transactions are offered again");
                 }
+                // A build on another parent -- a build ahead superseded by the
+                // next block -- took transactions the queue must not lose: they
+                // go back too, and the canonical pruner removes the ones the
+                // chain has meanwhile mined. Dropping them here starved the
+                // builder while the pool sat at its gate (round 38).
+                Some((previous, taken)) if !taken.is_empty() => {
+                    let count = taken.len();
+                    inner.give_back(taken);
+                    tracing::debug!(target: "n42.tx_queue", count, ?previous, ?parent, "a build on another parent was superseded; its transactions are offered again");
+                }
                 _ => {}
             }
             inner.last_build = Some((parent, Vec::new()));

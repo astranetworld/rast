@@ -483,6 +483,19 @@ where
                         .and_then(|r| r);
                         match handed {
                             Ok((executed, phases, converted)) => {
+                                // The block's transactions leave the queue now, not
+                                // when the canonical pruner gets to them: a build
+                                // ahead starts the moment this import returns and
+                                // would otherwise take them again (87,800 stale
+                                // transactions in one build, round 38).
+                                if let Some(queue) = n42_tx_queue::global::<reth_transaction_pool::EthPooledTransaction>() {
+                                    let mined: Vec<(alloy_primitives::Address, u64)> = executed
+                                        .recovered_block
+                                        .transactions_with_sender()
+                                        .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+                                        .collect();
+                                    tokio::task::spawn_blocking(move || queue.remove_mined_batch(mined));
+                                }
                                 let (done, handed) = tokio::sync::oneshot::channel();
                                 let sent = inserts
                                     .send(reth_node_builder::executed_inserts::ExecutedInsert { block: executed, done })
