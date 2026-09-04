@@ -75,6 +75,8 @@ while (( $# )); do
     --decay-sec)    DECAY_SEC=$2; shift 2 ;;
     --conc)         CONC=$2; shift 2 ;;
     --rpcbatch)     RPCBATCH=$2; shift 2 ;;
+    # F7_FLOOD_WINDOW=<frames>: the flood's frames in flight per worker
+    # (tx_flood --window, default 32) -- the closed loop's depth.
     --gasprice)     GASPRICE=$2; shift 2 ;;
     --gasceil)      GASCEIL=$2; shift 2 ;;
     --profile-node) PROFILE_NODE=$2; shift 2 ;;
@@ -381,7 +383,7 @@ for ((fp = 0; fp < FLOOD_PROCS; fp++)); do
   setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
     "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
     --senders "$fp_senders" --pertx "$PERTX" --offset "$fp_offset" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
-    --conc "$fp_conc" --rpcbatch "$RPCBATCH" $SHARD \
+    --conc "$fp_conc" --rpcbatch "$RPCBATCH" ${F7_FLOOD_WINDOW:+--window "$F7_FLOOD_WINDOW"} $SHARD \
     > "$fp_log" 2>&1 < /dev/null 9>&- &
   FLOODS+=($!)
   echo "flood        : pid ${FLOODS[-1]}, $fp_senders senders from $fp_offset, $fp_conc workers, log $fp_log"

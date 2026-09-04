@@ -81,6 +81,19 @@ const MAX_FRAME_TXS: u32 = 10_000;
 /// block's demand: the length of the pool stall it is meant to cover.
 const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
 
+/// `N42_TX_INGEST_ASYNC_FRAMES`: frames a connection may have recovering
+/// or awaiting admission before its next answer waits; the default above.
+fn async_frames_in_flight() -> usize {
+    static FRAMES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("N42_TX_INGEST_ASYNC_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(ASYNC_FRAMES_IN_FLIGHT)
+    })
+}
+
 /// How many frames may be in sender recovery at once, node-wide:
 /// `N42_TX_INGEST_RECOVER_PARALLEL`, unlimited by default. Unlimited, 64
 /// connections with 8 frames in flight each are 512 blocking threads of
@@ -122,14 +135,18 @@ fn apply_recovery_nice() {
     }
 }
 
+/// The recovery slot count when it is bounded, `None` when unlimited.
+fn recovery_slot_count() -> Option<usize> {
+    std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
 fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| {
-        let permits = std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS);
+        let permits = recovery_slot_count().unwrap_or(tokio::sync::Semaphore::MAX_PERMITS);
         std::sync::Arc::new(tokio::sync::Semaphore::new(permits))
     })
 }
@@ -238,33 +255,67 @@ fn high_water() -> usize {
 /// Prints the ingest's rate and time split every five seconds, once.
 fn spawn_stats_reporter() {
     tokio::spawn(async move {
-        let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64);
+        let slots = recovery_slot_count();
+        let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut last_reply = (0u64, 0u64, 0u64, 0u64, 0u64);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let now = std::time::Instant::now();
-            let (frames, txs, recover, pool) = (
+            let (frames, txs, recover, pool, busy) = (
                 STATS.frames.load(Ordering::Relaxed),
                 STATS.txs.load(Ordering::Relaxed),
                 STATS.recover_ns.load(Ordering::Relaxed),
                 STATS.pool_ns.load(Ordering::Relaxed),
+                STATS.busy_ns.load(Ordering::Relaxed),
             );
             let dframes = frames - last.1;
             if dframes > 0 {
                 let dtxs = txs - last.2;
                 let secs = now.duration_since(last.0).as_secs_f64();
+                let dbusy = busy - last.5;
+                let drecover = recover - last.3;
+                // How much of the slots' capacity the recovery used: busy
+                // time over slots x interval. Under 100% with the generator
+                // waiting says the slots idle between frames (a pipeline
+                // problem); at 100% they are the ceiling (a CPU problem).
+                let slots_busy_pct = slots
+                    .map(|slots| (dbusy as f64 / 1e9 / (slots as f64 * secs) * 100.0) as u64);
+                let (reply, gate_ns, chan, acq, spawn) = (
+                    STATS.reply_ns.load(Ordering::Relaxed),
+                    STATS.gate_ns.load(Ordering::Relaxed),
+                    STATS.chan_ns.load(Ordering::Relaxed),
+                    STATS.acq_ns.load(Ordering::Relaxed),
+                    STATS.spawn_ns.load(Ordering::Relaxed),
+                );
+                let (reply_us, gate_us, chan_us, acq_us, spawn_us) = (
+                    (reply - last_reply.0) / dframes / 1_000,
+                    (gate_ns - last_reply.1) / dframes / 1_000,
+                    (chan - last_reply.2) / dframes / 1_000,
+                    (acq - last_reply.3) / dframes / 1_000,
+                    (spawn - last_reply.4) / dframes / 1_000,
+                );
+                last_reply = (reply, gate_ns, chan, acq, spawn);
                 info!(
                     target: "n42.tx_ingest",
                     frames = dframes,
                     txs = dtxs,
                     rate = (dtxs as f64 / secs) as u64,
-                    recover_ms_per_frame = (recover - last.3) / dframes / 1_000_000,
+                    recover_ms_per_frame = drecover / dframes / 1_000_000,
                     pool_ms_per_frame = (pool - last.4) / dframes / 1_000_000,
-                    recover_us_per_tx = (recover - last.3) / dtxs.max(1) / 1_000,
+                    recover_us_per_tx = drecover / dtxs.max(1) / 1_000,
+                    busy_us_per_tx = dbusy / dtxs.max(1) / 1_000,
+                    slot_wait_us_per_tx = drecover.saturating_sub(dbusy) / dtxs.max(1) / 1_000,
+                    slots_busy_pct,
                     pool_us_per_tx = (pool - last.4) / dtxs.max(1) / 1_000,
+                    reply_us_per_frame = reply_us,
+                    gate_us_per_frame = gate_us,
+                    chan_us_per_frame = chan_us,
+                    acq_us_per_frame = acq_us,
+                    spawn_us_per_frame = spawn_us,
                     "ingest"
                 );
             }
-            last = (now, frames, txs, recover, pool);
+            last = (now, frames, txs, recover, pool, busy);
         }
     });
 }
@@ -428,6 +479,7 @@ where
         // when a backlog has formed, which is when the followers' import was
         // seen to double (80% of a follower's samples on the runtime's threads
         // in one kernel address). One watcher polls; the waiters sleep.
+        let frame_read = std::time::Instant::now();
         loop {
             let notified = GATE.open.notified();
             tokio::pin!(notified);
@@ -439,26 +491,37 @@ where
             notified.await;
             GATE.waiting.fetch_sub(1, Ordering::Relaxed);
         }
+        STATS.gate_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
             let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
             let cache = cache.clone();
+            let acquiring = std::time::Instant::now();
             let slot = std::sync::Arc::clone(recovery_slots())
                 .acquire_owned()
                 .await
                 .expect("the recovery semaphore is never closed");
+            let granted = std::time::Instant::now();
+            STATS.acq_ns.fetch_add(granted.duration_since(acquiring).as_nanos() as u64, Ordering::Relaxed);
             let recovering = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
                 apply_recovery_nice();
-                decode_and_recover::<P>(raws, cache.as_ref())
+                let busy = std::time::Instant::now();
+                STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
+                let decoded = decode_and_recover::<P>(raws, cache.as_ref());
+                STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                decoded
             });
             // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
             // waiting for the pool: the answer waits for a slot, as before.
+            let chan = std::time::Instant::now();
             if admit_tx.send(recovering).await.is_err() {
                 return Ok(());
             }
+            STATS.chan_ns.fetch_add(chan.elapsed().as_nanos() as u64, Ordering::Relaxed);
             write_half.write_u32_le(offered).await?;
             write_half.write_u32_le(pending).await?;
+            STATS.reply_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
             continue;
         }
         let accepted = admit(&pool, raws, cache.clone()).await;
@@ -482,15 +545,39 @@ where
 struct IngestStats {
     frames: AtomicU64,
     txs: AtomicU64,
+    /// Wall time from a frame's arrival at `admit` to its senders recovered:
+    /// the wait for a recovery slot plus the recovery itself.
     recover_ns: AtomicU64,
+    /// Time spent inside the recovery task alone, on a slot -- the CPU cost
+    /// of decoding and secp256k1, without the queue for a slot in front of
+    /// it. `recover_ns - busy_ns` is that queue.
+    busy_ns: AtomicU64,
     pool_ns: AtomicU64,
+    /// Per frame on the connection's read loop: from the frame fully read to
+    /// its answer written (`reply_ns`), of which the gate (`gate_ns`) and the
+    /// wait for room in the connection's admission channel (`chan_ns`). What
+    /// the generator sees as an answer's latency, minus the wire.
+    reply_ns: AtomicU64,
+    gate_ns: AtomicU64,
+    chan_ns: AtomicU64,
+    /// Waiting for a recovery slot (`acq_ns`), and from the slot granted to
+    /// the recovery task actually running on a blocking thread (`spawn_ns`):
+    /// the hand-off through the runtime, paid once per frame.
+    acq_ns: AtomicU64,
+    spawn_ns: AtomicU64,
 }
 
 static STATS: IngestStats = IngestStats {
     frames: AtomicU64::new(0),
     txs: AtomicU64::new(0),
     recover_ns: AtomicU64::new(0),
+    busy_ns: AtomicU64::new(0),
     pool_ns: AtomicU64::new(0),
+    reply_ns: AtomicU64::new(0),
+    gate_ns: AtomicU64::new(0),
+    chan_ns: AtomicU64::new(0),
+    acq_ns: AtomicU64::new(0),
+    spawn_ns: AtomicU64::new(0),
 };
 
 
@@ -516,7 +603,10 @@ where
     let decoded = match tokio::task::spawn_blocking(move || {
         let _slot = slot;
         apply_recovery_nice();
-        decode_and_recover::<P>(raws, cache.as_ref())
+        let busy = std::time::Instant::now();
+        let decoded = decode_and_recover::<P>(raws, cache.as_ref());
+        STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        decoded
     })
     .await
     {

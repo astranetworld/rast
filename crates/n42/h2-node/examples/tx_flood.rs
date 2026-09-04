@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, TxKind, U256};
+use alloy_primitives::{keccak256, Address, Signature, TxKind, B256, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use serde_json::{json, Value};
@@ -90,7 +90,11 @@ fn recipient(spread: u32, index: u64) -> Address {
 }
 const TRANSFER_GAS: u64 = 21_000;
 /// gov5 caps a batch here; beyond it the JSON body itself becomes the cost.
-const MAX_RPC_BATCH: usize = 200;
+// Over the ingest a frame may carry up to 10,000 transactions and a bigger
+// frame amortises the node's per-frame hand-off (~24 ms a frame at 100 on a
+// connection's read loop); over JSON-RPC a batch this large may exceed the
+// server's limit, so raise `--rpcbatch` past 200 only with `--ingest`.
+const MAX_RPC_BATCH: usize = 2000;
 
 struct Args {
     rpcs: Vec<String>,
@@ -109,6 +113,11 @@ struct Args {
     gas: u64,
     conc: usize,
     rpc_batch: usize,
+    /// Frames a worker may have unanswered at once over the ingest
+    /// (`--window`, 32). The generator is a closed loop: its rate is the
+    /// frames in flight over an answer's latency, so this is the knob that
+    /// says whether a node's answers or its own signing bound it.
+    window: usize,
     shard_senders: bool,
     skip_funding: bool,
     /// How many distinct recipients the transfers are spread over. 1 keeps the
@@ -161,13 +170,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (sent, rejected, stop) = (Arc::clone(&sent), Arc::clone(&rejected), Arc::clone(&stop));
         std::thread::spawn(move || {
             let mut last = (Instant::now(), 0u64);
+            let mut last_reply = ([0u64; 8], [0u64; 8]);
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(5));
                 let now = Instant::now();
                 let total = sent.load(Ordering::Relaxed);
                 let rate = (total - last.1) as f64 / now.duration_since(last.0).as_secs_f64();
+                // Each node's answer latency (send to answer read) over the
+                // interval, in ms: the number that says which node the
+                // generator is waiting on, and whether the wait is the wire
+                // or the node.
+                let mut per_node = String::new();
+                for node in 0..REPLY_NS.len() {
+                    let (ns, n) = (REPLY_NS[node].load(Ordering::Relaxed), REPLY_N[node].load(Ordering::Relaxed));
+                    let (dns, dn) = (ns - last_reply.0[node], n - last_reply.1[node]);
+                    last_reply.0[node] = ns;
+                    last_reply.1[node] = n;
+                    if dn > 0 {
+                        per_node.push_str(&format!("{:.1} ", dns as f64 / dn as f64 / 1e6));
+                    }
+                }
                 eprintln!(
-                    "flood +{:>4}s: sent {} ({:.0}/s), rejected {}, sign {}s, send {}s, wait {}s, deepest pool {}",
+                    "flood +{:>4}s: sent {} ({:.0}/s), rejected {}, sign {}s, send {}s, wait {}s, deepest pool {}, reply ms/node [{}]",
                     started.elapsed().as_secs(),
                     total,
                     rate,
@@ -176,6 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     SEND_NS.load(Ordering::Relaxed) / 1_000_000_000,
                     WAIT_NS.load(Ordering::Relaxed) / 1_000_000_000,
                     DEEPEST.load(Ordering::Relaxed),
+                    per_node.trim_end(),
                 );
                 last = (now, total);
             }
@@ -367,7 +392,7 @@ fn flood_over_ingest(
     /// shallow enough that a worker cannot bury the node under work it has
     /// already refused: at 100 transactions a frame this is 3,200 in flight
     /// per worker.
-    const WINDOW: usize = 32;
+    let window = args.window.max(1);
 
     let mut inflight = vec![false; part.len()];
     let mut done = vec![false; part.len()];
@@ -378,7 +403,7 @@ fn flood_over_ingest(
     loop {
         let mut wrote = false;
         for (index, key) in part.iter().enumerate() {
-            if done[index] || inflight[index] || conn.inflight.len() >= WINDOW {
+            if done[index] || inflight[index] || conn.inflight.len() >= window {
                 continue;
             }
             let from = nonce[index];
@@ -460,8 +485,13 @@ struct Ingest {
     /// Senders with a frame in flight, in the order the frames were written.
     /// Replies come back in the same order, so this is what matches an answer
     /// to the sender it belongs to.
-    inflight: std::collections::VecDeque<(usize, usize)>,
+    inflight: std::collections::VecDeque<(usize, usize, Instant)>,
 }
+
+/// Per stream (node), the answers' latency summed since the start and their
+/// count: send to answer read, in nanoseconds. Eight slots for seven nodes.
+static REPLY_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static REPLY_N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 impl Ingest {
     fn connect(addrs: &[&str]) -> std::io::Result<Self> {
@@ -491,7 +521,7 @@ impl Ingest {
         for stream in &mut self.streams {
             stream.write_all(&frame)?;
         }
-        self.inflight.push_back((sender, batch.len()));
+        self.inflight.push_back((sender, batch.len(), Instant::now()));
         Ok(())
     }
 
@@ -505,7 +535,7 @@ impl Ingest {
     /// was full or the generator that was slow.
     fn recv(&mut self) -> std::io::Result<Option<(usize, usize, usize, usize)>> {
         use std::io::Read;
-        let Some((sender, offered)) = self.inflight.pop_front() else {
+        let Some((sender, offered, sent_at)) = self.inflight.pop_front() else {
             return Ok(None);
         };
         // Across the streams: the fewest accepted, so a nonce never advances
@@ -513,11 +543,15 @@ impl Ingest {
         // gating the generator.
         let mut accepted = usize::MAX;
         let mut pending = 0usize;
-        for stream in &mut self.streams {
+        for (node, stream) in self.streams.iter_mut().enumerate() {
             let mut buf = [0u8; 8];
             stream.read_exact(&mut buf)?;
             accepted = accepted.min(u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")) as usize);
             pending = pending.max(u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize);
+            if node < REPLY_NS.len() {
+                REPLY_NS[node].fetch_add(sent_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                REPLY_N[node].fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(Some((sender, offered, accepted, pending)))
     }
@@ -535,9 +569,36 @@ fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128
         value: U256::from(value),
         ..Default::default()
     };
-    let signature = key.sign_hash_sync(&tx.signature_hash()).expect("sign");
+    let signature = sign_hash(key, &tx.signature_hash());
     let envelope: TxEnvelope = tx.into_signed(signature).into();
     envelope.encoded_2718()
+}
+
+/// Signs a hash with libsecp256k1 rather than the signer's k256.
+///
+/// The signer's own `sign_hash_sync` is pure-Rust k256 and costs ~80 us a
+/// transaction on this generator's SMT-shared cores -- 22 of its 64 workers
+/// were signing at 269k/s with the other 42 waiting on answers, which put
+/// the flood's own ceiling near 300k/s, below what the chain now consumes.
+/// libsecp256k1 signs in a fraction of that, and the node recovers with the
+/// same library, so the two sides agree on low-s normalisation. The
+/// secret is re-derived from the signer's bytes each call; that is a scalar
+/// check, ~1 us, nothing beside the signature. `TX_FLOOD_K256_SIGN=1`
+/// restores the k256 path for an A-B.
+fn sign_hash(key: &PrivateKeySigner, hash: &B256) -> Signature {
+    static K256: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *K256.get_or_init(|| std::env::var_os("TX_FLOOD_K256_SIGN").is_some()) {
+        return key.sign_hash_sync(hash).expect("sign");
+    }
+    let secret = secp256k1::SecretKey::from_slice(key.to_bytes().as_slice()).expect("a derived key is a valid scalar");
+    let message = secp256k1::Message::from_digest(hash.0);
+    let (recovery_id, compact) =
+        secp256k1::SECP256K1.sign_ecdsa_recoverable(&message, &secret).serialize_compact();
+    Signature::new(
+        U256::from_be_slice(&compact[..32]),
+        U256::from_be_slice(&compact[32..]),
+        i32::from(recovery_id) != 0,
+    )
 }
 
 /// Submits a batch as one JSON-RPC array. Counts each element's outcome, since
@@ -724,6 +785,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         gas: TRANSFER_GAS,
         conc: 32,
         rpc_batch: 100,
+        window: 32,
         shard_senders: false,
         skip_funding: false,
         ingest: Vec::new(),
@@ -744,6 +806,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--gas" => args.gas = next()?.parse()?,
             "--conc" => args.conc = next()?.parse()?,
             "--rpcbatch" => args.rpc_batch = next()?.parse::<usize>()?.clamp(1, MAX_RPC_BATCH),
+            "--window" => args.window = next()?.parse::<usize>()?.clamp(1, 4096),
             "--ingest" => args.ingest = next()?.split(',').map(str::to_owned).collect(),
             "--ingest-all" => args.ingest_all = true,
             "--recipients" => args.recipients = next()?.parse()?,
@@ -782,3 +845,20 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --shard-senders     pin each sender to one node (cold-follower path)
   --skip-funding      the senders are already funded
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libsecp_signs_what_k256_signs() {
+        for i in 0..8u64 {
+            let key = PrivateKeySigner::from_bytes(&keccak256(i.to_be_bytes())).expect("key");
+            let hash = keccak256((i * 7).to_be_bytes());
+            let fast = sign_hash(&key, &hash);
+            let slow = key.sign_hash_sync(&hash).expect("sign");
+            assert_eq!(fast, slow, "sender {i}: libsecp256k1 and k256 disagree");
+            assert_eq!(fast.recover_address_from_prehash(&hash).expect("recover"), key.address());
+        }
+    }
+}
