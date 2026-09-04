@@ -81,6 +81,19 @@ const MAX_FRAME_TXS: u32 = 10_000;
 /// block's demand: the length of the pool stall it is meant to cover.
 const ASYNC_FRAMES_IN_FLIGHT: usize = 8;
 
+/// `N42_TX_INGEST_ASYNC_FRAMES`: frames a connection may have recovering
+/// or awaiting admission before its next answer waits; the default above.
+fn async_frames_in_flight() -> usize {
+    static FRAMES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("N42_TX_INGEST_ASYNC_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(ASYNC_FRAMES_IN_FLIGHT)
+    })
+}
+
 /// How many frames may be in sender recovery at once, node-wide:
 /// `N42_TX_INGEST_RECOVER_PARALLEL`, unlimited by default. Unlimited, 64
 /// connections with 8 frames in flight each are 512 blocking threads of
@@ -244,6 +257,7 @@ fn spawn_stats_reporter() {
     tokio::spawn(async move {
         let slots = recovery_slot_count();
         let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut last_reply = (0u64, 0u64, 0u64);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let now = std::time::Instant::now();
@@ -266,6 +280,17 @@ fn spawn_stats_reporter() {
                 // problem); at 100% they are the ceiling (a CPU problem).
                 let slots_busy_pct = slots
                     .map(|slots| (dbusy as f64 / 1e9 / (slots as f64 * secs) * 100.0) as u64);
+                let (reply, gate_ns, chan) = (
+                    STATS.reply_ns.load(Ordering::Relaxed),
+                    STATS.gate_ns.load(Ordering::Relaxed),
+                    STATS.chan_ns.load(Ordering::Relaxed),
+                );
+                let (reply_us, gate_us, chan_us) = (
+                    (reply - last_reply.0) / dframes / 1_000,
+                    (gate_ns - last_reply.1) / dframes / 1_000,
+                    (chan - last_reply.2) / dframes / 1_000,
+                );
+                last_reply = (reply, gate_ns, chan);
                 info!(
                     target: "n42.tx_ingest",
                     frames = dframes,
@@ -278,6 +303,9 @@ fn spawn_stats_reporter() {
                     slot_wait_us_per_tx = drecover.saturating_sub(dbusy) / dtxs.max(1) / 1_000,
                     slots_busy_pct,
                     pool_us_per_tx = (pool - last.4) / dtxs.max(1) / 1_000,
+                    reply_us_per_frame = reply_us,
+                    gate_us_per_frame = gate_us,
+                    chan_us_per_frame = chan_us,
                     "ingest"
                 );
             }
@@ -445,6 +473,7 @@ where
         // when a backlog has formed, which is when the followers' import was
         // seen to double (80% of a follower's samples on the runtime's threads
         // in one kernel address). One watcher polls; the waiters sleep.
+        let frame_read = std::time::Instant::now();
         loop {
             let notified = GATE.open.notified();
             tokio::pin!(notified);
@@ -456,6 +485,7 @@ where
             notified.await;
             GATE.waiting.fetch_sub(1, Ordering::Relaxed);
         }
+        STATS.gate_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
             let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
@@ -474,11 +504,14 @@ where
             });
             // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
             // waiting for the pool: the answer waits for a slot, as before.
+            let chan = std::time::Instant::now();
             if admit_tx.send(recovering).await.is_err() {
                 return Ok(());
             }
+            STATS.chan_ns.fetch_add(chan.elapsed().as_nanos() as u64, Ordering::Relaxed);
             write_half.write_u32_le(offered).await?;
             write_half.write_u32_le(pending).await?;
+            STATS.reply_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
             continue;
         }
         let accepted = admit(&pool, raws, cache.clone()).await;
@@ -510,6 +543,13 @@ struct IngestStats {
     /// it. `recover_ns - busy_ns` is that queue.
     busy_ns: AtomicU64,
     pool_ns: AtomicU64,
+    /// Per frame on the connection's read loop: from the frame fully read to
+    /// its answer written (`reply_ns`), of which the gate (`gate_ns`) and the
+    /// wait for room in the connection's admission channel (`chan_ns`). What
+    /// the generator sees as an answer's latency, minus the wire.
+    reply_ns: AtomicU64,
+    gate_ns: AtomicU64,
+    chan_ns: AtomicU64,
 }
 
 static STATS: IngestStats = IngestStats {
@@ -518,6 +558,9 @@ static STATS: IngestStats = IngestStats {
     recover_ns: AtomicU64::new(0),
     busy_ns: AtomicU64::new(0),
     pool_ns: AtomicU64::new(0),
+    reply_ns: AtomicU64::new(0),
+    gate_ns: AtomicU64::new(0),
+    chan_ns: AtomicU64::new(0),
 };
 
 
