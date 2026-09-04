@@ -4706,3 +4706,38 @@ and is never read; faults are attributed per process
 
 The record window in this set: 319,872 (loop35R400b window 2) and 318,587
 (loop37D400a4 window 1), both supply-bound at ~83% occupancy.
+
+## Where the headroom is (2026-09-04, after round 39)
+
+The fleet reads 310-319k on window 1 at ~83% occupancy with a 0.42-0.43 s
+cycle, so the supply binds: seven ingests at ~53 us a transaction per
+slot (37 us of it ecrecover), 16 slots each, ~300k/s, every signature
+recovered seven times -- ~100 of the box's 128 physical cores. In order:
+
+1. Supply, non-signature part: decode outside the slot, insert straight
+   into the queue, batch per sender (16 of the 53 us; +10-15%). Re-test
+   18-20 recovery slots at pacing 400 now that the import is lighter.
+   libsecp256k1's ecmult window is single digits at best; ECDSA does not
+   batch. Structural ceiling on one box: 7 x 40 us = 280 us CPU a
+   transaction, ~350k realistic; seven boxes move the bound back to the
+   chain.
+2. Chain, masked by supply today: own import 90-130 ms (send the sealed
+   header, not the 19 MB payload, back to the execution layer: -30-40
+   ms); builder execution 229 ms (revm `State` transition bookkeeping
+   ~15% of the thread, tx clone 8%: a fast path that writes the bundle
+   directly, ~1 us/tx); follower execution 145 ms (a partitioned parallel
+   fast path for plain transfers -- not reth's BAL executor, measured a
+   loss). Together a ~0.33-0.35 s full-block cycle, ~465k capacity, pacing
+   300-350.
+3. Long runs: ~1 GB/s of writes across seven nodes (~2.5x the block's
+   data: compaction, static files, MDBX) -- larger write buffers, prune or
+   relocate the transaction-hash index; the first-leg cold-cache collapse
+   (root cause open; warm-up leg meanwhile); trim the validator's body
+   store (3.5 GB) by finalized height.
+4. Latency, not TPS: the libp2p swarm is still polled inline by the
+   service loop; its own task is the right shape.
+
+Measured null or worse, not to be re-run: deeper flood windows, 24
+recovery slots (old configuration), the vote log's fsync, RocksDB
+fsync/direct-IO on the cycle, the BAL parallel executor, account
+prefetch, pool gate depth, the flood's signer.
