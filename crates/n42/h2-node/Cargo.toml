@@ -28,6 +28,7 @@ reqwest = { workspace = true, features = ["json", "rustls"] }
 url.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
 secp256k1.workspace = true

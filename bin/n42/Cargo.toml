@@ -13,6 +13,7 @@ default-run = "n42"
 workspace = true
 
 [dependencies]
+libc.workspace = true
 reth-primitives-traits.workspace = true
 #n42
 pubsub-mem.workspace = true

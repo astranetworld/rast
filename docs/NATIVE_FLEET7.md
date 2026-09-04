@@ -4741,3 +4741,48 @@ Measured null or worse, not to be re-run: deeper flood windows, 24
 recovery slots (old configuration), the vote log's fsync, RocksDB
 fsync/direct-IO on the cycle, the BAL parallel executor, account
 prefetch, pool gate depth, the flood's signer.
+
+### loop38-39: 20 recovery slots reach 337,638; the collapses are the box's memory, and THP is in them
+
+Supply side. The RLP decode moved off the recovery slot (`decode_frame` on
+the connection's task, `recover_decoded` on the slot): the slot's busy
+time did not move (48-51 us a transaction; the decode was ~1 us of it),
+so the slot is secp256k1 under SMT load. What moves the supply is the
+slot count, at pacing 400 with a 42M-transaction flood:
+
+    leg   slots  THP   win1     win2     win3     note
+    S16a  16     on    317,005  279,744  211,864  win3 faulting
+    S20a  20     on    337,638  320,556  199,477  full blocks at 0.476 s; win3 = flood exhausted (36M in 111 s)
+    S16b  16     on    308,221  301,806  292,172  clean
+    S24a  24     on    179,244  293,318  287,956  win1 faulting; import exec 241 ms, slot busy 61-64 us
+    S20b  20     on    276,941  184,633  168,390  collapsed throughout (Cached pinned 17 GB, 1.2M faults / 30 s)
+
+20 slots: ingest 338-340k/s a node (busy 54 us, 92-93%), +7-10% on
+window 1 over the 16-slot bookends, every block full. 24 slots take the
+CPU from the import (exec 241-385 ms) and lose it back.
+
+What the collapses are. Not the knobs, not a neighbour: with the fleet's
+own processes faulting by the million while 70-85 GB is free, `Cached`
+pinned at the tmpfs level, `compact_stall` 5.8M and `allocstall` 9.3M on
+the box, swap 8 GB full, THP `always`. Back to back in loop39 (16 slots,
+same box state):
+
+    leg   THP (prctl)  win1     win2     win3     fleet major faults
+    T16a  off          304,257  298,819  255,358  ~0 for 90 s, 18k at the end
+    S16c  on           236,730  179,191  173,782  0.5-1.0M per 30 s
+    T16b  off          309,680  293,391  255,359  ~0 for 90 s, 21k at the end
+    T20a  off, 20      271,656  141,207  277,090  400k in window 2 -- still not immune
+    T24a  off, 24      277,087  271,650  233,626
+
+`N42_THP_DISABLE=1` (PR_SET_THP_DISABLE in `n42` and `h2_validator`;
+`N42_V_THP_DISABLE=1` for the validator alone) removes most of it but not
+all, and costs the builder its huge pages: build exec 237-277 ms against
+194-207 with THP, so the chain then binds at 0.52-0.60 s with every block
+full. The clean THP-on legs earlier in the day (0.43 s at 83%, 310-319k)
+are the better regime, and they need a box whose memory is not in this
+state. What a root fix looks like on this host: `swapoff -a` (the swap is
+full and cannot take anonymous pages, so reclaim takes file pages),
+`echo 3 > drop_caches` once, THP `madvise` instead of `always` (or
+`watermark_boost_factor=0`); none of it is ours to run without root.
+Until then: warm-up leg, 20 slots, THP off for the validator, never read a
+leg whose fleet faulted.

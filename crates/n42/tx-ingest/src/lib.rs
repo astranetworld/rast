@@ -497,6 +497,11 @@ where
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
             let cache = cache.clone();
             let acquiring = std::time::Instant::now();
+            // Decoded here, on the connection's task, before the slot is
+            // taken: the slots are the ingest's bound (16 a node at 94-99%
+            // busy, 48-50 us a transaction, round 39), and the RLP decode is
+            // not secp256k1's work to wait for.
+            let pooled = decode_frame::<P>(raws);
             let slot = std::sync::Arc::clone(recovery_slots())
                 .acquire_owned()
                 .await
@@ -508,7 +513,7 @@ where
                 apply_recovery_nice();
                 let busy = std::time::Instant::now();
                 STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
-                let decoded = decode_and_recover::<P>(raws, cache.as_ref());
+                let decoded = recover_decoded::<P>(pooled, cache.as_ref());
                 STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 decoded
             });
@@ -596,6 +601,7 @@ where
     // on that thread, and the pool's own futures, waited behind them. Blocking
     // threads are for exactly this.
     let started = std::time::Instant::now();
+    let pooled = decode_frame::<P>(raws);
     let slot = std::sync::Arc::clone(recovery_slots())
         .acquire_owned()
         .await
@@ -604,7 +610,7 @@ where
         let _slot = slot;
         apply_recovery_nice();
         let busy = std::time::Instant::now();
-        let decoded = decode_and_recover::<P>(raws, cache.as_ref());
+        let decoded = recover_decoded::<P>(pooled, cache.as_ref());
         STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
         decoded
     })
@@ -683,40 +689,50 @@ where
 
 /// Decodes a frame's transactions and recovers their senders, on the calling
 /// thread.
-fn decode_and_recover<P>(
-    raws: Vec<Bytes>,
-    cache: Option<&reth_evm::SenderRecoveryCache>,
-) -> Vec<P::Transaction>
+/// The pooled transaction type of a pool.
+type PooledOf<P> = <<P as TransactionPool>::Transaction as PoolTransaction>::Pooled;
+
+/// Decodes a frame's raw transactions; an undecodable one is dropped with a
+/// debug line rather than closing the connection. No signature work here.
+fn decode_frame<P>(raws: Vec<Bytes>) -> Vec<PooledOf<P>>
 where
     P: TransactionPool,
 {
     let mut decoded = Vec::with_capacity(raws.len());
     for raw in raws {
-        // Recover through the cache when there is one, so the sender this
-        // costs ~50 us to compute is still there when the block carrying this
-        // transaction is imported.
-        //
-        // Without it the work is simply done twice. reth's cache has exactly
-        // two consumers -- devp2p transaction gossip and block import -- and
-        // both recover-or-insert, so on a fleet that runs `--disable-tx-gossip`
-        // and admits over RPC or over this path, nothing populates it before
-        // import and it cannot hit by construction. That is what an A/B showing
-        // no difference between having the cache and not having it looks like,
-        // and it is not the same as the work being absent.
-        type Pooled<P> = <<P as TransactionPool>::Transaction as PoolTransaction>::Pooled;
-        let recovered = match <Pooled<P> as alloy_eips::Decodable2718>::decode_2718_exact(raw.as_ref()) {
-            Ok(pooled) => match cache {
-                Some(cache) => <P::Transaction as PoolTransaction>::try_recover_with_cache(pooled, cache)
-                    .map_err(|_| "invalid signature".to_string()),
-                None => <P::Transaction as PoolTransaction>::try_recover(pooled)
-                    .map_err(|_| "invalid signature".to_string()),
-            },
-            Err(err) => Err(err.to_string()),
-        };
-        match recovered {
-            Ok(tx) => decoded.push(tx),
+        match <PooledOf<P> as alloy_eips::Decodable2718>::decode_2718_exact(raw.as_ref()) {
+            Ok(pooled) => decoded.push(pooled),
             Err(err) => debug!(target: "n42.tx_ingest", %err, "undecodable transaction"),
         }
     }
     decoded
+}
+
+/// Recovers the senders of decoded transactions, on a recovery slot.
+///
+/// Through the cache when there is one, so the sender this costs ~40 us to
+/// compute is still there when the block carrying the transaction is
+/// imported. Without it the work is simply done twice: reth's cache has
+/// exactly two consumers -- devp2p transaction gossip and block import -- and
+/// both recover-or-insert, so on a fleet that runs `--disable-tx-gossip` and
+/// admits over this path, nothing else populates it before import.
+fn recover_decoded<P>(
+    pooled: Vec<PooledOf<P>>,
+    cache: Option<&reth_evm::SenderRecoveryCache>,
+) -> Vec<P::Transaction>
+where
+    P: TransactionPool,
+{
+    let mut recovered = Vec::with_capacity(pooled.len());
+    for tx in pooled {
+        let result = match cache {
+            Some(cache) => <P::Transaction as PoolTransaction>::try_recover_with_cache(tx, cache),
+            None => <P::Transaction as PoolTransaction>::try_recover(tx),
+        };
+        match result {
+            Ok(tx) => recovered.push(tx),
+            Err(_) => debug!(target: "n42.tx_ingest", "invalid signature"),
+        }
+    }
+    recovered
 }

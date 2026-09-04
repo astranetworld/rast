@@ -67,6 +67,23 @@ use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use n42_mobile_service::MobileService;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
+    // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
+    // memory drove 5.8M direct-compaction stalls that tore the page cache
+    // out from under the importers' reads (round 39: the "first leg"
+    // collapses, 0.7-0.8 s cycles, millions of major faults at 70 GB free).
+    // `N42_V_THP_DISABLE=1` does it for the validator alone, leaving the
+    // execution layer's builder its huge pages (measured +15-20% on its
+    // execution phase without them).
+    if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1")
+        || std::env::var("N42_V_THP_DISABLE").is_ok_and(|v| v == "1")
+    {
+        // SAFETY: prctl with PR_SET_THP_DISABLE takes no pointers.
+        let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+        if rc != 0 {
+            eprintln!("could not disable transparent huge pages: {}", std::io::Error::last_os_error());
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

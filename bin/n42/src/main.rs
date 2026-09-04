@@ -29,6 +29,18 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
+    // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
+    // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
+    // memory drove 5.8M direct-compaction stalls that tore the page cache
+    // out from under the importers' reads (round 39: the "first leg"
+    // collapses, 0.7-0.8 s cycles, millions of major faults at 70 GB free).
+    if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1") {
+        // SAFETY: prctl with PR_SET_THP_DISABLE takes no pointers.
+        let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+        if rc != 0 {
+            eprintln!("could not disable transparent huge pages: {}", std::io::Error::last_os_error());
+        }
+    }
     reth_cli_util::sigsegv_handler::install();
 
     // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.
