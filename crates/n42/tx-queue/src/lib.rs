@@ -210,8 +210,20 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
         let mut inner = self.inner.lock();
         self.drain_inbox(&mut inner);
+        let mut pairs: std::collections::HashSet<(Address, u64)> = std::collections::HashSet::new();
         for (sender, nonce) in mined {
             inner.remove_mined(sender, nonce);
+            pairs.insert((sender, nonce));
+        }
+        // What a build has taken is not in the lanes, so the removal above
+        // misses it; when the build is superseded its transactions are
+        // offered again, and a mined one offered again is a stale
+        // transaction the builder pays to refuse (42,000 a build in round
+        // 38). Forget the mined ones here.
+        if let Some((_, taken)) = inner.last_build.as_mut() {
+            if !taken.is_empty() {
+                taken.retain(|t| !pairs.contains(&(t.sender(), t.nonce())));
+            }
         }
     }
 
