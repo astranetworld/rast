@@ -4243,3 +4243,48 @@ the builder slows as the block grows (383 ms for 163k against 179 ms for
 throughput: at 1.75 µs a transaction, ~100 ms of a full block is the
 queue's per-transaction lock and inbox drain, now batched
 (`N42_TX_QUEUE_BATCH`, 0311b30b3), to be measured.
+
+### Round 38, continued: the raw channel's shifted responses, and reth's job that rebuilt every second
+
+Every stall of the fast fleet came down to two things in the leader's
+execution path.
+
+**The raw payload channel could hand a request the previous request's
+response.** The channel is one persistent connection; a request whose
+future was dropped between writing and reading -- a build prepared ahead,
+aborted when the QC moved to the next block -- left its response in the
+stream. The next request then read it as its own: a 17k-transaction
+block on the *previous* parent, "built" in 2 ms, which every voter refused
+as not extending the justify QC (the halts of loop16D and loop17D); or,
+one shift later, a request waiting for a response already consumed --
+the leader silent for the whole view (loop22P400b, 00:58:47 to the
+timeout). The driver's parent check (c6aa9294d) caught the first form and
+rebuilt; 1f62b06f3 removes the cause: the connection is taken out of the
+channel for a request and put back only after the whole response, so a
+dropped request drops the connection.
+
+**reth's payload job rebuilt every second for twelve.** `--builder.interval`
+defaults to 1 s and `--builder.deadline` to 12 s: each job the leader
+created was rebuilt eleven more times after the one build it collected,
+each rebuild taking 163,000 transactions from the queue and giving them
+back ("previous build on the same parent was not committed; offered
+again" once a second), two or three builds of one block running at once
+on the leader (`txs=297920`, `434880` attempted), and its execution
+layer answering nothing for 8 s under it. `F7_EL_EXTRA="--builder.interval
+60 --builder.deadline 3"` makes a job build once and end; the fleet's
+own pacing sets the cadence.
+
+Also on the way: the engine transport retries once a request that failed
+before any response (51735ac64; a server-closed keep-alive connection cost
+a view each time), the queue takes transactions in batches under one lock
+(`N42_TX_QUEUE_BATCH`, 0311b30b3), returns what a superseded build took
+minus what the chain mined meanwhile (1fac24593, 705911f9c -- the first
+version returned mined ones too and the builder refused 42,000 stale
+transactions a block), and can drain its inbox off the builder's thread
+(`N42_TX_QUEUE_DRAINER=1`, f635c2739, to be measured).
+
+| leg | pacing | jobs | win1 | win2 | win3 | occupancy |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| loop21B | 250 ms | rebuilt | **265,128** | 241,106 | halt | 59-70% |
+| loop22P400 | 400 ms | single | 264,335 | 260,346 | 245,169 | 83-89% |
+| loop22P400b | 400 ms | single | 260,139 | halt (channel) | | 92% |
