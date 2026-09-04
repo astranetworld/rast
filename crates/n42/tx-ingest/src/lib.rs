@@ -467,7 +467,10 @@ where
             let recovering = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
                 apply_recovery_nice();
-                decode_and_recover::<P>(raws, cache.as_ref())
+                let busy = std::time::Instant::now();
+                let decoded = decode_and_recover::<P>(raws, cache.as_ref());
+                STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                decoded
             });
             // Full when ASYNC_FRAMES_IN_FLIGHT frames are still recovering or
             // waiting for the pool: the answer waits for a slot, as before.
