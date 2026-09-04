@@ -228,6 +228,20 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
     }
 
+    /// Moves what the inbox holds into the lanes now. The builder does this
+    /// on its own pulls otherwise, and at the bench tier that is ~0.7 us a
+    /// transaction of a full block's build (118 ms of 440, round 38) spent
+    /// inserting arrivals rather than building; a task calling this every
+    /// few milliseconds (`N42_TX_QUEUE_DRAINER=1`) takes it off the builder.
+    pub fn drain_now(&self) {
+        use std::sync::atomic::Ordering;
+        if self.staged.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        self.drain_inbox(&mut inner);
+    }
+
     /// The transactions for a build on `parent`, as the pool's iterator would
     /// hand them. Taking returns what the previous build on the same parent
     /// took, first.

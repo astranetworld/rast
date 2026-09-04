@@ -287,6 +287,18 @@ fn main() {
             // here by every canonical block on every node.
             if std::env::var("N42_TX_QUEUE").is_ok() {
                 let queue: n42_tx_queue::TxQueue<reth_transaction_pool::EthPooledTransaction> = n42_tx_queue::TxQueue::new();
+                if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
+                    // The inbox drained off the builder's thread; see TxQueue::drain_now.
+                    let drained = queue.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(std::time::Duration::from_millis(5));
+                        loop {
+                            tick.tick().await;
+                            let drained = drained.clone();
+                            let _ = tokio::task::spawn_blocking(move || drained.drain_now()).await;
+                        }
+                    });
+                }
                 if n42_tx_queue::install(queue.clone()) {
                     info!(target: "reth::cli", "builder-side transaction queue installed");
                 }
