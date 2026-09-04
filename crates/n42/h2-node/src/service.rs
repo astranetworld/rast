@@ -194,6 +194,9 @@ pub struct H2Service<E> {
     payload_attributes: Option<Box<PayloadAttributesBuilder>>,
     /// How long to wait before asking the builder again; see [`PROPOSE_RETRY`].
     propose_retry: Duration,
+    /// The last transport drain's split: poll ms, handle ms, slowest handle
+    /// ms and its event kind (see `drain_transport`).
+    last_drain: (u64, u64, u64, &'static str),
     /// The view this node last built a block for, so a leader does not rebuild
     /// on every event it handles while still in the same view.
     proposed_view: Option<u64>,
@@ -562,6 +565,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             outbox: Vec::new(),
             payload_attributes: None,
             propose_retry: PROPOSE_RETRY,
+            last_drain: (0, 0, 0, ""),
             proposed_view: None,
             meshed: false,
             checkpoint: None,
@@ -956,7 +960,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.flush_outbox(&mut events);
         let flush_ms = at.elapsed().as_millis() as u64;
         if transport_ms + flush_ms > 30 {
-            info!(target: "n42.h2.node", transport_ms, transport_events, outputs_ms, flush_ms, "slow step");
+            let (poll_ms, handle_ms, slowest_ms, slowest_kind) = self.last_drain;
+            info!(target: "n42.h2.node", transport_ms, transport_events, poll_ms, handle_ms, slowest_ms, slowest_kind, outputs_ms, flush_ms, "slow step");
         }
         Ok(events)
     }
@@ -968,7 +973,16 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// same starvation this fixes, pointed the other way.
     async fn drain_transport(&mut self, events: &mut Vec<ServiceEvent>) -> Result<usize, ServiceError> {
         let mut drained = 0;
+        // The phase's time, split: polling the swarm (which runs libp2p's
+        // whole state machine inline, on this loop) against handling what it
+        // yielded, with the slowest single handling and its kind. A
+        // follower's step after its vote measured 120-140 ms in this phase
+        // with nothing logged, and the PrepareQC waited behind it (round 39).
+        let mut poll = std::time::Duration::ZERO;
+        let mut handle = std::time::Duration::ZERO;
+        let mut slowest = (std::time::Duration::ZERO, "");
         for _ in 0..MAX_TRANSPORT_DRAIN {
+            let at = std::time::Instant::now();
             let ready = tokio::select! {
                 biased;
                 event = self.transport.next_event() => {
@@ -976,14 +990,23 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 () = std::future::ready(()) => None,
             };
+            poll += at.elapsed();
             match ready {
                 Some(event) => {
+                    let kind = transport_event_kind(&event);
+                    let at = std::time::Instant::now();
                     self.handle_transport_event(event)?;
+                    let took = at.elapsed();
+                    handle += took;
+                    if took > slowest.0 {
+                        slowest = (took, kind);
+                    }
                     drained += 1;
                 }
                 None => break,
             }
         }
+        self.last_drain = (poll.as_millis() as u64, handle.as_millis() as u64, slowest.0.as_millis() as u64, slowest.1);
         let _ = events;
         Ok(drained)
     }
@@ -1283,6 +1306,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn accept_envelope(&mut self, envelope: &H2V4Envelope) {
         match wire_bridge::to_engine(envelope, self.validator_count) {
             Ok(message) => {
+                if trace_messages() {
+                    info!(target: "n42.h2.trace", kind = message_kind(&message), view = message.view(), "recv");
+                }
                 // A message that fails the engine's own checks is a
                 // peer problem, not a local one: log it and keep the
                 // node running rather than taking the fleet's word for
@@ -1823,6 +1849,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         events: &mut Vec<ServiceEvent>,
     ) {
         let view = message.view();
+        if trace_messages() {
+            info!(target: "n42.h2.trace", kind = message_kind(&message), view, "send");
+        }
         // The v4 profile is static-validator, so the changes hash is zero
         // throughout. `wire_bridge` refuses a Decide that disagrees with this
         // rather than letting a mismatch onto the wire.
@@ -2394,4 +2423,36 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
         }
     }
     rlps
+}
+
+/// `N42_H2_TRACE_MSGS=1`: one info line per consensus message sent or
+/// received, with its kind and view, so a round's hops can be timed across
+/// the fleet's logs (all on one clock when the fleet is on one box).
+fn trace_messages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_H2_TRACE_MSGS").is_ok_and(|v| v == "1"))
+}
+
+fn message_kind(message: &n42_h2_primitives::consensus::ConsensusMessage) -> &'static str {
+    use n42_h2_primitives::consensus::ConsensusMessage as M;
+    match message {
+        M::Proposal(_) => "proposal",
+        M::Vote(_) => "vote",
+        M::CommitVote(_) => "commit_vote",
+        M::PrepareQC(_) => "prepare_qc",
+        M::Timeout(_) => "timeout",
+        M::NewView(_) => "new_view",
+        M::Decide(_) => "decide",
+    }
+}
+
+fn transport_event_kind(event: &TransportEvent) -> &'static str {
+    match event {
+        TransportEvent::Envelope { .. } => "envelope",
+        TransportEvent::Native { .. } => "native",
+        TransportEvent::Rejected { .. } => "rejected",
+        TransportEvent::Transactions { .. } => "transactions",
+        TransportEvent::Block { .. } => "block",
+        _ => "other",
+    }
 }

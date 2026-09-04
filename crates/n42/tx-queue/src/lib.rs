@@ -234,6 +234,36 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
     }
 
+    /// Forgets the transactions the build on `parent` took that a block has
+    /// now mined -- those at or below each sender's mined nonce -- and hands
+    /// them back to the caller to drop off the calling path (freeing 163,000
+    /// of them is 20-40 ms; this is the leader's own-import path, right
+    /// before its next build starts). What the build took but did not
+    /// mine -- the puller's batches in flight when the block filled -- stays
+    /// taken, for the next build's give-back. The lanes are not touched:
+    /// the canonical pruner cleans them later, off this path.
+    pub fn forget_mined(
+        &self,
+        parent: B256,
+        mined: impl IntoIterator<Item = (Address, u64)>,
+    ) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        let mut highest: AddressHashMap<u64> = AddressHashMap::default();
+        for (sender, nonce) in mined {
+            let entry = highest.entry(sender).or_insert(nonce);
+            *entry = (*entry).max(nonce);
+        }
+        let mut inner = self.inner.lock();
+        let Some((built_on, taken)) = inner.last_build.as_mut() else { return Vec::new() };
+        if *built_on != parent || taken.is_empty() {
+            return Vec::new();
+        }
+        let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
+            .into_iter()
+            .partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce));
+        *taken = kept;
+        mined
+    }
+
     /// Moves what the inbox holds into the lanes now. The builder does this
     /// on its own pulls otherwise, and at the bench tier that is ~0.7 us a
     /// transaction of a full block's build (118 ms of 440, round 38) spent
@@ -625,6 +655,26 @@ mod tests {
         let at = std::time::Instant::now();
         queue.remove_mined_batch(mined);
         eprintln!("remove_mined_batch of 163,000 taken: {:?}", at.elapsed());
+    }
+
+    #[test]
+    fn forget_mined_keeps_what_the_build_took_but_did_not_mine() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(1, 2), tx(2, 0), tx(2, 1)]);
+        let parent = B256::repeat_byte(3);
+        let mut best = queue.best_for_build(parent);
+        // The build takes all five; the block carries (1,0), (1,1) and (2,0).
+        let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+        assert_eq!(taken.len(), 5);
+        drop(best);
+        let dropped = queue.forget_mined(parent, [(Address::repeat_byte(1), 1), (Address::repeat_byte(2), 0)]);
+        assert_eq!(dropped.len(), 3);
+        // The next build, on the block, is offered (1,2) and (2,1) again -- the
+        // taken-but-unmined ones -- and nothing else.
+        let mut best = queue.best_for_build(B256::repeat_byte(4));
+        let mut again: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        again.sort();
+        assert_eq!(again, vec![(1, 2), (2, 1)]);
     }
 
     #[test]

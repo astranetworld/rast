@@ -125,11 +125,17 @@ pub fn parallel_ordered_trie_root<T: AsRef<[u8]> + Sync>(items: &[T]) -> B256 {
         return sequential();
     }
 
-    // Every key, in the trie's order.
-    let mut keyed: Vec<(Nibbles, usize)> = (0..items.len())
-        .map(|i| (Nibbles::unpack(alloy_rlp::encode_fixed_size(&i)), i))
+    // Every key, in the trie's order. `adjust_index_for_rlp` is the
+    // permutation that yields `rlp(index)` keys in lexicographic order
+    // directly (what alloy's own ordered root uses), so the keys need no
+    // sort: 6.5 ms of the 16-24 ms this took hot at 163,000 items.
+    let keyed: Vec<(Nibbles, usize)> = (0..items.len())
+        .map(|i| {
+            let index = alloy_trie::root::adjust_index_for_rlp(i, items.len());
+            (Nibbles::unpack(alloy_rlp::encode_fixed_size(&index)), index)
+        })
         .collect();
-    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    debug_assert!(keyed.windows(2).all(|w| w[0].0 < w[1].0));
 
     // Groups: keys of four nibbles or more, by all but their last two
     // nibbles; shorter keys stand alone as leaves.
@@ -332,5 +338,34 @@ mod tests {
             .collect();
         assert_eq!(parallel_transaction_root(&txs), alloy_consensus::proofs::calculate_transaction_root(&txs));
         assert_eq!(parallel_transaction_root::<TxEnvelope>(&[]), alloy_consensus::proofs::calculate_transaction_root::<TxEnvelope>(&[]));
+    }
+}
+
+#[cfg(test)]
+mod trie_bench {
+    /// `cargo test -p n42-engine-types --release -- --ignored bench_parallel_trie_root --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_parallel_trie_root() {
+        let items: Vec<Vec<u8>> = (0..163_000u32).map(|i| { let mut v = vec![0xb8u8; 110]; v[..4].copy_from_slice(&i.to_be_bytes()); v }).collect();
+        for round in 0..3 {
+            let at = std::time::Instant::now();
+            let root = super::parallel_ordered_trie_root(&items);
+            let par = at.elapsed();
+            let at = std::time::Instant::now();
+            let seq = alloy_trie::root::ordered_trie_root_with_encoder(&items, |item, buf| buf.extend_from_slice(item));
+            let sq = at.elapsed();
+            assert_eq!(root, seq);
+            // The serial prologue alone: keys and their sort.
+            let at = std::time::Instant::now();
+            let mut keyed: Vec<(alloy_trie::Nibbles, usize)> = (0..items.len())
+                .map(|i| (alloy_trie::Nibbles::unpack(alloy_rlp::encode_fixed_size(&i)), i))
+                .collect();
+            let keys = at.elapsed();
+            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let sorted = at.elapsed();
+            std::hint::black_box(&keyed);
+            eprintln!("round {round}: parallel {:?} sequential {:?} keys {:?} +sort {:?} (rayon threads {})", par, sq, keys, sorted - keys, rayon::current_num_threads());
+        }
     }
 }

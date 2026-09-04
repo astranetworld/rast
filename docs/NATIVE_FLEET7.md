@@ -4537,3 +4537,58 @@ miss is a transaction this node has not admitted yet -- not the cache's
 capacity (4.2M slots direct-mapped; a 60% loss would need a 14 s wait).
 With the supply at batch 500 the hits hold at ~157k and the phase at
 32-51 ms.
+
+### loop28-31: the fsync null, a forget that dropped the puller's batches, and 317k
+
+loop28 (own-block queue prune before the build ahead; assembly timers;
+`N42_VOTE_LOG_NOSYNC=1` A-B-A-B):
+
+    leg     pacing  nosync  win1     win2     win3     win1 cycle
+    C450a   450     -       310,603  298,906  266,214  0.517 s
+    D450a   450     yes     309,473  302,239  277,087  0.517 s
+    C450b   450     -       309,690  303,069  277,091  0.517 s
+    D400a   400     yes     309,889  309,368  284,170  0.517 s
+
+The vote log's `fsync` is not the second round: 34-53 syncs a node a round
+reached 3 ms (p50 7, max 25), and the knob moved nothing. It stays on. The
+build's loop residual is gone (loop = pool 3 + exec 229 + 6) and the
+assembly timers say the finish is the transactions trie (41 ms on the
+leader's 32 threads, against 16-24 ms hot in a test) beside the QMDB root
+(12 ms). The trie's keys are now generated in order with
+`adjust_index_for_rlp` instead of sorted: 10-14 ms hot.
+
+The own-block prune itself cost 39-51 ms on the import path -- most of it
+freeing the 163,000 transactions the retain dropped -- so it became a
+*forget* of the build's taken list with the drop on a blocking thread. The
+first cut forgot the whole list and lost the puller's batches in flight
+when the block filled: a few thousand transactions across every sender,
+and every lane then started above the chain's nonce (loop29E400a: 28,489
+TPS at 7% occupancy, `refused[6]` climbing 37,000 a build). `forget_mined`
+keeps the unmined part for the next build's give-back; a test pins it.
+
+loop31, with that and the message trace (`N42_H2_TRACE_MSGS=1`):
+
+    leg     pacing  window  win1     win2     win3
+    E400a   400     6       316,905  277,088  195,064   (page-fault storm from +60 s, external)
+    E450a   450     6       314,823  296,239  288,691
+    E400b   400     6       313,188  315,121  285,755
+    F400w8  400     8       306,589  283,641  263,416
+
+313-317k on window 1 three times; E400b's window 2 full at 0.517 s is
+315,121. E400a's windows 2-3 collapsed with `pgmajfault` climbing 700,000
+in a minute and the page cache halving while 65 GB stayed available -- the
+execution phase drifted 166 -> 441 ms -- and E450a right after it, same
+binary, had a flat fault counter; treated as an external event. A deeper
+flood window (8) is worse: the reply latency grows (810 -> 1,300 ms) and
+the rate does not, so the supply is the nodes' ingest, near 290-315k/s.
+
+**Where the second round's 80 ms goes, from the trace (E450a, 223 views):**
+the PrepareQC reaches the first follower 0.2 ms after it is sent and the
+last one 161 ms (median) after; the followers answer within 2 ms of
+*processing* it; the commit vote's transit is 0.2 ms. The delay is on the
+follower before it processes the message: its service loop polls the
+libp2p swarm inline (`next_event` is `swarm.select_next_some()`), and a
+step that has just awaited a 280-340 ms import comes back to a transport
+phase of 120-140 ms (`slow step transport_ms=121 transport_events=15`),
+during which the queued PrepareQC waits. loop32 splits that phase into
+polling and handling with the slowest handler's kind.

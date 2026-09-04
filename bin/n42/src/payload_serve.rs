@@ -258,17 +258,24 @@ where
     // transactions back to the lanes at the next build's start (57 ms of a
     // full block's build, under the lock) for the canonical pruner to take
     // out again 100 ms later (78 ms, waiting on the same lock).
-    let queue_prune = n42_tx_queue::global::<reth_transaction_pool::EthPooledTransaction>().map(|queue| {
-        let mined: Vec<(alloy_primitives::Address, u64)> = executed
+    //
+    // Not by removing them from the lanes (`remove_mined_batch`: 39-51 ms
+    // here, most of it freeing the 163,000 transactions its retain drops)
+    // but by forgetting the mined part of the build's taken list, with the
+    // drop on a blocking thread. Forgetting the *whole* list lost the
+    // puller's batches in flight when the block filled -- a few thousand
+    // transactions across every sender -- and every sender's lane then
+    // started above the chain's nonce (loop29E400a: 7% occupancy).
+    let queue_prune_ms = n42_tx_queue::global::<reth_transaction_pool::EthPooledTransaction>().map(|queue| {
+        let at = std::time::Instant::now();
+        let mined = executed
             .recovered_block
             .transactions_with_sender()
-            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
-            .collect();
-        let at = std::time::Instant::now();
-        tokio::task::spawn_blocking(move || {
-            queue.remove_mined_batch(mined);
-            at.elapsed().as_millis() as u64
-        })
+            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
+        let dropped = queue.forget_mined(executed.recovered_block.header().parent_hash, mined);
+        debug!(target: "n42.payload_serve", forgotten = dropped.len(), "own block's transactions forgotten by the queue");
+        tokio::task::spawn_blocking(move || drop(dropped));
+        at.elapsed().as_millis() as u64
     });
     let (done, handed) = tokio::sync::oneshot::channel();
     if reuse
@@ -279,10 +286,6 @@ where
         return None;
     }
     let handed = tokio::time::timeout(std::time::Duration::from_secs(2), handed).await;
-    let queue_prune_ms = match queue_prune {
-        Some(prune) => prune.await.ok(),
-        None => None,
-    };
     match handed {
         Ok(Ok(true)) => {
             if let Some(prune) = reuse.prune_pool.clone() {
