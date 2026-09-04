@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, TxKind, U256};
+use alloy_primitives::{keccak256, Address, Signature, TxKind, B256, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use serde_json::{json, Value};
@@ -535,9 +535,36 @@ fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128
         value: U256::from(value),
         ..Default::default()
     };
-    let signature = key.sign_hash_sync(&tx.signature_hash()).expect("sign");
+    let signature = sign_hash(key, &tx.signature_hash());
     let envelope: TxEnvelope = tx.into_signed(signature).into();
     envelope.encoded_2718()
+}
+
+/// Signs a hash with libsecp256k1 rather than the signer's k256.
+///
+/// The signer's own `sign_hash_sync` is pure-Rust k256 and costs ~80 us a
+/// transaction on this generator's SMT-shared cores -- 22 of its 64 workers
+/// were signing at 269k/s with the other 42 waiting on answers, which put
+/// the flood's own ceiling near 300k/s, below what the chain now consumes.
+/// libsecp256k1 signs in a fraction of that, and the node recovers with the
+/// same library, so the two sides agree on low-s normalisation. The
+/// secret is re-derived from the signer's bytes each call; that is a scalar
+/// check, ~1 us, nothing beside the signature. `TX_FLOOD_K256_SIGN=1`
+/// restores the k256 path for an A-B.
+fn sign_hash(key: &PrivateKeySigner, hash: &B256) -> Signature {
+    static K256: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *K256.get_or_init(|| std::env::var_os("TX_FLOOD_K256_SIGN").is_some()) {
+        return key.sign_hash_sync(hash).expect("sign");
+    }
+    let secret = secp256k1::SecretKey::from_slice(key.to_bytes().as_slice()).expect("a derived key is a valid scalar");
+    let message = secp256k1::Message::from_digest(hash.0);
+    let (recovery_id, compact) =
+        secp256k1::SECP256K1.sign_ecdsa_recoverable(&message, &secret).serialize_compact();
+    Signature::new(
+        U256::from_be_slice(&compact[..32]),
+        U256::from_be_slice(&compact[32..]),
+        i32::from(recovery_id) != 0,
+    )
 }
 
 /// Submits a batch as one JSON-RPC array. Counts each element's outcome, since
@@ -782,3 +809,20 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --shard-senders     pin each sender to one node (cold-follower path)
   --skip-funding      the senders are already funded
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libsecp_signs_what_k256_signs() {
+        for i in 0..8u64 {
+            let key = PrivateKeySigner::from_bytes(&keccak256(i.to_be_bytes())).expect("key");
+            let hash = keccak256((i * 7).to_be_bytes());
+            let fast = sign_hash(&key, &hash);
+            let slow = key.sign_hash_sync(&hash).expect("sign");
+            assert_eq!(fast, slow, "sender {i}: libsecp256k1 and k256 disagree");
+            assert_eq!(fast.recover_address_from_prehash(&hash).expect("recover"), key.address());
+        }
+    }
+}

@@ -122,14 +122,18 @@ fn apply_recovery_nice() {
     }
 }
 
+/// The recovery slot count when it is bounded, `None` when unlimited.
+fn recovery_slot_count() -> Option<usize> {
+    std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
 fn recovery_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| {
-        let permits = std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS);
+        let permits = recovery_slot_count().unwrap_or(tokio::sync::Semaphore::MAX_PERMITS);
         std::sync::Arc::new(tokio::sync::Semaphore::new(permits))
     })
 }
@@ -238,33 +242,46 @@ fn high_water() -> usize {
 /// Prints the ingest's rate and time split every five seconds, once.
 fn spawn_stats_reporter() {
     tokio::spawn(async move {
-        let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64);
+        let slots = recovery_slot_count();
+        let mut last = (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let now = std::time::Instant::now();
-            let (frames, txs, recover, pool) = (
+            let (frames, txs, recover, pool, busy) = (
                 STATS.frames.load(Ordering::Relaxed),
                 STATS.txs.load(Ordering::Relaxed),
                 STATS.recover_ns.load(Ordering::Relaxed),
                 STATS.pool_ns.load(Ordering::Relaxed),
+                STATS.busy_ns.load(Ordering::Relaxed),
             );
             let dframes = frames - last.1;
             if dframes > 0 {
                 let dtxs = txs - last.2;
                 let secs = now.duration_since(last.0).as_secs_f64();
+                let dbusy = busy - last.5;
+                let drecover = recover - last.3;
+                // How much of the slots' capacity the recovery used: busy
+                // time over slots x interval. Under 100% with the generator
+                // waiting says the slots idle between frames (a pipeline
+                // problem); at 100% they are the ceiling (a CPU problem).
+                let slots_busy_pct = slots
+                    .map(|slots| (dbusy as f64 / 1e9 / (slots as f64 * secs) * 100.0) as u64);
                 info!(
                     target: "n42.tx_ingest",
                     frames = dframes,
                     txs = dtxs,
                     rate = (dtxs as f64 / secs) as u64,
-                    recover_ms_per_frame = (recover - last.3) / dframes / 1_000_000,
+                    recover_ms_per_frame = drecover / dframes / 1_000_000,
                     pool_ms_per_frame = (pool - last.4) / dframes / 1_000_000,
-                    recover_us_per_tx = (recover - last.3) / dtxs.max(1) / 1_000,
+                    recover_us_per_tx = drecover / dtxs.max(1) / 1_000,
+                    busy_us_per_tx = dbusy / dtxs.max(1) / 1_000,
+                    slot_wait_us_per_tx = drecover.saturating_sub(dbusy) / dtxs.max(1) / 1_000,
+                    slots_busy_pct,
                     pool_us_per_tx = (pool - last.4) / dtxs.max(1) / 1_000,
                     "ingest"
                 );
             }
-            last = (now, frames, txs, recover, pool);
+            last = (now, frames, txs, recover, pool, busy);
         }
     });
 }
@@ -482,7 +499,13 @@ where
 struct IngestStats {
     frames: AtomicU64,
     txs: AtomicU64,
+    /// Wall time from a frame's arrival at `admit` to its senders recovered:
+    /// the wait for a recovery slot plus the recovery itself.
     recover_ns: AtomicU64,
+    /// Time spent inside the recovery task alone, on a slot -- the CPU cost
+    /// of decoding and secp256k1, without the queue for a slot in front of
+    /// it. `recover_ns - busy_ns` is that queue.
+    busy_ns: AtomicU64,
     pool_ns: AtomicU64,
 }
 
@@ -490,6 +513,7 @@ static STATS: IngestStats = IngestStats {
     frames: AtomicU64::new(0),
     txs: AtomicU64::new(0),
     recover_ns: AtomicU64::new(0),
+    busy_ns: AtomicU64::new(0),
     pool_ns: AtomicU64::new(0),
 };
 
@@ -516,7 +540,10 @@ where
     let decoded = match tokio::task::spawn_blocking(move || {
         let _slot = slot;
         apply_recovery_nice();
-        decode_and_recover::<P>(raws, cache.as_ref())
+        let busy = std::time::Instant::now();
+        let decoded = decode_and_recover::<P>(raws, cache.as_ref());
+        STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        decoded
     })
     .await
     {
