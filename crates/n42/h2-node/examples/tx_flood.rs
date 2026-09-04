@@ -90,7 +90,11 @@ fn recipient(spread: u32, index: u64) -> Address {
 }
 const TRANSFER_GAS: u64 = 21_000;
 /// gov5 caps a batch here; beyond it the JSON body itself becomes the cost.
-const MAX_RPC_BATCH: usize = 200;
+// Over the ingest a frame may carry up to 10,000 transactions and a bigger
+// frame amortises the node's per-frame hand-off (~24 ms a frame at 100 on a
+// connection's read loop); over JSON-RPC a batch this large may exceed the
+// server's limit, so raise `--rpcbatch` past 200 only with `--ingest`.
+const MAX_RPC_BATCH: usize = 2000;
 
 struct Args {
     rpcs: Vec<String>,
