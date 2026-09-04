@@ -4288,3 +4288,29 @@ transactions a block), and can drain its inbox off the builder's thread
 | loop21B | 250 ms | rebuilt | **265,128** | 241,106 | halt | 59-70% |
 | loop22P400 | 400 ms | single | 264,335 | 260,346 | 245,169 | 83-89% |
 | loop22P400b | 400 ms | single | 260,139 | halt (channel) | | 92% |
+
+### With the channel fixed: 269,432 / 263,210 / 265,908, every proposal from a build ahead
+
+| leg | drainer | win1 | win2 | win3 | cycle | occupancy |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| loop23D | on | **269,432** | 263,210 | 265,908 | 0.51-0.53 s | 83-85% |
+| loop23N | off | 258,814 | 258,223 | 246,719 | 0.48-0.57 s | 72-90% |
+| loop23D2 | on | 266,021 | 259,316 | 261,982 | 0.46-0.60 s | 74-98% |
+
+400 ms pacing, direct import, batch 1024, single-build jobs, the raw
+channel taking its connection per request. The build ahead was used on
+380 of 382 proposals (before the channel fix: almost none, every one
+refused for its parent), zero rebuilds, zero stale builds, zero
+refusals. The drainer (`N42_TX_QUEUE_DRAINER=1`) is +3-4% on both of its
+legs -- at the spread's edge, consistent, kept. A full build is now
+pool 65 / exec 216 / loop 341 / total 388 ms; the blocks are 84% full
+because the build ahead's window is the pacing minus the 66 ms own
+import, so the next lever is the pacing itself (450-470 ms should fill
+them) and after that the builder's execution phase.
+
+A follower's `/metrics` during a leg: `save_blocks_update_history_indices`
+0.86 µs -- reth's history indices cost nothing here, so gov5's -58%
+write-path win from dropping theirs has no Rust analogue -- and
+persistence 0.89 s median per 3-block batch (RocksDB commit 0.32-0.71 s),
+300-410 ms a block against a 0.51 s cycle: off the critical path, the
+number to watch if the cycle drops toward 0.4 s.
