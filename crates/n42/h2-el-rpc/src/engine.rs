@@ -646,36 +646,48 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let started = std::time::Instant::now();
         let frame = n42_h2_execution::raw_engine::encode_execution_data(payload);
         let encoded = started.elapsed();
-        let attempt: std::io::Result<PayloadStatus> = async {
-            if channel.stream.is_none() {
-                let stream = tokio::net::TcpStream::connect(addr).await?;
-                stream.set_nodelay(true)?;
-                channel.stream = Some(stream);
-            }
-            let stream = channel.stream.as_mut().expect("just connected");
+        // The connection is taken out of the channel for the request and put
+        // back only once the whole response has been read: a request whose
+        // future is dropped between writing and reading (a build prepared
+        // ahead, aborted when the parent moved) would otherwise leave its
+        // response in the stream for the next request to read as its own --
+        // a block on the previous parent, delivered in 2 ms (round 38).
+        let taken = channel.stream.take();
+        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            let stream = &mut conn;
             stream.write_u8(n42_h2_execution::raw_engine::request::NEW_PAYLOAD).await?;
             stream.write_u32_le(frame.len() as u32).await?;
             stream.write_all(&frame).await?;
-            match stream.read_u8().await? {
+            let status = match stream.read_u8().await? {
                 1 => {
                     let len = stream.read_u32_le().await? as usize;
                     let mut buf = vec![0u8; len];
                     stream.read_exact(&mut buf).await?;
                     n42_h2_execution::raw_engine::decode_payload_status(&buf)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
                 }
                 2 => {
                     let len = stream.read_u32_le().await? as usize;
                     let mut message = vec![0u8; len];
                     stream.read_exact(&mut message).await?;
-                    Err(std::io::Error::other(String::from_utf8_lossy(&message).into_owned()))
+                    return Err(std::io::Error::other(String::from_utf8_lossy(&message).into_owned()));
                 }
-                other => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
-            }
+                other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
+            };
+            Ok((status, conn))
         }
         .await;
         match attempt {
-            Ok(status) => {
+            Ok((status, conn)) => {
+                channel.stream = Some(conn);
                 if frame.len() > 1_000_000 {
                     debug!(
                         target: "n42.h2.el",
@@ -710,22 +722,28 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let mut channel = self.raw_channel.lock().await;
         let addr = self.raw_endpoint(&mut channel).await?;
         let started = std::time::Instant::now();
-        let attempt: std::io::Result<Option<Result<BuiltBlock, ElError>>> = async {
-            if channel.stream.is_none() {
-                let stream = tokio::net::TcpStream::connect(addr).await?;
-                stream.set_nodelay(true)?;
-                channel.stream = Some(stream);
-            }
-            let stream = channel.stream.as_mut().expect("just connected");
+        // Taken out for the request, back only after the full response; see
+        // new_payload_over_channel.
+        let taken = channel.stream.take();
+        let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            let stream = &mut conn;
             stream.write_u8(n42_h2_execution::raw_engine::request::GET_PAYLOAD).await?;
             stream.write_all(&id.0 .0).await?;
-            match stream.read_u8().await? {
-                0 => Ok(None),
+            let answer = match stream.read_u8().await? {
+                0 => None,
                 2 => {
                     let len = stream.read_u32_le().await? as usize;
                     let mut message = vec![0u8; len];
                     stream.read_exact(&mut message).await?;
-                    Ok(Some(Err(ElError::new(String::from_utf8_lossy(&message).into_owned()))))
+                    Some(Err(ElError::new(String::from_utf8_lossy(&message).into_owned())))
                 }
                 1 => {
                     let len = stream.read_u32_le().await? as usize;
@@ -763,14 +781,18 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                             "raw payload collected"
                         );
                     }
-                    Ok(Some(built))
+                    Some(built)
                 }
-                other => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
-            }
+                other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
+            };
+            Ok((answer, conn))
         }
         .await;
         match attempt {
-            Ok(answer) => Some(answer),
+            Ok((answer, conn)) => {
+                channel.stream = Some(conn);
+                Some(answer)
+            }
             Err(err) => {
                 debug!(target: "n42.h2.el", %err, "raw payload channel failed; using JSON for this build");
                 channel.stream = None;
