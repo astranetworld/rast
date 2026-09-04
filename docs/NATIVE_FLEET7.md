@@ -4314,3 +4314,116 @@ write-path win from dropping theirs has no Rust analogue -- and
 persistence 0.89 s median per 3-block batch (RocksDB commit 0.32-0.71 s),
 300-410 ms a block against a 0.51 s cycle: off the critical path, the
 number to watch if the cycle drops toward 0.4 s.
+
+## Supply session, 2026-09-04: three nulls, one confound, and the batch that filled every block
+
+All on n42-rs-36's loop24P450 configuration (pacing 450 ms, tenure 16, direct
+follower import, single-build jobs, batch 1024 + drainer, 16 recovery slots,
+fast transfer path), fresh datadirs every leg, one node binary per A-B-A, the
+datc job paused, 81-86 GB available, major faults under 100/s except where
+noted. Offsets 500001 onward. The chain side had just reached 268k with
+blocks 77-88% full and the flood holding 241-269k/s, so the question was the
+supply's ceiling and where it lives.
+
+### The signer: 43% off the generator's CPU, zero effect (02:27-02:37)
+
+`tx_flood` signed with the local signer's k256 at ~51 us a transaction on
+its 32 SMT threads. At 269k/s that is 22 of 64 workers signing and 42 in
+`recv`, which read like a generator at its signing ceiling. a727fac37 signs
+with libsecp256k1 (byte-identical signatures, RFC 6979 low-s; a test recovers
+both against k256), `TX_FLOOD_K256_SIGN=1` restores the old path.
+
+    leg       win1     win2     win3    sign/tx  flood rate @10 s / @90 s
+    A1 k256   266,206  261,651  252,363  51 us    272.8k / 247.5k
+    B1 secp   266,570  256,054  254,861  29 us    268.5k / 243.8k
+    A2 k256   266,213  264,666  245,741  53 us    269.8k / 237.2k
+
+Bookends agree to 0.003%; B is inside them. The time saved went straight
+into `wait`. Signing was not on the constraint.
+
+### The gate: +59% deeper, zero effect (02:40-02:47)
+
+Every 5 s line of every leg reported the deepest pool at the gate, so the
+gate was the next suspect. Gate 407,500 -> 266,223 win1; gate 650,000 ->
+271,655 (+2%, inside single-round noise); the flood's rate and wait did not
+move, the deepest pool simply rose to the new gate within ten seconds.
+Meanwhile the ingest's split -- `busy_us_per_tx` inside the recovery task,
+`slot_wait_us_per_tx` outside it (7cf043a15; the first cut instrumented only
+the synchronous path and read 0) -- said: busy 46-50 us, slot wait 0, the 16
+slots 71-86% busy. Not the node's CPU either.
+
+The earlier figure `recover_us_per_tx=45` was measured from the frame's
+arrival and so included the slot wait; "16 slots / 45 us = 355k theoretical"
+was arithmetic on a latency.
+
+### The closed loop, and the instrument that named it
+
+Followers prune the queue in 30-40 ms per block with no canonical lag; the
+queue after a prune oscillates between 2k and 550k per node; node0's partial
+builds averaged 66k transactions at a 120 ms loop -- starved, not cut. With
+the generator's CPU, the node's CPU and the gate excluded, what remained was
+the round trip nobody had timed: the flood is a closed loop (64 workers x 32
+frames, each worker blocking in `recv` for all seven answers), its rate is
+frames in flight over an answer's latency, and the node answers only after
+the frame's slot is acquired.
+
+691f9b42a and 090ffe613 time both ends. The node's stats line adds, per
+frame, `reply_us` (frame fully read to answer written) split into `gate_us`,
+`acq_us` (waiting for a recovery slot), `spawn_us` (permit granted to the
+task running on a blocking thread) and `chan_us` (room in the connection's
+admission channel, `N42_TX_INGEST_ASYNC_FRAMES`); the flood's five-second
+line adds each node's answer latency in ms; `tx_flood --window`
+(`F7_FLOOD_WINDOW`) sets the frames a worker keeps in flight.
+
+What they read at batch 100, window 32: answer latency 0.74-0.88 s at every
+node (all seven within 3%: no slow node); node side reply 23.6-23.9 ms per
+100-transaction frame = acq 20.9-21.3 + gate 1.7-2.9 + spawn 0.05-0.13 +
+chan 0. A connection's read loop is sequential, so 32 queued frames x 24 ms
+= 0.77 s, the flood's own number, and 64 connections x 100 / 24 ms = 267k/s
+per node -- the acceptance measured for two days, derived.
+
+### Depth: 4x deeper, worse (03:18-03:28)
+
+Window 128 with the admission channel at 32: 271,657 / 254,890 / 263,682,
+B below both bookends; answer latency 2.3-2.6 s, rate unchanged. Little's
+law with a fixed service rate: depth only lengthens the queue.
+
+### Batch 500 at window 32: confounded, not read (03:30-03:40)
+
+271,652 / 255,359 / 265,706, with win3 of B at 152k. Window x batch put
+1.02M transactions in flight per node against a 407,500 gate: `gate_us`
+went from 1-2 ms to 34-66 ms a frame, answer latency to 3.6-5.5 s. The leg
+measured the gate, not the frame size. Withdrawn.
+
+### Batch 500 at equal depth: every block full (03:42-03:52)
+
+Batch 500 with window 6 (3,000 transactions in flight per worker, the same
+as 32 x 100), one binary 090ffe613:
+
+    leg      win1     win2     win3    full blocks         3-window total  flood @60 s
+    A1 100   266,224  249,832  258,597  49/50 30/55 20/60   23,240,400      260.6k/s
+    B1 500   271,411  277,089  271,658  50/51 51/51 50/50   24,613,000      288.5k/s
+    A2 100   261,442  257,152  259,154  45/51 40/54 26/56   23,333,900      246.5k/s
+
+Bookends 0.4% apart; B +5.7% on the total, every window full, 277,089 the
+best window measured on this fleet. The timers at 500: reply 113-119 ms a
+frame = acq 89.6 + gate 23-29 + spawn 0.3-0.4. So the acquire wait scales
+with transactions, not frames: it is queueing for slot service, and the
+per-frame hand-off through the runtime (spawn, ~0.1 ms) is not the cost. The
+slots' 12-20% idle matches the gate's share of the read loop -- a connection
+held at the gate wants no slot -- so a dedicated recovery pool would buy
+nothing, and is not written. What batch 500 buys is a shorter answer latency
+for the same in-flight (0.62 vs 0.75 s), ~10% more delivered, which was the
+gap between 80-88% and full blocks.
+
+With the queue at the gate throughout B and every block full, supply now
+exceeds consumption, and the chain's full-block cycle is the bound:
+163,000 / 0.59 s = 276k, which is what win2 read. The next number is that
+cycle -- build 380 + own import 70 + seal 30 on the leader, the followers'
+263 ms import and the RocksDB commit behind it -- and it is not a supply
+number.
+
+Flags: `--rpcbatch 500` with `F7_FLOOD_WINDOW=6` (keep window x batch near
+3,000 a worker; the flood's frame cap is 2,000 since 4b2080db3). The
+generator levers that remain parked: `F7_FLOOD_PROCS` (no extra cores),
+24 recovery slots (measured worse on the followers by n42-rs-36).
