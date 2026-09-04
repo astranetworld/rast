@@ -4663,3 +4663,46 @@ index entries and the history indices into the memtable -- not the sync,
 and it is off the cycle in any case. To be re-run on a quiet box; the
 fault attribution (`/proc/<pid>/stat` majflt against `pgmajfault`) goes
 into the sampler first.
+
+### loop35-37: the RocksDB knobs on a quiet box -- null on the cycle, and the first-leg rule
+
+Re-run with datc gone (load 0.5, 115 GB available), pacing 400, the
+sampler recording the fleet's own major faults per process:
+
+    leg            knobs              win1     win2     win3     persist ms/block (n1/n3/n5)  commit
+    loop35 R400a   -   (first leg)    304,406  206,332  206,225  146 / 142 / 146   93 / 91 / 92
+    loop35 R400b   nosync+direct-IO   315,588  319,872  284,390  132 / 120 / 130   96 / 85 / 93
+    loop35 R400b2  nosync+direct-IO   313,773  300,688  278,057  129 / 122 / 131   93 / 86 / 93
+    loop35 R400a2  -                  310,451  304,423  300,674  134 / 128 / 137   96 / 91 / 98
+    loop36 D400a   direct-IO (warm-up) 311,788 310,938  299,304  128 / 123 / 134   93 / 89 / 97
+    loop36 D400b   nosync+direct-IO   311,799  306,773  286,490  128 / 121 / 131   90 / 86 / 93
+    loop36 D400a2  direct-IO          315,956  287,106  307,686  128 / 122 / 132   93 / 89 / 96
+    loop37 D400a3  direct-IO          309,790  294,989  306,256  129 / 121 / 128   94 / 87 / 92
+    loop37 D400b2  nosync+direct-IO   315,171  298,955  303,955   -                 -
+    loop37 D400a4  direct-IO          318,587  310,337  282,058  134 / 126 / 132   97 / 89 / 94
+
+Nine clean legs read 310-319k on window 1 whatever the knobs, with the
+fleet's major faults at 35-40 for a whole leg. The RocksDB commit is
+86-98 ms a block in every leg: neither the `fsync` nor direct I/O touches
+it, so it is the memtable write of the block's 163,000 transaction-hash
+entries and history indices -- off the cycle. Direct I/O for flushes and
+compactions takes ~5 ms a block off the persistence batch (121-134
+against 128-146), which is real, small, and also off the cycle; the
+`fsync` knob is null on top of it. Both stay default off: durability
+costs nothing here.
+
+What the first leg was: R400a collapsed to 206k with 2.7M major faults in
+the fleet's own ELs while MemFree sat at 85 GB -- for its whole loaded
+phase `Cached` stayed at the tmpfs `Shmem` level (10.9-11.2 GB, i.e. zero
+file pages) while the seven ELs wrote ~1 GB/s; in A2 the same writes grew
+the cache to 75 GB and no read missed. Not the knobs, not a neighbour
+(the gov5 session grepped its harness for `drop_caches`: nothing), not
+memory pressure. Every collapse on record is the first leg after the box
+changed state -- a rebuild (E400a, G400a), a resident neighbour (loop34
+R400a), seven idle hours (loop35 R400a) -- and the legs back to back
+after it were clean. Rule from here: a launcher's first leg is a warm-up
+and is never read; faults are attributed per process
+(`/proc/<pid>/stat` field 12) before anything is blamed on memory.
+
+The record window in this set: 319,872 (loop35R400b window 2) and 318,587
+(loop37D400a4 window 1), both supply-bound at ~83% occupancy.
