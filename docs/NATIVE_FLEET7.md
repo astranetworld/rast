@@ -4636,3 +4636,30 @@ not. Reads of evicted SSTs under the same NVMe's write load is the
 reading; a longer run than 2 minutes will meet it every time, and the
 fix is on the RocksDB side (direct I/O or `fadvise` on the written
 files), not the consensus side.
+
+### loop34: the RocksDB knobs, voided by a neighbour
+
+`N42_ROCKSDB_NOSYNC=1` (no `fsync` per commit) and `N42_ROCKSDB_DIRECT_IO=1`
+(direct I/O for flushes and compactions, 1 MiB writable buffer), both
+default off, A-B-A at pacing 400 with the fleet's persistence metrics
+scraped from `/metrics` at the end of each leg:
+
+    leg     knobs   win1     win2     win3     persist ms/block  rocksdb commit ms/block (node1/3/5)
+    R400a   -       300,044  233,548  228,069  154 / 148 / 153   102 / 98 / 101
+    R400b   both    312,339  211,782  222,688  147 / 140 / 150    95 / 89 /  97
+    R400a2  -       313,889  273,032  239,011  169 / 157 / 166   112 / 105 / 109
+
+The bookends disagree by 4.6% on window 1 and 10% on the persistence
+time, and windows 2-3 collapsed to 0.6-0.8 s cycles in every leg, so the
+round says nothing about the knobs: `n42-datc-25m-hi4.bin` (33 GB RSS,
+started ~08:31, not ours) was streaming its input through mmap from the
+fleet's NVMe the whole time -- 93-99% of the box's major faults and, by
+the gov5 session's sample, 660 MB/s of device writes with no fleet
+running, in phases. A phased neighbour moves between legs and no leg
+order cancels it. What survives the noise: turning the per-commit
+`fsync` off moved the RocksDB commit from ~200 to ~189 ms (2 blocks a
+batch), so the commit is the write itself -- 163,000 transaction-hash
+index entries and the history indices into the memtable -- not the sync,
+and it is off the cycle in any case. To be re-run on a quiet box; the
+fault attribution (`/proc/<pid>/stat` majflt against `pgmajfault`) goes
+into the sampler first.

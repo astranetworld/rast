@@ -40,10 +40,31 @@ use std::{
 use tracing::instrument;
 
 /// Returns [`WriteOptions`] with WAL sync enabled for crash durability.
+///
+/// `N42_ROCKSDB_NOSYNC=1` leaves the WAL write unsynced (the OS flushes it):
+/// a bench knob for measuring what the per-commit `fsync` costs on a disk
+/// seven execution layers share; not for a node whose durability matters.
 fn synced_write_options() -> WriteOptions {
     let mut opts = WriteOptions::default();
-    opts.set_sync(true);
+    opts.set_sync(!rocksdb_nosync());
     opts
+}
+
+/// `N42_ROCKSDB_NOSYNC`, read once.
+fn rocksdb_nosync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROCKSDB_NOSYNC").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_ROCKSDB_DIRECT_IO=1`: flushes and compactions bypass the page cache
+/// (direct I/O with a 1 MiB writable buffer), so the SST files `RocksDB`
+/// writes do not evict the pages the importers read their state through.
+/// Seven execution layers on one box grew the page cache ~60 GB in two
+/// minutes and met major-fault storms once `MemFree` bottomed
+/// (docs/NATIVE_FLEET7.md, round 39). Reads stay buffered.
+fn rocksdb_direct_io() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROCKSDB_DIRECT_IO").is_ok_and(|v| v == "1"))
 }
 
 /// Pending `RocksDB` batches type alias.
@@ -248,6 +269,11 @@ impl RocksDBBuilder {
         options.set_log_level(log_level);
 
         options.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
+
+        if rocksdb_direct_io() {
+            options.set_use_direct_io_for_flush_and_compaction(true);
+            options.set_writable_file_max_buffer_size(1 << 20);
+        }
 
         // Delete obsolete WAL files immediately after all column families have flushed.
         // Both set to 0 means "delete ASAP, no archival".
