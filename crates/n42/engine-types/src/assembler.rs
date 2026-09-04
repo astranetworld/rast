@@ -211,22 +211,35 @@ where
         let receipts = &input.output.receipts;
         let hotstuff = self.hotstuff;
         let bundle = input.bundle_state;
+        let assembling = std::time::Instant::now();
+        let tx_root_ms = std::sync::atomic::AtomicU64::new(0);
+        let qmdb_ms = std::sync::atomic::AtomicU64::new(0);
+        let bloom_ms = std::sync::atomic::AtomicU64::new(0);
         let (transactions_root, (receipts_root, bloom)) = rayon::join(
             || {
                 rayon::join(
-                    || parallel_transaction_root(&input.transactions),
+                    || {
+                        let at = std::time::Instant::now();
+                        let root = parallel_transaction_root(&input.transactions);
+                        tx_root_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                        root
+                    },
                     || {
                         if let Some(job) = &self.qmdb {
+                            let at = std::time::Instant::now();
                             let changes = n42_qmdb_reth::changes_from_execution(bundle, job.prague);
                             let prepared = job.state.compute(job.parent, &changes).map_err(|e| e.to_string());
                             *job.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(prepared);
+                            qmdb_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                         }
                     },
                 )
                 .0
             },
             || {
+                let at = std::time::Instant::now();
                 let bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
+                bloom_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                 // Replaced by gov5's keccak-of-receipts in the payload builder;
                 // a placeholder here is never seen by anyone.
                 let root = if hotstuff {
@@ -239,7 +252,22 @@ where
                 (root, bloom)
             },
         );
-        self.inner.assemble_block(input, Some(transactions_root), Some(receipts_root), Some(bloom))
+        let roots_ms = assembling.elapsed().as_millis() as u64;
+        let tx_count = input.transactions.len();
+        let block = self.inner.assemble_block(input, Some(transactions_root), Some(receipts_root), Some(bloom));
+        if tx_count > 10_000 {
+            tracing::info!(
+                target: "n42.assembler",
+                txs = tx_count,
+                tx_root_ms = tx_root_ms.into_inner(),
+                qmdb_ms = qmdb_ms.into_inner(),
+                bloom_ms = bloom_ms.into_inner(),
+                roots_ms,
+                inner_ms = assembling.elapsed().as_millis() as u64 - roots_ms,
+                "assembly phases"
+            );
+        }
+        block
     }
 }
 

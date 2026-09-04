@@ -210,11 +210,17 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
         let mut inner = self.inner.lock();
         self.drain_inbox(&mut inner);
+        // Folded to the highest nonce per sender first: a lane is split once
+        // per sender, not once per transaction. Splitting per transaction
+        // was 163,000 tree splits and as many allocations a block, 54-128 ms
+        // under the lock the next build's puller is waiting on.
         let mut highest: AddressHashMap<u64> = AddressHashMap::default();
         for (sender, nonce) in mined {
-            inner.remove_mined(sender, nonce);
             let entry = highest.entry(sender).or_insert(nonce);
             *entry = (*entry).max(nonce);
+        }
+        for (sender, nonce) in &highest {
+            inner.remove_mined(*sender, *nonce);
         }
         // What a build has taken is not in the lanes, so the removal above
         // misses it; when the build is superseded its transactions are
@@ -566,6 +572,59 @@ mod tests {
         let signed = Signed::new_unchecked(inner, Signature::test_signature(), Default::default());
         let recovered = reth_primitives_traits::Recovered::new_unchecked(reth_ethereum_primitives::TransactionSigned::from(signed), Address::repeat_byte(sender_seed));
         EthPooledTransaction::new(recovered, 120)
+    }
+
+    fn tx_of(sender: Address, nonce: u64) -> EthPooledTransaction {
+        use alloy_consensus::{Signed, TxEip1559};
+        let inner = TxEip1559 { chain_id: 1, nonce, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(9)), value: U256::from(1), ..Default::default() };
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), Default::default());
+        let recovered = reth_primitives_traits::Recovered::new_unchecked(reth_ethereum_primitives::TransactionSigned::from(signed), sender);
+        EthPooledTransaction::new(recovered, 120)
+    }
+
+    /// The queue's own cost per transaction at the bench tier's shape
+    /// (6,000 senders, 30 transactions each), apart from everything the
+    /// builder does around it. `cargo test -p n42-tx-queue --release -- --ignored bench_ --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_next_at_the_bench_tier() {
+        let senders = 6_000u64;
+        let per = 30u64;
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let mut all = Vec::with_capacity((senders * per) as usize);
+        for n in 0..per {
+            for s in 0..senders {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(s + 1).to_be_bytes());
+                all.push(tx_of(Address::from(a), n));
+            }
+        }
+        let pushed_at = std::time::Instant::now();
+        queue.push(all);
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        assert!(best.next().is_some());
+        let pushed = pushed_at.elapsed();
+        drop(best);
+        for round in 0..3 {
+            let mut best = queue.best_for_build(B256::repeat_byte(2 + round));
+            let at = std::time::Instant::now();
+            let mut n = 0u64;
+            while let Some(t) = best.next() {
+                n += 1;
+                std::hint::black_box(&t);
+                if n == 163_000 { break; }
+            }
+            let took = at.elapsed();
+            eprintln!("round {round}: {n} next() in {:?} = {:.0} ns/tx (push+drain {:?})", took, took.as_nanos() as f64 / n as f64, pushed);
+            drop(best);
+        }
+        // The canonical prune of a full block whose transactions a build took.
+        let mut best = queue.best_for_build(B256::repeat_byte(9));
+        let mined: Vec<(Address, u64)> = std::iter::from_fn(|| best.next()).take(163_000).map(|t| (t.sender(), t.nonce())).collect();
+        drop(best);
+        let at = std::time::Instant::now();
+        queue.remove_mined_batch(mined);
+        eprintln!("remove_mined_batch of 163,000 taken: {:?}", at.elapsed());
     }
 
     #[test]

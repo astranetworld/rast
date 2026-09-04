@@ -263,12 +263,22 @@ impl FileVoteLog {
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        file.seek(SeekFrom::Start(0))
+        let at = std::time::Instant::now();
+        let written = file
+            .seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&buf))
             // sync_data, not sync_all: the file's size and offsets never change,
             // so only the contents need to be durable.
-            .and_then(|()| file.sync_data())
-            .map_err(n42_h2_consensus::vote_log::map_io_err)
+            // `N42_VOTE_LOG_NOSYNC=1` skips the sync: a bench knob that gives
+            // up crash-safety of the vote log for a measurement of what the
+            // sync costs on a disk seven execution layers are committing to.
+            .and_then(|()| if vote_log_nosync() { Ok(()) } else { file.sync_data() })
+            .map_err(n42_h2_consensus::vote_log::map_io_err);
+        let took = at.elapsed();
+        if took.as_millis() >= 3 {
+            tracing::info!(target: "n42.h2.store", vote, commit, sync_ms = took.as_millis() as u64, "vote log sync was slow");
+        }
+        written
     }
 
     /// Raises a watermark, if the new view is higher.
@@ -303,6 +313,12 @@ impl VoteLogWriter for FileVoteLog {
             warn!(target: "n42.h2.store", %error, view, "could not record an R2 vote; the vote is aborted");
         })
     }
+}
+
+/// `N42_VOTE_LOG_NOSYNC`, read once.
+fn vote_log_nosync() -> bool {
+    static NOSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NOSYNC.get_or_init(|| std::env::var("N42_VOTE_LOG_NOSYNC").is_ok_and(|v| v == "1"))
 }
 
 /// A CRC-32 over the two watermarks.

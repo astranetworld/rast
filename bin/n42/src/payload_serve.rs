@@ -252,6 +252,24 @@ where
         hashed_state: built.hashed_state,
         trie_updates: built.trie_updates,
     };
+    // The block's transactions leave the queue before this returns, as a
+    // foreign block's do: the build ahead starts on the return, and a queue
+    // that still lists this build as the last one gives its 163,000
+    // transactions back to the lanes at the next build's start (57 ms of a
+    // full block's build, under the lock) for the canonical pruner to take
+    // out again 100 ms later (78 ms, waiting on the same lock).
+    let queue_prune = n42_tx_queue::global::<reth_transaction_pool::EthPooledTransaction>().map(|queue| {
+        let mined: Vec<(alloy_primitives::Address, u64)> = executed
+            .recovered_block
+            .transactions_with_sender()
+            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+            .collect();
+        let at = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            queue.remove_mined_batch(mined);
+            at.elapsed().as_millis() as u64
+        })
+    });
     let (done, handed) = tokio::sync::oneshot::channel();
     if reuse
         .inserts
@@ -260,7 +278,12 @@ where
     {
         return None;
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(2), handed).await {
+    let handed = tokio::time::timeout(std::time::Duration::from_secs(2), handed).await;
+    let queue_prune_ms = match queue_prune {
+        Some(prune) => prune.await.ok(),
+        None => None,
+    };
+    match handed {
         Ok(Ok(true)) => {
             if let Some(prune) = reuse.prune_pool.clone() {
                 let hashes: Vec<alloy_primitives::B256> =
@@ -283,6 +306,7 @@ where
                 target: "n42.payload_serve",
                 number = v1.block_number,
                 convert_ms = converted.as_millis() as u64,
+                queue_prune_ms,
                 total_ms = started.elapsed().as_millis() as u64,
                 "own block handed to the engine as executed"
             );

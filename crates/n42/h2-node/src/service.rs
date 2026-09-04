@@ -360,7 +360,7 @@ const PROPOSE_RETRY: Duration = Duration::from_millis(200);
 /// eighth of 250 ms is 31 ms, which is small against the interval it is
 /// quantising and still far more than the cost of asking (an in-memory head
 /// lookup and a closure that returns `None`).
-const PROPOSE_RETRY_FRACTION: u32 = 8;
+const PROPOSE_RETRY_FRACTION: u32 = 32;
 const PROPOSE_RETRY_FLOOR: Duration = Duration::from_millis(10);
 
 /// A pull of the blocks this node is missing, from one peer, by range.

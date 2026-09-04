@@ -25,15 +25,16 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
 
-## Where it stands today: 255,358 TPS (2026-09-03)
+## Where it stands today: 305,556 TPS (2026-09-04)
 
-The record on this fleet, bookended (round 37, `loop11A`/`loop11A2`):
+The record on this fleet, bookended (round 39, `loop27B2`, with `loop27A1`
+and `loop27A2` at 288/288/277 and 291/283/283 around the puller legs):
 
 | window | TPS | blocks | cycle | occupancy |
 | --- | ---: | ---: | ---: | ---: |
-| win1 | **252,617** | 47 | 0.638 s | 98.9% |
-| win2 | **255,358** | 47 | 0.638 s | 100% |
-| win3 | 244,488 | 45 | 0.667 s | 100% |
+| win1 | **305,556** | 57 | 0.526 s | 98.7% |
+| win2 | **298,824** | 55 | 0.545 s | 100% |
+| win3 | 277,045 | 51 | 0.588 s | 100% |
 
 Seven nodes, every follower executing every transaction and computing the
 QMDB root, senders recovered on every node, bodies over direct push with
@@ -45,8 +46,10 @@ result. The configuration, all in the environment of `fleet7-bench.sh`:
 F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1 N42_TX_INGEST_ASYNC=1 \
 F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250 F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1 \
 N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DIRECT=1 \
-N42_FAST_TRANSFER=1 \
-scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 6000 --conc 64 --rpcbatch 100
+N42_FAST_TRANSFER=1 N42_FOLLOWER_DIRECT_IMPORT=1 F7_SENDER_CACHE_MULT=4 \
+N42_TX_QUEUE_BATCH=1024 N42_TX_QUEUE_DRAINER=1 N42_BUILDER_PULLER=1024 \
+F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3" F7_FLOOD_WINDOW=6 F7_BLOCK_INTERVAL_MS=400 \
+scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 6000 --conc 64 --rpcbatch 500
 ```
 
 How it got here, in the order the rounds found it (each has its section
@@ -55,7 +58,9 @@ the builder's per-transaction state read and clone (round 36); the full
 block's refusal tail and the own-block conversion (round 37: 190k -> 233-239k);
 the plain-transfer path without the interpreter, which only reached the
 builder once the payload service used the node's EVM factory (round 37:
-248-255k). Measured and rejected on the way: 24 recovery slots (slower and
+248-255k); the follower's direct import (round 38: 262-269k); batch 500 on
+the supply (supply session: 277k); the queue's prune, the pool puller and
+the re-ask fraction (round 39: 288k, then 302-306k). Measured and rejected on the way: 24 recovery slots (slower and
 sloped), a parallel account prefetch (cold reads are 17 ms a block), a
 tighter view timeout, jemalloc knobs, RocksDB memtable size.
 
@@ -4462,3 +4467,73 @@ Flags: `--rpcbatch 500` with `F7_FLOOD_WINDOW=6` (keep window x batch near
 3,000 a worker; the flood's frame cap is 2,000 since 4b2080db3). The
 generator levers that remain parked: `F7_FLOOD_PROCS` (no extra cores),
 24 recovery slots (measured worse on the followers by n42-rs-36).
+
+## Round 39: the cycle with full blocks, and the first window past 300,000
+
+With the supply settled (batch 500, window 6), the cycle with full blocks
+was 0.59 s and the question was where it goes. Reconstructed from one
+leader tenure of loop24P450 (validator and execution-layer logs side by
+side), the leader's cycle is *published body -> next published body* =
+own import 83-101 + build ahead 376-410 + seal/publish ~16, and the QC of
+the block arrives at about the same moment the next build finishes -- the
+two chains are at parity. Three things inside them were not what they had
+been read as:
+
+1. **The queue's canonical prune held the lock 54-128 ms a block** while
+   the next build's pulls waited on it: `remove_mined_batch` split every
+   sender's lane once per *transaction* (163,000 tree splits and
+   allocations). Folded to the highest nonce per sender first: 7.5 ms hot
+   (`bench_next_at_the_bench_tier`, an ignored test), 5-15 ms on a
+   follower.
+2. **The builder's pool phase was 405 ns a transaction (47-85 ms) against
+   the queue's own 55-65 ns hot.** The rest is the memory the transactions
+   live in and the lock. `N42_BUILDER_PULLER=<n>` walks the pool on its own
+   thread, batches of `n` ahead of the execution into a bounded channel;
+   refusals go back as messages. Pool phase 2-6 ms.
+3. **The loop's other 57 ms** (loop minus pool minus exec; `tail_ms`, the
+   bookkeeping after each execution, measured 1 ms) is `best_for_build`
+   giving the *just-built block's* 163,000 transactions back to the lanes
+   -- the build ahead starts before the canonical pruner has seen the block
+   -- for the pruner to take out again 100 ms later. The own-block import
+   now prunes the queue before it returns, as a foreign block's import
+   already did (loop28, below).
+
+Also: `PROPOSE_RETRY_FRACTION` 8 -> 32, so a leader whose pacing gate opens
+between re-asks loses ~7 ms on average instead of ~28.
+
+loop27, one binary, batch 500 / window 6, `F7_SENDER_CACHE_MULT=4`
+(`N42_SENDER_CACHE_MULT` is overridden by `fleet7.sh`; every earlier leg
+ran at 2), items 1 and the retry fraction in every leg:
+
+    leg  pacing puller   win1     win2     win3     cycle (win1)  full
+    A1   450    -        287,958  287,955  277,009  0.556 s       53/54 53/53 51/51
+    B1   450    1024     302,439  298,741  271,657  0.526 s       55/57 55/55 50/50
+    A2   450    -        291,041  282,523  282,522  0.556 s       53/54 52/52 52/52
+    B2   400    1024     305,556  298,824  277,045  0.526 s       56/57 55/55 51/51
+
+A1 alone is a record over the supply session's 277,089 (item 1 and the
+fraction). B is outside the A bookends on windows 1 and 2 (+4-5%), inside
+on window 3; the build's median fell 385 -> 347 ms. B2 at pacing 400 reads
+the same cycle as B1 at 450: the pacing is not what binds -- the two
+chains above are.
+
+**The vote's second round is 26-126 ms.** The leader's own timing line
+(`consensus_timing=leader proposal=@206ms R1_collect=370ms R2_collect=106ms`)
+splits the QC chain: R1 (proposal -> five votes, i.e. the followers'
+imports, 326-349 ms on the fast ones) and R2 (PrepareQC out, CommitVote
+back: p10 26, p50 81, p90 126 ms over 220 full blocks) for a message round
+trip on one box. Every follower's import ended within 25 ms of each other;
+the gap is after the votes. Both rounds `fsync` the vote log before signing
+(`FileVoteLog::write`, `sync_data`), on the NVMe that seven execution
+layers are committing 300-400 ms of RocksDB writes a block to. loop28
+measures it: `N42_VOTE_LOG_NOSYNC=1` (a bench knob; the vote log is not
+crash-safe with it) A-B against the sync, with the slow syncs logged
+(`vote log sync was slow`, >= 3 ms).
+
+The follower's `senders` phase, read again with the logs kept: 31-225 ms
+because the cache's hits fall from 153k to 60k of 163k through a window,
+and that is the follower's *ingest* lagging the leader's consumption -- a
+miss is a transaction this node has not admitted yet -- not the cache's
+capacity (4.2M slots direct-mapped; a 60% loss would need a 14 s wait).
+With the supply at batch 500 the hits hold at ~157k and the phase at
+32-51 ms.

@@ -467,6 +467,7 @@ where
     // on decides what to fix, and guessing has been wrong before.
     let mut pool_ns: u128 = 0;
     let mut exec_ns: u128 = 0;
+    let mut tail_ns: u128 = 0;
     let setup_took = build_started.elapsed();
     let mut stale_txs: u64 = 0;
     // Transactions taken from the pool ahead of execution so that the
@@ -478,6 +479,9 @@ where
     let ticks_at_start = ticks();
     let mut pool_ticks: u64 = 0;
     let mut exec_ticks: u64 = 0;
+    // After the execution, before the next pull: the loop's own bookkeeping.
+    let mut tail_ticks: u64 = 0;
+    let mut tail_at: u64 = 0;
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -496,6 +500,37 @@ where
     // iterator's live feed of new transactions. The pool phase stayed at
     // 66-82 ms a block either way, so the cost is the ordered sets
     // themselves, not what arrives during the build.
+    //
+    // The pool phase of a full block -- `next()` 163,000 times -- measured
+    // 66 ms on the leader, 405 ns a transaction, where the queue's own walk
+    // is 55-65 ns hot (`bench_next_at_the_bench_tier`): the rest is the cold
+    // memory the transactions live in and the lock shared with the inbox
+    // drain. `N42_BUILDER_PULLER=<n>` moves the walk to its own thread,
+    // which pulls batches of <n> ahead of the execution into a bounded
+    // channel; the loop below pops a local buffer. A refusal goes back to
+    // the puller as a message, so the refused sender's later transactions
+    // are still dropped, only a batch late -- each such transaction fails
+    // its nonce check in the executor and is refused again, as the queue
+    // did for them before. Whatever was pulled and not built is returned
+    // by the puller when the build ends, and by the queue's give-back at
+    // the next build in any case.
+    let puller = builder_puller();
+    let mut pulled: Option<Puller<Pool::Transaction>> = None;
+    let mut best_txs = if puller == 0 {
+        Some(best_txs)
+    } else {
+        pulled = Some(Puller::start(best_txs, puller));
+        None
+    };
+    macro_rules! refuse {
+        ($tx:expr, $err:expr) => {
+            match (best_txs.as_mut(), pulled.as_ref()) {
+                (Some(best), _) => best.mark_invalid($tx, $err),
+                (None, Some(puller)) => puller.refuse(Refusal::Invalid(Arc::clone($tx), $err)),
+                (None, None) => {}
+            }
+        };
+    }
     let mut tx_count = 0u64;
     let mut total_fees = U256::ZERO;
 
@@ -534,13 +569,27 @@ where
         // split. rdtsc is a register read; the ticks are converted once, at
         // the end, against the build's wall clock.
         let pool_at = ticks();
-        let pool_tx = if prefetch == 0 {
-            let Some(pool_tx) = best_txs.next() else { break };
+        if tail_at != 0 {
+            tail_ticks += pool_at.wrapping_sub(tail_at);
+        }
+        let pool_tx = if let Some(puller) = pulled.as_ref() {
+            if lookahead.is_empty() {
+                match puller.batches.recv() {
+                    Ok(batch) => lookahead.extend(batch),
+                    Err(_) => break,
+                }
+                if lookahead.is_empty() {
+                    break;
+                }
+            }
+            lookahead.pop_front().expect("checked non-empty")
+        } else if prefetch == 0 {
+            let Some(pool_tx) = best_txs.as_mut().expect("direct").next() else { break };
             pool_tx
         } else {
             if lookahead.is_empty() {
                 while lookahead.len() < prefetch {
-                    let Some(pool_tx) = best_txs.next() else { break };
+                    let Some(pool_tx) = best_txs.as_mut().expect("direct").next() else { break };
                     lookahead.push_back(pool_tx);
                 }
                 if lookahead.is_empty() {
@@ -604,9 +653,9 @@ where
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
             // continue
-            best_txs.mark_invalid(
+            refuse!(
                 &pool_tx,
-                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
+                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
             );
             continue;
         }
@@ -653,14 +702,14 @@ where
                 // the iterator. This is similar to the gas limit condition
                 // for regular transactions above.
                 trace!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
-                best_txs.mark_invalid(
+                refuse!(
                     &pool_tx,
                     InvalidPoolTransactionError::Eip4844(
                         Eip4844PoolTransactionError::TooManyEip4844Blobs {
                             have: block_blob_count + tx_blob_count,
                             permitted: max_blob_count,
                         },
-                    ),
+                    )
                 );
                 continue;
             }
@@ -672,7 +721,8 @@ where
         let blob_count = tx.as_eip4844().map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let executed = builder.execute_transaction(tx);
-        exec_ticks += ticks().wrapping_sub(pulled_at);
+        tail_at = ticks();
+        exec_ticks += tail_at.wrapping_sub(pulled_at);
         let gas_used = match executed {
             Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
@@ -695,7 +745,7 @@ where
                         }
                         _ => InvalidTransactionError::TxTypeNotSupported,
                     };
-                    best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Consensus(kind));
+                    refuse!(&pool_tx, InvalidPoolTransactionError::Consensus(kind));
                 }
                 continue;
             }
@@ -709,7 +759,11 @@ where
 
             // if we've reached the max blob count, we can skip blob txs entirely
             if block_blob_count == max_blob_count {
-                best_txs.skip_blobs();
+                match (best_txs.as_mut(), pulled.as_ref()) {
+                    (Some(best), _) => best.skip_blobs(),
+                    (None, Some(puller)) => puller.refuse(Refusal::Blobs),
+                    (None, None) => {}
+                }
             }
         }
 
@@ -726,11 +780,14 @@ where
     // Whatever was taken ahead and not built goes back to the queue, last
     // taken first so each is the queue's last and the return is O(1).
     for pool_tx in lookahead.into_iter().rev() {
-        best_txs.mark_invalid(
+        refuse!(
             &pool_tx,
-            InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
+            InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
         );
     }
+    // The puller stops at its next batch; what it pulled meanwhile it
+    // returns itself.
+    drop(pulled.take());
     let loop_done = build_started.elapsed();
     // Ticks to nanoseconds, against the wall clock of the loop just run.
     {
@@ -738,6 +795,7 @@ where
         let ns_per_tick = loop_done.as_nanos() as f64 / elapsed_ticks as f64;
         pool_ns += (pool_ticks as f64 * ns_per_tick) as u128;
         exec_ns += (exec_ticks as f64 * ns_per_tick) as u128;
+        tail_ns += (tail_ticks as f64 * ns_per_tick) as u128;
     }
 
     // check if we have a better block
@@ -930,6 +988,7 @@ where
             fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
             refused = ?crate::fast_transfer::rejected(),
             exec_ms = (exec_ns / 1_000_000) as u64,
+            tail_ms = (tail_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,
             finish_ms = finish_took.as_millis() as u64,
             root_ms = root_took.as_millis() as u64,
@@ -1080,6 +1139,83 @@ const MIN_TRANSACTION_GAS: u64 = 21_000;
 /// `N42_BUILDER_PREFETCH=<n>`: how many transactions the builder takes ahead
 /// of execution to read their accounts in parallel first; 0 (the default)
 /// executes straight from the pool.
+/// `N42_BUILDER_PULLER=<n>`: the batch a puller thread takes from the pool
+/// ahead of the build's execution; 0 (default) walks the pool on the build's
+/// own thread.
+fn builder_puller() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("N42_BUILDER_PULLER").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// What the build tells the puller about a transaction it was handed.
+enum Refusal<T: reth_transaction_pool::PoolTransaction> {
+    /// Refused: the pool's `mark_invalid`, from the puller's thread.
+    Invalid(Arc<reth_transaction_pool::ValidPoolTransaction<T>>, InvalidPoolTransactionError),
+    /// The block's blob space is full.
+    Blobs,
+}
+
+/// The pool walk on its own thread: batches ahead of the execution, refusals
+/// back. Dropping it ends the walk; the thread returns what it still holds.
+struct Puller<T: reth_transaction_pool::PoolTransaction> {
+    batches: std::sync::mpsc::Receiver<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>,
+    refusals: std::sync::mpsc::Sender<Refusal<T>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
+    fn start(
+        mut best: Box<dyn BestTransactions<Item = Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>,
+        batch: usize,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        let (batch_tx, batches) = std::sync::mpsc::sync_channel(2);
+        let (refusals, refusal_rx) = std::sync::mpsc::channel::<Refusal<T>>();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let apply = move |best: &mut Box<dyn BestTransactions<Item = Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>| {
+            while let Ok(refusal) = refusal_rx.try_recv() {
+                match refusal {
+                    Refusal::Invalid(tx, err) => best.mark_invalid(&tx, err),
+                    Refusal::Blobs => best.skip_blobs(),
+                }
+            }
+        };
+        let spawned = std::thread::Builder::new().name("n42-builder-puller".into()).spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                apply(&mut best);
+                let mut pulled = Vec::with_capacity(batch);
+                for _ in 0..batch {
+                    match best.next() {
+                        Some(tx) => pulled.push(tx),
+                        None => break,
+                    }
+                }
+                if pulled.is_empty() || batch_tx.send(pulled).is_err() {
+                    break;
+                }
+            }
+            // The build's last refusals, then the walk's own give-back on drop.
+            apply(&mut best);
+        });
+        if let Err(err) = spawned {
+            warn!(target: "payload_builder", %err, "could not start the pool puller; the build has no transactions");
+        }
+        Self { batches, refusals, done }
+    }
+
+    fn refuse(&self, refusal: Refusal<T>) {
+        // A puller that already ended has nothing to refuse.
+        let _ = self.refusals.send(refusal);
+    }
+}
+
+impl<T: reth_transaction_pool::PoolTransaction> Drop for Puller<T> {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn builder_prefetch() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("N42_BUILDER_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
