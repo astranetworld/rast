@@ -25,17 +25,16 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
 
-## Where it stands today: 353,075 TPS (2026-09-05)
+## Where it stands today: 365,399 TPS (2026-09-05)
 
-The record on this fleet (round 39, `loop49K20c`, bookended by `loop48K20b`
-345,250 / 330,985 and `loop49K20d` 345,599 / 328,509; the same legs without
-huge pages for the heap read 310,0xx / 293,39x):
+The record on this fleet (round 39, `loop53Q300a`, pacing 300; pacing 350 read
+357,292 and 357,651 on window 1 in the legs around it, pacing 400 349-353k):
 
 | window | TPS | blocks | cycle | occupancy |
 | --- | ---: | ---: | ---: | ---: |
-| win1 | **353,075** | 66 | 0.455 s | ~98% |
-| win2 | **320,555** | 59 | 0.508 s | 100% |
-| win3 | 239,059 | 51 | 0.588 s | 100% (direct compaction; `defrag=defer` pending) |
+| win1 | **365,399** | 71 | 0.423 s | 94.7% |
+| win2 | **343,885** | 64 | 0.469 s | 98.9% |
+| win3 | 271,655 | 69 | 0.435 s | 72.5% (the 48M flood running out) |
 
 Seven nodes, every follower executing every transaction and computing the
 QMDB root, senders recovered on every node, bodies over direct push with
@@ -50,8 +49,8 @@ N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DI
 N42_FAST_TRANSFER=1 N42_FOLLOWER_DIRECT_IMPORT=1 F7_SENDER_CACHE_MULT=4 \
 N42_TX_QUEUE_BATCH=1024 N42_TX_QUEUE_DRAINER=1 N42_BUILDER_PULLER=1024 \
 N42_TX_INGEST_RECOVER_PARALLEL=20 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always \
-F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3" F7_FLOOD_WINDOW=6 F7_BLOCK_INTERVAL_MS=400 \
-scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 7000 --conc 64 --rpcbatch 500
+F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3" F7_FLOOD_WINDOW=6 F7_BLOCK_INTERVAL_MS=300 \
+scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 8000 --conc 64 --rpcbatch 500
 ```
 
 How it got here, in the order the rounds found it (each has its section
@@ -4887,3 +4886,36 @@ Working configuration on this host, from here: THP `madvise` +
 `N42_TX_INGEST_RECOVER_PARALLEL=20 N42_TX_QUEUE_RUN=64
 MALLOC_CONF=thp:always` with `--pertx 7000` on the fleet; one warm-up leg;
 the box shared through the claim files.
+
+### loop51-53: run length is spent, the own block travels as a header, and pacing 300 reads 365,399
+
+Box exclusive (Codex stopped), host THP `madvise` + `defrag=defer`, 20
+slots, jemalloc huge pages, one warm-up leg each (void):
+
+    loop51 (queue run length, pacing 400, 42M flood)
+      R64a 347,714/336,849  R128a 353,148/331,419  R256a 350,673/335,222  R64b 353,117/339,171  R128b 354,208/342,286
+      -> null beyond 64; window 3 = 271,657 in four legs is the flood running out (--pertx 8000 from here)
+    loop52 (own block by sealed header vs the payload, pacing 400, 48M flood)
+      H20a 351,789/351,131  P20a 345,602/345,382  H20b 349,897/345,253  P20b 352,666/331,376
+      -> the own import falls 90-130 -> 57 ms (hand-off 35, payload assembly 15, engine 9; 79/79
+         blocks by header, 0 refusals) but the cycle sits at the pacing gate: null on window 1
+    loop53 (pacing, header path)
+      Q350a 357,292/349,513  Q400a 353,150/340,142  Q300a 365,399/343,885  Q350b 357,651/341,711  Q400b 349,115/349,567
+      -> 300: 0.423 s cycle at 94.7% occupancy, the two chains (own import + build ahead; gossip +
+         follower import + votes) now set the cycle; 350: 0.441 s; 400: 0.455 s
+
+The leader's own block now crosses the raw channel as its sealed header
+(`request::OWN_BLOCK`, ~600 bytes): the execution layer finds the build
+in its registry, hands the build's execution to the engine under the
+sealed hash, assembles the engine's payload from the build's own
+transactions, and answers; an unknown build is refused and the validator
+sends the payload as before. What it buys shows only once the pacing gate
+is out of the way, which loop53 does: 365,399 on window 1 at pacing 300.
+
+Item 3 -- the follower's block of plain transfers executed on the worker
+pool (`parallel_transfer`: groups that share no sender or recipient, one
+`State` over the parent each, the groups' changes folded into the block's
+state as deltas so rewards and the beneficiary's tips come out as the
+serial executor's; asserted equal to it on receipts, gas, requests and
+the bundle's accounts, statuses and reverts) -- is built behind
+`N42_FOLLOWER_PARALLEL=1` and measured next (loop54).
