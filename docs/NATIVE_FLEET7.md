@@ -4866,3 +4866,24 @@ occupancy, with the supply at 20 slots delivering ~340k/s. The
 configuration on top of the round-39 one: `N42_TX_INGEST_RECOVER_PARALLEL=20
 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always`, a 42M-transaction flood
 (`--pertx 7000`), one warm-up leg before anything is read.
+
+### loop50: `defrag=defer` gives the huge-page legs their third window back
+
+Host now at THP `madvise`, `defrag=defer` (khugepaged only, no compaction
+on the fault path), same legs as loop48-49:
+
+    leg     heap THP  win1     win2     win3     fleet major faults
+    W20     -         271,654  255,357  233,476  warm-up after three idle hours, void
+    K20e    yes       343,816  325,642  277,088  0
+    B20c    -         306,754  298,824  282,525  0
+    K20f    yes       345,546  315,119  293,389  0
+
+Windows 1-2 hold at 344-346k / 315-326k over the 307k / 299k bookend, and
+window 3 reads 277-293k where `defer+madvise` left it at 239-255k. The
+build's execution no longer spikes; `compact_stall` still moves in
+bursts (other high-order allocations), with no fleet faults behind it.
+Working configuration on this host, from here: THP `madvise` +
+`defrag=defer` + `watermark_boost_factor=0` + swap empty on the host;
+`N42_TX_INGEST_RECOVER_PARALLEL=20 N42_TX_QUEUE_RUN=64
+MALLOC_CONF=thp:always` with `--pertx 7000` on the fleet; one warm-up leg;
+the box shared through the claim files.
