@@ -109,20 +109,15 @@ block's cycle goes — run at the END of a round and compare whole rounds only)
 and `scripts/fleet7-profile.sh` (perf between windows; `--alloc` for jemalloc
 heap profiles, the instrument a CPU profile cannot replace).
 
-**Record (2026-09-04, round 39): 316,289 / 304,541 / 302,823 TPS** (loop33H400a, every window past
-300k, 0.43 s cycle at 80% occupancy -- the flood's ~300k/s supply binds; 315,121 on a window with every
-block full in loop31E400b) with `F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1
-N42_TX_INGEST_ASYNC=1 F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=400 F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1
-N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DIRECT=1
-N42_FAST_TRANSFER=1 N42_FOLLOWER_DIRECT_IMPORT=1 F7_SENDER_CACHE_MULT=4 N42_TX_QUEUE_BATCH=1024
-N42_TX_QUEUE_DRAINER=1 N42_BUILDER_PULLER=1024 F7_FLOOD_WINDOW=6
-F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3"` and `--gasceil 3423000000 --senders 6000
---pertx 6000 --conc 64 --rpcbatch 500`. `N42_FAST_TRANSFER=1` applies plain transfers without the
-interpreter (byte-equal to revm, tested); the payload service must use the node's EVM factory for
-any EVM change to reach the builder (it had its own `EthEvmConfig::new` until 9d95b8e0f). The
-cycle is *own import + build ahead* on the leader (83-101 + ~350 ms) at parity with the QC chain
-(followers' import ~330 ms + the vote's second round, 26-126 ms of `fsync` on the vote log --
-measured in loop28); 24 recovery slots and a parallel account prefetch both measured worse.
+**Record (2026-09-05, round 39): 353,075 / 320,555 TPS** (win1/win2 of loop49K20c, 0.455 s cycle
+with every block full; the two legs around it 345,250 / 330,985 and 345,599 / 328,509; the same legs
+without huge pages for the heap 310k / 293k) with the round-39 configuration plus
+`N42_TX_INGEST_RECOVER_PARALLEL=20 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always` and `--pertx 7000`.
+`MALLOC_CONF=thp:always` gives the execution layer's jemalloc heap 2 MB pages under the host's THP
+`madvise` (the builder's execution is 194-207 ms with them, 225-241 without); the third window is
+lost to direct compaction until the host runs `defrag=defer`. Host rules that matter: THP `madvise`
+(not `always`: with it the fleet's reads faulted by the million), swap empty, one warm-up leg before
+any leg is read, and `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md` for sharing the box.
 `docs/NATIVE_FLEET7.md` "Where it stands today".
 
 **Never draw a conclusion from one round.** `scripts/fleet7-repeat.sh <n>` runs a

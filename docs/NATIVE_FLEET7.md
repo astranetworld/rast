@@ -25,17 +25,17 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
 
-## Where it stands today: 316,289 TPS, every window past 300,000 (2026-09-04)
+## Where it stands today: 353,075 TPS (2026-09-05)
 
-The record on this fleet (round 39, `loop33H400a`, bookended by `loop33H400b`
-at 314,690 / 297,856 / 299,955; `loop31E400a` read 316,905 on window 1 and
-`loop31E400b` 315,121 on a window with every block full):
+The record on this fleet (round 39, `loop49K20c`, bookended by `loop48K20b`
+345,250 / 330,985 and `loop49K20d` 345,599 / 328,509; the same legs without
+huge pages for the heap read 310,0xx / 293,39x):
 
 | window | TPS | blocks | cycle | occupancy |
 | --- | ---: | ---: | ---: | ---: |
-| win1 | **316,289** | 70 | 0.429 s | 83.2% |
-| win2 | **304,541** | 71 | 0.423 s | 78.9% |
-| win3 | **302,823** | 70 | 0.429 s | 79.6% |
+| win1 | **353,075** | 66 | 0.455 s | ~98% |
+| win2 | **320,555** | 59 | 0.508 s | 100% |
+| win3 | 239,059 | 51 | 0.588 s | 100% (direct compaction; `defrag=defer` pending) |
 
 Seven nodes, every follower executing every transaction and computing the
 QMDB root, senders recovered on every node, bodies over direct push with
@@ -49,8 +49,9 @@ F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250 F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1 \
 N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DIRECT=1 \
 N42_FAST_TRANSFER=1 N42_FOLLOWER_DIRECT_IMPORT=1 F7_SENDER_CACHE_MULT=4 \
 N42_TX_QUEUE_BATCH=1024 N42_TX_QUEUE_DRAINER=1 N42_BUILDER_PULLER=1024 \
+N42_TX_INGEST_RECOVER_PARALLEL=20 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always \
 F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3" F7_FLOOD_WINDOW=6 F7_BLOCK_INTERVAL_MS=400 \
-scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 6000 --conc 64 --rpcbatch 500
+scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 7000 --conc 64 --rpcbatch 500
 ```
 
 How it got here, in the order the rounds found it (each has its section
@@ -4831,3 +4832,37 @@ nonces of one sender before moving on) at 16 slots:
 
 Build execution 208 ms against 226, the build 298 against 312: -8% on
 the build, +3% on windows 1-2.
+
+### loop48-49: 353,075 -- huge pages for the execution layer's heap, bookended
+
+20 recovery slots, `N42_TX_QUEUE_RUN=64`, a 42M-transaction flood, the box
+at THP `madvise` / `defrag=defer+madvise`; the B legs are the same with
+jemalloc's `MALLOC_CONF=thp:always`, which makes the execution layer's heap
+the only thing on the box asking for huge pages:
+
+    leg           heap THP  win1     win2     win3     cycle (win1)  note
+    loop48 K20a   yes       179,293  249,922  244,489  0.833 s       first leg after two idle hours: warm-up, void
+    loop48 B20a   -         309,995  293,391  293,389  0.517 s
+    loop48 K20b   yes       345,250  330,985  249,925  0.462 s
+    loop49 W20    -         309,689  298,822  293,390  0.517 s       warm-up
+    loop49 K20c   yes       353,075  320,555  239,059  0.455 s
+    loop49 B20b   -         310,108  293,390  287,953  0.517 s
+    loop49 K20d   yes       345,599  328,509  255,358  0.462 s
+
+The bookends agree to 0.04% (310.0 / 310.1 on window 1) and the three
+huge-page legs read 345-353k on window 1 and 321-331k on window 2:
++11-14% and +9-13%, from the builder getting its 2 MB pages back (the
+day-before's 194-207 ms execution instead of 225-241). Every huge-page
+leg loses its third window the same way: `compact_stall` climbs 7-17k per
+30 s once the page cache is full, because `defer+madvise` compacts
+synchronously for madvised regions and the build's execution then
+spikes to 500+ ms. `defrag=defer` hands that to khugepaged and is the
+one root-side setting still to try; with it the three windows should
+read like the first two.
+
+Where this leaves the fleet: 353k on a window at 0.455 s with every
+block full is 163,000 / 0.455 -- the chain's cycle again, at ~98%
+occupancy, with the supply at 20 slots delivering ~340k/s. The
+configuration on top of the round-39 one: `N42_TX_INGEST_RECOVER_PARALLEL=20
+N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always`, a 42M-transaction flood
+(`--pertx 7000`), one warm-up leg before anything is read.

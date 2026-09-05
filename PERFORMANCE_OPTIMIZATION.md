@@ -6,10 +6,10 @@
 
 ---
 
-## Status (2026-09-04)
+## Status (2026-09-05)
 
 This guide is a point-in-time plan from 2025-12-20; its targets are long
-passed. The measured figure is **316,289 TPS** (every window of the round past 300,000) on the all-Rust seven-node
+passed. The measured figure is **353,075 TPS** on the all-Rust seven-node
 native fleet (round 39 in `docs/NATIVE_FLEET7.md`), every node executing every
 transaction; that document records what each round changed and what it was
 worth. Read the tables below as history.
