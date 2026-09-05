@@ -144,7 +144,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
     /// revm would succeed on it; `None` sends it to the interpreter. A database
     /// error is the same error the interpreter would have hit loading the
     /// account.
-    fn transfer(&mut self, tx: &TxEnv) -> Result<Option<ResultAndState>, DB::Error> {
+    pub(crate) fn transfer(&mut self, tx: &TxEnv) -> Result<Option<ResultAndState>, DB::Error> {
         // The transaction's shape.
         let TxKind::Call(to) = tx.kind else { return refused(0) };
         if !tx.data.is_empty()

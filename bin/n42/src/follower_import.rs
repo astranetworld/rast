@@ -57,8 +57,11 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     chain_spec: &ChainSpec,
 ) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 7]), String>
 where
-    Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header>,
-    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
+    Evm: ConfigureEvm<
+        Primitives = EthPrimitives,
+        BlockExecutorFactory = n42_engine_types::parallel_transfer::FastExecutorFactory,
+    >,
     ChainSpec: reth_chainspec::EthereumHardforks,
 {
     let qmdb = qmdb.ok_or("no QMDB state: the direct import needs the chain's root")?;
@@ -115,10 +118,43 @@ where
         Some((of, cached)) if of == parent_hash => cached,
         _ => CachedReads::default(),
     };
-    let output = evm_config
-        .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
-        .execute(&recovered)
-        .map_err(|err| format!("execution: {err}"))?;
+    // `N42_FOLLOWER_PARALLEL=1`: a block of plain transfers executes on the
+    // worker pool (`parallel_transfer`), partitioned by the accounts it
+    // touches; anything it cannot take falls back to the serial executor.
+    let mut output = None;
+    if follower_parallel() {
+        let open = || provider.state_by_block_hash(parent_hash).ok().map(StateProviderDatabase::new);
+        match n42_engine_types::parallel_transfer::execute_transfers(
+            evm_config,
+            &recovered,
+            cached.as_db_mut(StateProviderDatabase::new(&state)),
+            &open,
+        )
+        .map_err(|err| format!("parallel execution: {err}"))?
+        {
+            Ok((out, phases)) => {
+                tracing::info!(
+                    target: "n42.follower_import",
+                    number,
+                    groups = phases.groups,
+                    partition_ms = phases.partition_ms,
+                    groups_ms = phases.groups_ms,
+                    merge_ms = phases.merge_ms,
+                    finish_ms = phases.finish_ms,
+                    "parallel import phases"
+                );
+                output = Some(out);
+            }
+            Err(why) => tracing::debug!(target: "n42.follower_import", number, %why, "not parallel; executing serially"),
+        }
+    }
+    let output = match output {
+        Some(out) => out,
+        None => evm_config
+            .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
+            .execute(&recovered)
+            .map_err(|err| format!("execution: {err}"))?,
+    };
     let exec_ms = executed_at.elapsed().as_millis() as u64;
     let checks_at = std::time::Instant::now();
     consensus
@@ -163,4 +199,10 @@ where
         }),
         [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits],
     ))
+}
+
+/// `N42_FOLLOWER_PARALLEL`, read once.
+fn follower_parallel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARALLEL").is_ok_and(|v| v == "1"))
 }
