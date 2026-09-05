@@ -4786,3 +4786,48 @@ full and cannot take anonymous pages, so reclaim takes file pages),
 `watermark_boost_factor=0`); none of it is ours to run without root.
 Until then: warm-up leg, 20 slots, THP off for the validator, never read a
 leg whose fleet faulted.
+
+### 2026-09-05: the box reset, a double booking, 342k with huge pages for the heap alone, and the block's shape
+
+The host was reset as root (swap emptied, caches dropped, THP `madvise`,
+`watermark_boost_factor=0`, both persisted). Two runs were then voided by
+another driver: seven `n42-qread-check` jobs (94 GB) at 00:31 and a second
+Rust fleet from `N42-gov5/build/perf7/run-rust-persist30.sh` at 00:41,
+neither reading the claim files; the gate now also refuses to start while
+the box holds more than 30 GB of anonymous memory, and the shared rules are
+in `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md` (a Codex driver has
+since claimed through it). A fleet of ours is stopped by its datadir root
+(`rust-fleet7-benc[h]`), never by the binary's name, which the other fleet
+shares.
+
+On the reset box with THP `madvise`, every leg is clean (fleet major
+faults 35-40 a leg) and chain-bound with every block full at 0.53-0.59 s:
+
+    loop43  W20 300/283/277  S20a 301/283/277  S16a 306/293/288  S20b 295/283/277  S16b 305/293/288
+    loop45  P6a 316/299/276 (36M flood)  P7a 310/299/299 (42M)  P6b 306/299/291 (36M)
+
+The slot count no longer matters (the chain binds) and the flood's size
+is null. What changed against the 0.43 s legs of the day before is the
+builder: 225-241 ms of execution against 194-207, because the execution
+layer's heap has no huge pages under `madvise`. `MALLOC_CONF=thp:always`
+makes jemalloc ask for them itself (`AnonHugePages` 27 GB) and gives the
+record:
+
+    loop44  J20a 322,405 / 266,223 / 266,203   S20c 300,124 / 287,949 / 282,523   J20b 342,287 / 342,278 / 260,773
+
+-- 342k on two consecutive windows at 0.469-0.476 s, then a tail lost to
+direct compaction (`compact_stall` thousands per 15 s once the page cache
+is full; `defrag=defer+madvise` compacts synchronously for madvised
+regions, and the build's execution spikes to 510-560 ms). `defrag=defer`
+(root) is the next setting to ask for; loop47 waits on it.
+
+The block's shape is the other lever the day-before legs had for free:
+`updated` accounts a block were 2.7k then and 5.3-7.2k now (same flood
+arguments; the ingest's arrival order interleaves more senders). The
+queue's run length `N42_TX_QUEUE_RUN=64` (take up to 64 consecutive
+nonces of one sender before moving on) at 16 slots:
+
+    loop46  R64a 320,568 / 309,690 / 243,710 (win3 = flood exhausted)   R1a 310,784 / 298,824 / 291,524   R64b 315,102 / ...
+
+Build execution 208 ms against 226, the build 298 against 312: -8% on
+the build, +3% on windows 1-2.
