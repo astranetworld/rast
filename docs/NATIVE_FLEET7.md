@@ -4919,3 +4919,35 @@ state as deltas so rewards and the beneficiary's tips come out as the
 serial executor's; asserted equal to it on receipts, gas, requests and
 the bundle's accounts, statuses and reverts) -- is built behind
 `N42_FOLLOWER_PARALLEL=1` and measured next (loop54).
+
+### loop54-55: the parallel follower moves the chain's cycle to 0.36 s, and the supply is the bound again
+
+`N42_FOLLOWER_PARALLEL=1` against the serial follower, pacing 300, 20 slots,
+huge pages, 48M flood (warm-up void):
+
+    leg   follower  win1     cycle    win2     cycle    win3
+    F1    parallel  346,322  0.361 s  339,254  0.441 s  320,555
+    S1    serial    359,607  0.435 s  325,986  0.500 s  271,657
+    F2    parallel  355,630  0.380 s  333,183  0.366 s  309,463
+    S2    serial    355,470  0.435 s  335,372  0.484 s  293,387
+
+The follower's execution falls 145 -> 87 ms (13 conflict-free groups a
+block; partition 29, groups 29 wall, merge 18 -- the partition's hasher
+is now the fixed-bytes one), 529 blocks a round through the path and
+none refused, R1 306 ms. The chain's cycle is 0.36-0.38 s where the serial
+follower held it at 0.435, i.e. a capacity of ~450k/s -- and the blocks are
+75-83% full, because the supply at 20 slots delivers ~340-350k/s (95%
+busy). Window 1 is therefore null between the two (both read the supply),
+window 3 is +10-18% for the parallel follower.
+
+Slots with the parallel follower (loop55, pacing 300):
+
+    X24a 358,252 (0.448 s)  X20a 352,921 (0.370 s)  X24b 357,254 (0.455 s)  X28a 347,169 (0.469 s)  X20b 354,963 (0.366 s)
+
+24 slots raise the ingest to 326-365k/s but slow the chain back to
+0.45 s (busy 57-63 us a transaction under the added SMT contention);
+28 is worse on both. 20 stays. Where the fleet stands on this host:
+355-365k on window 1, supply-bound, with a chain that could take ~450k.
+The next lever is the signature work itself (seven recoveries per
+transaction across the fleet) or a bigger box; the builder's revm
+bookkeeping (item 2) is off the binding chain for now.

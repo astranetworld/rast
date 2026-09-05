@@ -35,7 +35,6 @@ use revm::{
     state::{Account, AccountStatus},
     Database, DatabaseCommit,
 };
-use std::collections::HashMap;
 
 use crate::fast_transfer::N42EvmFactory;
 
@@ -136,7 +135,10 @@ where
     // The transactions' environments, and the partition.
     let at = std::time::Instant::now();
     let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
-    let mut index_of: HashMap<Address, usize> = HashMap::with_capacity(txs.len() * 2);
+    // Address-keyed with the fixed-bytes hasher: the default hasher was
+    // ~29 ms of a 163,000-transfer block's partition.
+    let mut index_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
+    index_of.reserve(txs.len() * 2);
     let mut party = |a: Address| -> usize {
         let next = index_of.len();
         *index_of.entry(a).or_insert(next)
@@ -160,16 +162,15 @@ where
     }
     // Group id per transaction, then the transactions of each group in block
     // order.
-    let mut group_of_root: HashMap<usize, usize> = HashMap::new();
+    let mut group_of_root: Vec<usize> = vec![usize::MAX; index_of.len()];
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (i, (a, _)) in edges.iter().enumerate() {
         let root = sets.find(*a);
-        let next = groups.len();
-        let g = *group_of_root.entry(root).or_insert_with(|| {
+        if group_of_root[root] == usize::MAX {
+            group_of_root[root] = groups.len();
             groups.push(Vec::new());
-            next
-        });
-        groups[g].push(i);
+        }
+        groups[group_of_root[root]].push(i);
     }
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.groups = groups.len();
