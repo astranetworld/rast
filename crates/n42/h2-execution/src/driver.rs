@@ -528,11 +528,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub fn spawn_import_own_block(&self, built: &BuiltBlock) {
         let el = std::sync::Arc::clone(&self.el);
         let payload = built.execution_data.clone();
+        let header = built.header.clone();
         let hash = built.hash;
         let imported = self.own_imports.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            match el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload).await {
+            match el.import_own_block(header.as_ref(), payload).await {
                 Ok(status) => {
                     info!(
                         target: "n42.h2.el",

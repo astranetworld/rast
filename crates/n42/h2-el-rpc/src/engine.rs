@@ -468,6 +468,21 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         accepted
     }
 
+    async fn import_own_block(
+        &self,
+        header: Option<&alloy_consensus::Header>,
+        payload: ExecutionData,
+    ) -> Result<PayloadStatus, ElError> {
+        // `N42_OWN_BLOCK_BY_HEADER=0` sends the payload as before (the A-B).
+        let by_header = std::env::var("N42_OWN_BLOCK_BY_HEADER").map_or(true, |v| v != "0");
+        if let (Some(header), true) = (header, by_header) {
+            if let Some(status) = self.own_block_over_channel(header).await {
+                return Ok(status);
+            }
+        }
+        self.new_payload(payload).await
+    }
+
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
         // The loopback channel first; any failure falls through to JSON.
         if let Some(status) = self.new_payload_over_channel(&payload).await {
@@ -639,6 +654,71 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
     /// Hands a payload to the execution layer over the raw channel.
     ///
     /// `None` means "not this way" and the caller uses JSON.
+    /// The own-block import by sealed header (`request::OWN_BLOCK`). `None`
+    /// when there is no raw channel, the execution layer no longer keeps the
+    /// build, or the request failed: the caller sends the payload instead.
+    async fn own_block_over_channel(&self, header: &alloy_consensus::Header) -> Option<PayloadStatus> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut channel = self.raw_import.lock().await;
+        let addr = self.raw_endpoint(&mut channel).await?;
+        let started = std::time::Instant::now();
+        let frame = alloy_rlp::encode(header);
+        let taken = channel.stream.take();
+        let attempt: std::io::Result<(Option<PayloadStatus>, tokio::net::TcpStream)> = async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            let stream = &mut conn;
+            stream.write_u8(n42_h2_execution::raw_engine::request::OWN_BLOCK).await?;
+            stream.write_u32_le(frame.len() as u32).await?;
+            stream.write_all(&frame).await?;
+            let status = match stream.read_u8().await? {
+                1 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut buf = vec![0u8; len];
+                    stream.read_exact(&mut buf).await?;
+                    Some(
+                        n42_h2_execution::raw_engine::decode_payload_status(&buf)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+                    )
+                }
+                2 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut message = vec![0u8; len];
+                    stream.read_exact(&mut message).await?;
+                    debug!(target: "n42.h2.el", message = %String::from_utf8_lossy(&message), "own block by header refused; sending the payload");
+                    None
+                }
+                other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
+            };
+            Ok((status, conn))
+        }
+        .await;
+        match attempt {
+            Ok((status, conn)) => {
+                channel.stream = Some(conn);
+                if let Some(status) = &status {
+                    tracing::info!(
+                        target: "n42.h2.el",
+                        round_trip_ms = started.elapsed().as_millis() as u64,
+                        status = ?status.status,
+                        "own block imported by header"
+                    );
+                }
+                status
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.el", %err, "own block by header failed; sending the payload");
+                None
+            }
+        }
+    }
+
     async fn new_payload_over_channel(&self, payload: &ExecutionData) -> Option<PayloadStatus> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut channel = self.raw_import.lock().await;

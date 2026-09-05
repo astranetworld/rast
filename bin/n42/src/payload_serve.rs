@@ -225,10 +225,30 @@ where
         }
     };
     let converted = started.elapsed();
-    let sealed_hash = sealed_header.hash();
     if v1.transactions.len() != built.block.body().transactions.len() {
         return None;
     }
+    hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, converted).await
+}
+
+/// The hand-off of a build this node kept, under the sealed header consensus
+/// gave it: the sealed block registered for the engine's own conversion, the
+/// build's execution inserted as executed, the QMDB root filed under the
+/// sealed hash, the queue told, the pool pruned. Shared by the payload path
+/// (`reuse_own_build`) and the header-only path (`request::OWN_BLOCK`).
+async fn hand_off_own_build<T>(
+    reuse: &OwnBlockReuse,
+    built_hash: B256,
+    built: n42_engine_types::built_executions::BuiltExecution,
+    sealed_header: reth_primitives_traits::SealedHeader,
+    converted: std::time::Duration,
+) -> Option<B256>
+where
+    T: PayloadTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    let started = std::time::Instant::now();
+    let block_number = sealed_header.number;
+    let sealed_hash = sealed_header.hash();
     let body = built.block.body().clone();
     // For the engine's newPayload of this block, which follows the hand-off:
     // its conversion finds the block here instead of decoding the payload.
@@ -307,7 +327,7 @@ where
             }
             info!(
                 target: "n42.payload_serve",
-                number = v1.block_number,
+                number = block_number,
                 convert_ms = converted.as_millis() as u64,
                 queue_prune_ms,
                 total_ms = started.elapsed().as_millis() as u64,
@@ -320,6 +340,61 @@ where
             None
         }
     }
+}
+
+/// A block this node built, imported by its sealed header alone
+/// (`request::OWN_BLOCK`): the build is found by the header's parent, number
+/// and roots, handed to the engine as executed under the sealed hash, and
+/// the engine's `newPayload` then runs on a payload assembled here from the
+/// build's own transactions -- 19 MB that no longer cross the wire twice.
+/// Returns the status, the block number, and the hand-off and payload
+/// assembly times in milliseconds; an `Err` is the message to send back
+/// (`unknown build`), on which the caller sends the payload the old way.
+async fn own_block_by_header<T>(
+    reuse: Option<&OwnBlockReuse>,
+    engine: &ConsensusEngineHandle<T>,
+    frame: &[u8],
+) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
+where
+    T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    use alloy_rlp::Decodable;
+    let reuse = reuse.ok_or("no own-block reuse on this node")?;
+    let header = alloy_consensus::Header::decode(&mut &frame[..]).map_err(|e| format!("header: {e}"))?;
+    if header.block_access_list_hash.is_some() {
+        // The build registry does not keep the access list the payload
+        // carries; the payload path does.
+        return Err("unknown build: block access list".to_owned());
+    }
+    let (built_hash, built) = n42_engine_types::built_executions::find(
+        header.parent_hash,
+        header.number,
+        header.state_root,
+        header.receipts_root,
+        header.gas_used,
+    )
+    .ok_or("unknown build")?;
+    let sealed_hash = header.hash_slow();
+    let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
+    let block = built.block.clone();
+    let handoff_at = std::time::Instant::now();
+    hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, std::time::Duration::ZERO)
+        .await
+        .ok_or("the engine did not take the executed block")?;
+    let handoff_ms = handoff_at.elapsed().as_millis() as u64;
+    // The payload for the engine's `newPayload`, from the build's transactions:
+    // encoded here, on the worker pool, instead of by the validator and
+    // decoded back here.
+    let payload_at = std::time::Instant::now();
+    let transactions: Vec<alloy_primitives::Bytes> = {
+        use rayon::prelude::*;
+        block.body().transactions().collect::<Vec<_>>().par_iter().map(|tx| tx.encoded_2718().into()).collect()
+    };
+    let withdrawals = block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
+    let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, transactions, withdrawals, None);
+    let payload_ms = payload_at.elapsed().as_millis() as u64;
+    let status = engine.new_payload(data).await.map_err(|e| format!("engine: {e}"))?;
+    Ok((status, header.number, handoff_ms, payload_ms))
 }
 
 /// The sealed header a payload describes, given the build it came from: the
@@ -448,6 +523,42 @@ where
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
+        if kind == request::OWN_BLOCK {
+            let len = stream.read_u32_le().await? as usize;
+            if len > 1 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header frame too large"));
+            }
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            out.clear();
+            let started = std::time::Instant::now();
+            let reply = own_block_by_header::<T>(reuse.as_ref(), &engine, &buf).await;
+            match reply {
+                Ok((status, number, handoff_ms, payload_ms)) => {
+                    info!(
+                        target: "n42.payload_serve",
+                        number,
+                        handoff_ms,
+                        payload_ms,
+                        total_ms = started.elapsed().as_millis() as u64,
+                        status = ?status.status,
+                        "own block imported by header"
+                    );
+                    let encoded = raw_engine::encode_payload_status(&status);
+                    out.push(1);
+                    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&encoded);
+                }
+                Err(message) => {
+                    debug!(target: "n42.payload_serve", %message, "own block by header refused");
+                    out.push(2);
+                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(message.as_bytes());
+                }
+            }
+            stream.write_all(&out).await?;
+            continue;
+        }
         if kind == request::NEW_PAYLOAD {
             let len = stream.read_u32_le().await? as usize;
             if len > 256 << 20 {

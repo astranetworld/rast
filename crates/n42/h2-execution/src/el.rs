@@ -169,6 +169,21 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// Engine-API `newPayload` — insert and validate a block.
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError>;
 
+    /// Imports a block this node built. An execution layer that keeps its
+    /// builds can take the sealed header alone (`header`) and skip the
+    /// payload's round trip -- encode 17 ms, 19 MB of wire, decode 10 ms on
+    /// the leader's cycle at the 163,000-transaction tier -- falling back to
+    /// the payload when it no longer has the build. The default sends the
+    /// payload.
+    async fn import_own_block(
+        &self,
+        header: Option<&alloy_consensus::Header>,
+        payload: ExecutionData,
+    ) -> Result<PayloadStatus, ElError> {
+        let _ = header;
+        self.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload).await
+    }
+
     /// Classified Engine-API `newPayload` call.
     ///
     /// Raw methods remain the adapter/test-double seam. Production callers use

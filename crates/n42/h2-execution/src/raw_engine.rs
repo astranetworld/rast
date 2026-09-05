@@ -33,6 +33,12 @@ pub mod request {
     /// `u32` length and an encoded [`super::ExecutionData`] follow; the
     /// answer is an encoded [`super::PayloadStatus`].
     pub const NEW_PAYLOAD: u8 = 2;
+    /// `u32` length and the RLP of a *sealed header* follow: a block this
+    /// execution layer built and still keeps (see `built_executions`), to be
+    /// imported without the 19 MB payload travelling back over the wire.
+    /// The answer is an encoded [`super::PayloadStatus`], or an error
+    /// (`unknown build`) telling the caller to send the whole payload.
+    pub const OWN_BLOCK: u8 = 3;
 }
 
 struct Writer(Vec<u8>);
