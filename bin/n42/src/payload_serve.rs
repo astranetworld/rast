@@ -471,6 +471,12 @@ fn sealed_header_from_fields(
     None
 }
 
+/// `N42_RAW_SHARED_DECODE`, read once.
+fn raw_shared_decode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_RAW_SHARED_DECODE").is_ok_and(|v| v == "1"))
+}
+
 /// `N42_PAYLOAD_SERVE_FRESH_BUFFERS`, read once.
 fn fresh_buffers() -> bool {
     static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -596,7 +602,15 @@ where
             // a few of a payload's transaction bytes per block, and a slice
             // keeps the whole buffer alive with them. 4.2 -> 8.5 GB in two
             // minutes, then the fault storm.
-            match raw_engine::decode_execution_data(&frame) {
+            // `N42_RAW_SHARED_DECODE=1` decodes as slices of one shared copy of
+            // the frame instead -- the variant that grew the execution layer,
+            // kept for finding what holds the bytes.
+            let shared_frame = raw_shared_decode().then(|| alloy_primitives::Bytes::copy_from_slice(&frame[..]));
+            let decoded_data = match &shared_frame {
+                Some(shared) => raw_engine::decode_execution_data_shared(shared),
+                None => raw_engine::decode_execution_data(&frame),
+            };
+            match decoded_data {
                 Err(err) => {
                     out.push(2);
                     out.extend_from_slice(&(err.len() as u32).to_le_bytes());

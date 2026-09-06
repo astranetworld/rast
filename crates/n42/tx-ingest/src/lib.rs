@@ -135,6 +135,75 @@ fn apply_recovery_nice() {
     }
 }
 
+/// `N42_TX_INGEST_RECOVER_PIN=1`: each recovery thread is pinned to one
+/// physical core of the node's CPU set, round-robin, so two recoveries do
+/// not share a core's execution units while the node's other threads float
+/// over the set. Under load a recovery measured 48-63 us against 37 us on
+/// an idle core (round 39): the SMT sibling was another recovery as often
+/// as not. The node's set is what `taskset` left it; "physical" here means
+/// the lower-numbered half of each sibling pair (cpu < 128 on this host's
+/// 128-core parts), all of it when no such split is visible.
+/// `=2` pins over every logical CPU of the set instead (one thread per SMT
+/// thread, no migration); `=1` measured a loss -- 16 physical cores could not
+/// carry 20 slots, 12.7 cores of recovery against 20 unpinned.
+fn recovery_pin() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("N42_TX_INGEST_RECOVER_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+fn physical_cores() -> &'static [usize] {
+    static CORES: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    CORES.get_or_init(|| {
+        let all_logical = recovery_pin() == 2;
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: sched_getaffinity fills a cpu_set_t of the given size.
+        let ok = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } == 0;
+        let mut cpus: Vec<usize> = Vec::new();
+        if ok {
+            for cpu in 0..(8 * std::mem::size_of::<libc::cpu_set_t>()) {
+                // SAFETY: cpu is within the set's bit range.
+                if unsafe { libc::CPU_ISSET(cpu, &set) } {
+                    cpus.push(cpu);
+                }
+            }
+        }
+        // The sibling split: keep a cpu whose sibling (cpu + half the
+        // machine) is also in the set only once, as the lower number.
+        let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }.max(1) as usize;
+        let half = ncpu / 2;
+        if all_logical {
+            return cpus;
+        }
+        let lower: Vec<usize> = cpus.iter().copied().filter(|&c| c < half || !cpus.contains(&(c - half))).collect();
+        if lower.is_empty() { cpus } else { lower }
+    })
+}
+
+/// Pins the calling thread to its core (see [`recovery_pin`]), once per
+/// thread.
+fn apply_recovery_affinity() {
+    thread_local! {
+        static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if recovery_pin() == 0 || PINNED.with(|p| p.replace(true)) {
+        return;
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let cores = physical_cores();
+    if cores.is_empty() {
+        return;
+    }
+    let core = cores[(NEXT.fetch_add(1, Ordering::Relaxed) as usize) % cores.len()];
+    // SAFETY: a zeroed cpu_set_t with one bit set, applied to the calling
+    // thread; a failure leaves the affinity as it was.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(core, &mut set);
+        let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+        libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 /// The recovery slot count when it is bounded, `None` when unlimited.
 fn recovery_slot_count() -> Option<usize> {
     std::env::var("N42_TX_INGEST_RECOVER_PARALLEL")
@@ -515,6 +584,7 @@ where
             let recovering = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
                 apply_recovery_nice();
+                apply_recovery_affinity();
                 let busy = std::time::Instant::now();
                 STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
                 let decoded = recover_decoded::<P>(pooled, cache.as_ref());
@@ -613,6 +683,7 @@ where
     let decoded = match tokio::task::spawn_blocking(move || {
         let _slot = slot;
         apply_recovery_nice();
+        apply_recovery_affinity();
         let busy = std::time::Instant::now();
         let decoded = recover_decoded::<P>(pooled, cache.as_ref());
         STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);

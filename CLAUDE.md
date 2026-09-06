@@ -112,7 +112,9 @@ heap profiles, the instrument a CPU profile cannot replace).
 **Record (2026-09-05, round 39): 365,399 / 343,885 TPS** (win1/win2 of loop53Q300a at pacing 300,
 0.423 s cycle; pacing 350 reads 357k twice, 400 reads 349-353k; the same legs without huge pages for
 the heap 310k / 293k) with the round-39 configuration plus `N42_TX_INGEST_RECOVER_PARALLEL=20
-N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always F7_BLOCK_INTERVAL_MS=300` and `--pertx 8000`; the
+N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always N42_FOLLOWER_PARALLEL=1 TOKIO_WORKER_THREADS=8
+F7_BLOCK_INTERVAL_MS=300` and `--pertx 8000` (the parallel follower and eight tokio workers: 367k on
+window 1, 338k on window 3, loop63); the
 leader's own block reaches its execution layer as a sealed header (`request::OWN_BLOCK`, 57 ms
 instead of 90-130).
 `MALLOC_CONF=thp:always` gives the execution layer's jemalloc heap 2 MB pages under the host's THP

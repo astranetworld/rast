@@ -2290,6 +2290,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         };
         let encoded = started.elapsed();
+        // Shared from here: the pushes to every member and the body store
+        // hold the same bytes; the leader used to copy the 19 MB once more
+        // for the pushers.
+        let rlp = alloy_primitives::Bytes::from(rlp);
         pushed_to_all = self.push_body(&rlp, block_hash);
         let pushed = started.elapsed();
         // Compressed only for the topic: when the push reached every member
@@ -2359,14 +2363,14 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// libp2p push is not used either. Otherwise the libp2p push covers
     /// everyone, at the cost of a duplicate to the peers the channel reached,
     /// which the receiver's body store absorbs.
-    fn push_body(&mut self, rlp: &[u8], block_hash: B256) -> bool {
+    fn push_body(&mut self, rlp: &alloy_primitives::Bytes, block_hash: B256) -> bool {
         if !self.direct_push {
             return false;
         }
         if let Some(pushers) = &self.body_pushers
             && !pushers.is_empty()
         {
-            let taken = pushers.push(std::sync::Arc::new(rlp.to_vec()));
+            let taken = pushers.push(rlp.clone());
             debug!(target: "n42.h2.node", ?block_hash, taken, peers = pushers.len(), "offered the body to the channel");
             if taken == pushers.len() {
                 return true;

@@ -178,7 +178,7 @@ pub struct ExecutionDriver<E> {
 
 impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Default payload cache size — a few views' worth of blocks.
-    pub const DEFAULT_MAX_CACHED_PAYLOADS: usize = 64;
+    pub const DEFAULT_MAX_CACHED_PAYLOADS: usize = 16;
 
     /// Builds a driver whose head and finalised block are `genesis`.
     pub fn new(el: E, genesis: B256) -> Self {

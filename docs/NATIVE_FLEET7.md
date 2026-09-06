@@ -48,8 +48,8 @@ F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250 F7_SKIP_STALE_CHECK=1 N42_TX_QUEUE=1 \
 N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=16 N42_TX_INGEST_DIRECT=1 \
 N42_FAST_TRANSFER=1 N42_FOLLOWER_DIRECT_IMPORT=1 F7_SENDER_CACHE_MULT=4 \
 N42_TX_QUEUE_BATCH=1024 N42_TX_QUEUE_DRAINER=1 N42_BUILDER_PULLER=1024 \
-N42_TX_INGEST_RECOVER_PARALLEL=20 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always \
-F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3" F7_FLOOD_WINDOW=6 F7_BLOCK_INTERVAL_MS=300 \
+N42_TX_INGEST_RECOVER_PARALLEL=20 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always N42_FOLLOWER_PARALLEL=1 \
+TOKIO_WORKER_THREADS=8 F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3" F7_FLOOD_WINDOW=6 F7_BLOCK_INTERVAL_MS=300 \
 scripts/fleet7-bench.sh --tag <tag> --gasceil 3423000000 --senders 6000 --pertx 8000 --conc 64 --rpcbatch 500
 ```
 
@@ -5026,3 +5026,37 @@ window 1 the supply as before, the validator at 0.73-0.88 GB against
 1.1-1.8, the execution layer unchanged, the CPU picture unchanged
 (recovery ~20 of 26.5 cores a node). The shared raw decoder stays in the
 code for when that holder is found.
+
+### loop62-63: what was left to try -- pinning (no), tokio workers (yes), rayon threads (maybe)
+
+Pacing 300, 20 slots, the parallel follower, jemalloc huge pages, 48M flood,
+one warm-up each (void). In the build: the leader pushes its body as
+shared bytes (one 19 MB copy less a block), the validator's payload cache
+keeps 16 payloads instead of 64, the transfer path's state map is sized
+once (326,000 fewer allocations a full block on the builder and the
+follower).
+
+    leg    change                                      win1     win2     win3
+    A1     recovery threads pinned, 1 per physical core  322,859  292,403  284,725
+    B1     -                                             364,067  342,873  326,440
+    A2     pinned, 1 per physical core                   322,404  288,274  278,073
+    B2     -                                             343,395  339,273  323,904
+    H1     shared raw decode, engine-only import         (void: 0.64-0.86 s cycles; EL 4.3 -> 6.9 GB)
+    K8     TOKIO_WORKER_THREADS=8                        366,981  343,690  334,217
+    B3     -                                             348,348  340,843  333,915
+    K16    RAYON_NUM_THREADS=16                          361,058  340,340  334,962
+    K8b    TOKIO_WORKER_THREADS=8                        361,776  344,056  338,162
+    P2     pinned, 1 per logical CPU                     339,402  311,242  300,268
+    B4     -                                             351,050  336,986  337,242
+
+Pinning the recovery threads loses either way: one per physical core
+leaves the SMT siblings idle (12.7 cores of recovery against 20, busy
+61 us), one per logical CPU forbids the migrations the scheduler was
+making for a reason (-3%). Both stay as knobs, default off. The payload
+bytes are held downstream of the engine's `newPayload` (the growth
+appears with the engine-only import too), so the raw channel keeps its
+copy per transaction. Eight tokio workers instead of thirty-two read
++4-5% on window 1 over the bookends (367k / 362k against 348k / 351k;
+the node's tokio threads went 84 -> 47) and +1% on the later windows:
+adopted for the fleet's environment. Sixteen rayon threads read +3% on
+window 1, inside the band; left at the default.

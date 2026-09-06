@@ -249,7 +249,10 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
         // The accounts as the journal would return them: touched, with the
         // pre-state kept as the original, and a recipient that did not exist
         // marked as loaded that way.
-        let mut state: EvmState = HashMap::default();
+        // Three accounts, sized once: growing from empty reallocated twice per
+        // transaction, 326,000 allocations a full block on both the builder and
+        // the follower.
+        let mut state: EvmState = EvmState::with_capacity_and_hasher(4, Default::default());
         let mut sender_account = Account::from(sender);
         sender_account.info.balance = sender_balance;
         sender_account.info.nonce += 1;

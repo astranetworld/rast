@@ -172,7 +172,7 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
 /// its own task.
 #[derive(Debug, Clone)]
 pub struct BodyPushers {
-    peers: Vec<(SocketAddr, mpsc::Sender<Arc<Vec<u8>>>)>,
+    peers: Vec<(SocketAddr, mpsc::Sender<alloy_primitives::Bytes>)>,
 }
 
 impl BodyPushers {
@@ -204,12 +204,12 @@ impl BodyPushers {
     /// Offers `body` to every peer's queue without waiting. Returns how many
     /// queues took it; a full queue means that peer is behind and gets the
     /// libp2p push instead.
-    pub fn push(&self, body: Arc<Vec<u8>>) -> usize {
-        self.peers.iter().filter(|(_, tx)| tx.try_send(Arc::clone(&body)).is_ok()).count()
+    pub fn push(&self, body: alloy_primitives::Bytes) -> usize {
+        self.peers.iter().filter(|(_, tx)| tx.try_send(body.clone()).is_ok()).count()
     }
 }
 
-async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<Arc<Vec<u8>>>) {
+async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<alloy_primitives::Bytes>) {
     let mut stream: Option<TcpStream> = None;
     while let Some(body) = rx.recv().await {
         if stream.is_none() {
