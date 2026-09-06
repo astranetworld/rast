@@ -4996,3 +4996,33 @@ the round's total up 2-4% (its window 3 is 310-327k against 288k) at a
 the block at 0.41 s. On this host that is the number: 356-364k on window
 1, ~30M transactions in three windows, supply-bound with the chain able to
 take ~450k/s.
+
+### loop60-61: the copies and allocations pass, and a slice that pinned 19 MB a block
+
+Changes, all behaviour-preserving: a pushed or fetched body is decoded as
+slices of its shared bytes and the body store keeps those bytes (no 19 MB
+copy a block per follower) and 16 bodies instead of 64; the ingest reads a
+frame's transactions into one buffer and hands out slices (one allocation
+a frame, not one a transaction); the own-block hand-off takes the build
+out of the registry and moves the body (one clone of 163,000 transactions
+instead of two); the header-only import gives the engine's `newPayload`
+an empty transaction list, which its conversion never reads (it takes the
+registered sealed block first): 15 ms and 163,000 allocations a block.
+
+    leg          win1     cycle    win2     cycle    win3     cycle    EL RSS      validator RSS
+    loop60 N1    352,864  0.345 s  325,138  0.333 s  190,082  0.858 s  4.2->8.5 GB  0.85 GB
+    loop60 N2    361,018  0.353 s  323,060  0.395 s  190,098  0.857 s  4.4->8.7 GB  0.8 GB
+    loop61 N3    363,815  0.349 s  344,254  0.337 s  318,994  0.366 s  4.4-5.3 GB   0.73-0.80 GB
+    loop61 N4    356,976  0.345 s  343,356  0.326 s  326,203  0.366 s  4.2-5.0 GB   0.73-0.88 GB
+
+loop60 also decoded the raw channel's payload as slices of one shared
+19 MB buffer, and that grew the execution layer by a block's payload
+every block: something downstream keeps a few of a payload's transaction
+bytes per block (a copy per transaction is invisible; a slice keeps the
+whole buffer alive), the fleet's page cache went, and window 3 collapsed
+to 0.86 s cycles. loop61 has that one change reverted and everything else
+in: windows 2 and 3 are the best pairs measured (344k / 319-326k),
+window 1 the supply as before, the validator at 0.73-0.88 GB against
+1.1-1.8, the execution layer unchanged, the CPU picture unchanged
+(recovery ~20 of 26.5 cores a node). The shared raw decoder stays in the
+code for when that holder is found.
