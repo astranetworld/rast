@@ -475,7 +475,7 @@ const PULLED_BLOCKS_PER_STEP: usize = 32;
 // Was 4,096: at 13-15 MB a full block, a validator held several gigabytes
 // of bodies by the end of a bench round, on every node. Anything older than
 // this is rebuilt from the execution layer, as the comment at the store says.
-const REMEMBERED_BODIES: usize = 64;
+const REMEMBERED_BODIES: usize = 16;
 
 /// How many bodies the store keeps: `N42_H2_REMEMBERED_BODIES`, else
 /// [`REMEMBERED_BODIES`]. An environment knob so a round can bookend the
@@ -1219,10 +1219,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 Ok(chunk) => {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
-                    match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
+                    match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
                         Ok(block) if block.block_hash == hash => {
                             self.remember_block(hash, &block.header);
-                            self.remember_body(hash, chunk.rlp.to_vec());
+                            self.remember_body(hash, chunk.rlp.clone());
                             self.driver.cache_payload(hash, block.execution_data());
                             self.import_eagerly(hash);
                             self.received_bodies.push(hash);
@@ -1247,12 +1247,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Arriving twice — pushed and then gossiped — costs one decode:
                 // everything below is idempotent, and `awaiting_bodies` has
                 // already been emptied by whichever copy came first.
-                match decode_block_rlp_raw(&chunk.rlp, self.header_profile) {
+                match n42_h2_net::decode_block_rlp_shared(&chunk.rlp, self.header_profile) {
                     Ok(block) => {
                         let hash = block.block_hash;
                         if !self.body_store.contains_key(&hash) {
                             self.remember_block(hash, &block.header);
-                            self.remember_body(hash, chunk.rlp.to_vec());
+                            self.remember_body(hash, chunk.rlp.clone());
                             self.driver.cache_payload(hash, block.execution_data());
                             self.import_eagerly(hash);
                             self.received_bodies.push(hash);
@@ -2058,7 +2058,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         self.remember_imported(hash);
                         self.note_imported(number);
                         self.remember_block(hash, &block.header);
-                        self.remember_body(hash, chunk.rlp.to_vec());
+                        self.remember_body(hash, chunk.rlp.clone());
                         if let Some(c) = self.catch_up.as_mut() {
                             c.next += 1;
                         }

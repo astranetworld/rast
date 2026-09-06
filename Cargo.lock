@@ -8328,6 +8328,7 @@ version = "2.1.5"
 dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives 1.7.1",
+ "bytes",
  "libc",
  "n42-tx-queue",
  "reth-evm",

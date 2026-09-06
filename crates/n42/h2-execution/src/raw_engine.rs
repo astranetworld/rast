@@ -50,17 +50,32 @@ impl Writer {
     fn bytes(&mut self, v: &[u8]) { self.u32(v.len() as u32); self.0.extend_from_slice(v); }
 }
 
-struct Reader<'a>(&'a [u8]);
+struct Reader<'a> {
+    rest: &'a [u8],
+    /// The whole buffer as shared bytes, when the caller has it: `bytes()`
+    /// then slices instead of copying (163,000 transactions a payload).
+    shared: Option<&'a Bytes>,
+}
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if self.0.len() < n { return Err(format!("truncated: wanted {n}, have {}", self.0.len())); }
-        let (a, b) = self.0.split_at(n); self.0 = b; Ok(a)
+        if self.rest.len() < n { return Err(format!("truncated: wanted {n}, have {}", self.rest.len())); }
+        let (a, b) = self.rest.split_at(n); self.rest = b; Ok(a)
     }
     fn u8(&mut self) -> Result<u8, String> { Ok(self.take(1)?[0]) }
     fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4"))) }
     fn u64(&mut self) -> Result<u64, String> { Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8"))) }
     fn b256(&mut self) -> Result<B256, String> { Ok(B256::from_slice(self.take(32)?)) }
-    fn bytes(&mut self) -> Result<Bytes, String> { let n = self.u32()? as usize; Ok(Bytes::copy_from_slice(self.take(n)?)) }
+    fn bytes(&mut self) -> Result<Bytes, String> {
+        let n = self.u32()? as usize;
+        let part = self.take(n)?;
+        Ok(match self.shared {
+            Some(whole) => {
+                let start = part.as_ptr() as usize - whole.as_ptr() as usize;
+                whole.slice(start..start + n)
+            }
+            None => Bytes::copy_from_slice(part),
+        })
+    }
 }
 
 /// Encodes an [`ExecutionData`] for the channel.
@@ -136,7 +151,16 @@ pub fn encode_execution_data(data: &ExecutionData) -> Vec<u8> {
 
 /// Decodes what [`encode_execution_data`] produced.
 pub fn decode_execution_data(buf: &[u8]) -> Result<ExecutionData, String> {
-    let mut r = Reader(buf);
+    decode_with(Reader { rest: buf, shared: None })
+}
+
+/// [`decode_execution_data`] over shared bytes: the transactions are slices
+/// of `buf`, not copies.
+pub fn decode_execution_data_shared(buf: &Bytes) -> Result<ExecutionData, String> {
+    decode_with(Reader { rest: buf, shared: Some(buf) })
+}
+
+fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
     let kind = r.u8()?;
     let parent_hash = r.b256()?;
@@ -231,7 +255,7 @@ pub fn encode_payload_status(status: &PayloadStatus) -> Vec<u8> {
 
 /// Decodes what [`encode_payload_status`] produced.
 pub fn decode_payload_status(buf: &[u8]) -> Result<PayloadStatus, String> {
-    let mut r = Reader(buf);
+    let mut r = Reader { rest: buf, shared: None };
     let kind = r.u8()?;
     let latest_valid_hash = if r.u8()? == 1 { Some(r.b256()?) } else { None };
     let error = String::from_utf8_lossy(&r.bytes()?).into_owned();

@@ -441,18 +441,22 @@ where
                 format!("frame of {count} transactions"),
             ));
         }
+        // The frame's transactions share one buffer: each is a slice of it
+        // rather than its own allocation (500 a frame, ~350,000 a second a
+        // node at the bench tier).
         let mut raws = Vec::with_capacity(count as usize);
+        let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
         for _ in 0..count {
-            let len = stream.read_u32_le().await?;
-            if len == 0 || len > MAX_TX_BYTES {
+            let len = stream.read_u32_le().await? as usize;
+            if len == 0 || len > MAX_TX_BYTES as usize {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("transaction of {len} bytes"),
                 ));
             }
-            let mut buf = vec![0u8; len as usize];
-            stream.read_exact(&mut buf).await?;
-            raws.push(Bytes::from(buf));
+            frame_buf.resize(len, 0);
+            stream.read_exact(&mut frame_buf[..]).await?;
+            raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
         }
         // The gate. Not a refusal and not a drop: the frame is held until the
         // chain has taken a block out of the pool, and the client hears nothing

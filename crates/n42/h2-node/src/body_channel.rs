@@ -64,25 +64,41 @@ impl BufPool {
 pub struct BodyBuf {
     buf: Vec<u8>,
     pool: Option<Arc<BufPool>>,
+    /// A body that arrived as shared bytes (a pushed or fetched chunk) is
+    /// kept as those bytes, not copied into `buf`.
+    shared: Option<alloy_primitives::Bytes>,
 }
 
 impl BodyBuf {
     /// The bytes as an owned `Vec`, copied.
     pub fn to_vec(&self) -> Vec<u8> {
-        self.buf.clone()
+        self.as_slice().to_vec()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match &self.shared {
+            Some(bytes) => bytes,
+            None => &self.buf,
+        }
     }
 }
 
 impl std::ops::Deref for BodyBuf {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.buf
+        self.as_slice()
     }
 }
 
 impl From<Vec<u8>> for BodyBuf {
     fn from(buf: Vec<u8>) -> Self {
-        Self { buf, pool: None }
+        Self { buf, pool: None, shared: None }
+    }
+}
+
+impl From<alloy_primitives::Bytes> for BodyBuf {
+    fn from(bytes: alloy_primitives::Bytes) -> Self {
+        Self { buf: Vec::new(), pool: None, shared: Some(bytes) }
     }
 }
 
@@ -145,7 +161,7 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
         let mut body = pool.take();
         body.resize(len as usize, 0);
         stream.read_exact(&mut body).await?;
-        let body = BodyBuf { buf: body, pool: Some(Arc::clone(&pool)) };
+        let body = BodyBuf { buf: body, pool: Some(Arc::clone(&pool)), shared: None };
         if sink.send(body).await.is_err() {
             return Ok(());
         }

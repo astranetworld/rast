@@ -29,7 +29,7 @@ pub mod transport;
 
 pub use block_gossip::{
     compress_block_rlp, decode_block_gossip, decode_block_rlp, decompress_block_gossip,
-    decode_block_rlp_raw,
+    decode_block_rlp_raw, decode_block_rlp_shared,
     encode_block_gossip, encode_block_rlp, encode_block_rlp_parts, encode_block_rlp_raw, gov5_block_topic, gov5_header_view, BlockGossipError,
     GossipBlock, HeaderProfile, RawGossipBlock,
 };

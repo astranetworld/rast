@@ -12,6 +12,7 @@ description = "Binary TCP transaction ingest for throughput rounds"
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 reth-transaction-pool.workspace = true
 libc.workspace = true
 n42-tx-queue.workspace = true

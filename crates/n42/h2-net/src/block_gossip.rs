@@ -411,6 +411,30 @@ pub fn decode_block_rlp_raw(
     encoded: &[u8],
     profile: HeaderProfile,
 ) -> Result<RawGossipBlock, BlockGossipError> {
+    decode_block_rlp_raw_with(encoded, None, profile)
+}
+
+/// [`decode_block_rlp_raw`] over a shared buffer: the transactions (and the
+/// access list) are slices of `encoded`, not copies. At 163,000 transactions
+/// the copies were 163,000 allocations and 19 MB per body on every follower.
+pub fn decode_block_rlp_shared(
+    encoded: &Bytes,
+    profile: HeaderProfile,
+) -> Result<RawGossipBlock, BlockGossipError> {
+    decode_block_rlp_raw_with(encoded, Some(encoded), profile)
+}
+
+/// A slice of `whole` for `part`, which must lie inside it.
+fn shared_slice(whole: &Bytes, part: &[u8]) -> Bytes {
+    let start = part.as_ptr() as usize - whole.as_ptr() as usize;
+    whole.slice(start..start + part.len())
+}
+
+fn decode_block_rlp_raw_with(
+    encoded: &[u8],
+    shared: Option<&Bytes>,
+    profile: HeaderProfile,
+) -> Result<RawGossipBlock, BlockGossipError> {
     let mut payload = encoded;
     let outer = RlpHeader::decode(&mut payload).map_err(|_| BlockGossipError::InvalidRlp)?;
     if !outer.list || outer.payload_length != payload.len() {
@@ -436,7 +460,10 @@ pub fn decode_block_rlp_raw(
         if bytes.is_empty() {
             return Err(BlockGossipError::InvalidRlp);
         }
-        transactions.push(Bytes::copy_from_slice(bytes));
+        transactions.push(match shared {
+            Some(whole) => shared_slice(whole, bytes),
+            None => Bytes::copy_from_slice(bytes),
+        });
     }
 
     take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
@@ -447,7 +474,10 @@ pub fn decode_block_rlp_raw(
     } else {
         take_rlp_bytes(&mut payload)
             .ok_or(BlockGossipError::InvalidRlp)
-            .map(|bytes| Some(Bytes::copy_from_slice(bytes)))?
+            .map(|bytes| Some(match shared {
+                Some(whole) => shared_slice(whole, bytes),
+                None => Bytes::copy_from_slice(bytes),
+            }))?
     };
     if !payload.is_empty() {
         return Err(BlockGossipError::InvalidRlp);

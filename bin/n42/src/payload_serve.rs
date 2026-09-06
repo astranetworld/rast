@@ -190,7 +190,7 @@ where
 {
     use reth_engine_primitives::PayloadValidator as _;
     let v1 = data.payload.as_v1();
-    let (built_hash, built) = n42_engine_types::built_executions::find(
+    let (built_hash, built) = n42_engine_types::built_executions::take(
         v1.parent_hash,
         v1.block_number,
         v1.state_root,
@@ -249,17 +249,32 @@ where
     let started = std::time::Instant::now();
     let block_number = sealed_header.number;
     let sealed_hash = sealed_header.hash();
-    let body = built.block.body().clone();
+    // The build's block is moved out when this is its last holder (the
+    // registry gave it up in `take`): one clone of the 163,000-transaction
+    // body for the engine's copy instead of two.
+    let (body, senders) = match std::sync::Arc::try_unwrap(built.block) {
+        Ok(block) => {
+            let (sealed, senders) = block.split_sealed();
+            (sealed.split_sealed_header_body().1, senders)
+        }
+        Err(shared) => (shared.body().clone(), shared.senders().to_vec()),
+    };
     // For the engine's newPayload of this block, which follows the hand-off:
     // its conversion finds the block here instead of decoding the payload.
     n42_engine_types::built_executions::remember_sealed(
         sealed_hash,
         SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
     );
-    let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(
+    let recovered: reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block> = reth_primitives_traits::RecoveredBlock::new_sealed(
         SealedBlock::from_sealed_parts(sealed_header, body),
-        built.block.senders().to_vec(),
+        senders,
     );
+    // For the pool prune below, taken now: the block moves into the engine's
+    // insert.
+    let pool_prune_hashes: Option<Vec<B256>> = reuse
+        .prune_pool
+        .is_some()
+        .then(|| recovered.body().transactions().map(|tx| *tx.tx_hash()).collect::<Vec<B256>>());
     if let Some(qmdb) = &reuse.qmdb {
         if let Err(err) = qmdb.rename(built_hash, sealed_hash) {
             warn!(target: "n42.payload_serve", %err, %built_hash, %sealed_hash, "could not file the build's QMDB root under the sealed hash; importing the ordinary way");
@@ -308,9 +323,7 @@ where
     let handed = tokio::time::timeout(std::time::Duration::from_secs(2), handed).await;
     match handed {
         Ok(Ok(true)) => {
-            if let Some(prune) = reuse.prune_pool.clone() {
-                let hashes: Vec<alloy_primitives::B256> =
-                    built.block.body().transactions().map(|tx| *tx.tx_hash()).collect();
+            if let (Some(prune), Some(hashes)) = (reuse.prune_pool.clone(), pool_prune_hashes) {
                 let count = hashes.len();
                 let pruned_at = std::time::Instant::now();
                 // Synchronous, on a blocking thread: the removal holds the
@@ -366,7 +379,7 @@ where
         // carries; the payload path does.
         return Err("unknown build: block access list".to_owned());
     }
-    let (built_hash, built) = n42_engine_types::built_executions::find(
+    let (built_hash, built) = n42_engine_types::built_executions::take(
         header.parent_hash,
         header.number,
         header.state_root,
@@ -376,24 +389,26 @@ where
     .ok_or("unknown build")?;
     let sealed_hash = header.hash_slow();
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
-    let block = built.block.clone();
+    let withdrawals = built.block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
     let handoff_at = std::time::Instant::now();
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, std::time::Duration::ZERO)
         .await
         .ok_or("the engine did not take the executed block")?;
     let handoff_ms = handoff_at.elapsed().as_millis() as u64;
-    // The payload for the engine's `newPayload`, from the build's transactions:
-    // encoded here, on the worker pool, instead of by the validator and
-    // decoded back here.
+    // The payload for the engine's `newPayload`: its conversion takes the
+    // sealed block registered above by the payload's block hash before it
+    // looks at anything else, so the transactions need not travel at all --
+    // an empty list here saves encoding 163,000 of them (15 ms and as many
+    // allocations). If the engine ever answered other than Valid, the
+    // validator's fallback sends the whole payload and the engine converts
+    // it the ordinary way.
     let payload_at = std::time::Instant::now();
-    let transactions: Vec<alloy_primitives::Bytes> = {
-        use rayon::prelude::*;
-        block.body().transactions().collect::<Vec<_>>().par_iter().map(|tx| tx.encoded_2718().into()).collect()
-    };
-    let withdrawals = block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
-    let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, transactions, withdrawals, None);
+    let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, Vec::new(), withdrawals, None);
     let payload_ms = payload_at.elapsed().as_millis() as u64;
     let status = engine.new_payload(data).await.map_err(|e| format!("engine: {e}"))?;
+    if !status.status.is_valid() {
+        return Err(format!("engine answered {:?} to the header-only payload", status.status));
+    }
     Ok((status, header.number, handoff_ms, payload_ms))
 }
 
@@ -575,6 +590,12 @@ where
             stream.read_exact(&mut frame[..]).await?;
             let started = std::time::Instant::now();
             out.clear();
+            // Decoded with a copy per transaction, deliberately: decoding the
+            // payload as slices of one shared 19 MB buffer (loop60N1) grew the
+            // execution layer by ~19 MB a block -- something downstream keeps
+            // a few of a payload's transaction bytes per block, and a slice
+            // keeps the whole buffer alive with them. 4.2 -> 8.5 GB in two
+            // minutes, then the fault storm.
             match raw_engine::decode_execution_data(&frame) {
                 Err(err) => {
                     out.push(2);

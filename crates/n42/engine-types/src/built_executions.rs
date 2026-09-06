@@ -66,18 +66,24 @@ pub fn remember(built_hash: B256, execution: BuiltExecution) {
 /// sealed header hashes to the hash it was given before trusting this.
 pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> Option<(B256, BuiltExecution)> {
     let store = store().lock().unwrap_or_else(|p| p.into_inner());
-    store
-        .iter()
-        .rev()
-        .find(|(_, built)| {
-            let header = built.block.header();
-            header.parent_hash == parent
-                && header.number == number
-                && header.state_root == state_root
-                && header.receipts_root == receipts_root
-                && header.gas_used == gas_used
-        })
-        .cloned()
+    store.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used)).cloned()
+}
+
+/// [`find`], taking the build out of the store: the caller becomes the
+/// block's only holder and can move it instead of cloning its body.
+pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> Option<(B256, BuiltExecution)> {
+    let mut store = store().lock().unwrap_or_else(|p| p.into_inner());
+    let at = store.iter().rposition(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used))?;
+    store.remove(at)
+}
+
+fn matches_build(built: &BuiltExecution, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> bool {
+    let header = built.block.header();
+    header.parent_hash == parent
+        && header.number == number
+        && header.state_root == state_root
+        && header.receipts_root == receipts_root
+        && header.gas_used == gas_used
 }
 
 /// The sealed blocks this node has handed to the engine as executed, kept
