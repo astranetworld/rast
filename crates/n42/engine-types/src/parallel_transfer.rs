@@ -21,7 +21,8 @@
 //! never wrong, only absent.
 
 use alloy_primitives::{Address, U256};
-use reth_ethereum_primitives::{Block, EthPrimitives, Receipt};
+use n42_tx_types::{Block, N42Primitives as EthPrimitives, Receipt};
+use alloy_consensus::TransactionEnvelope as _;
 use reth_evm::{
     execute::{BlockExecutionError, BlockExecutor as _, BlockExecutorFactory},
     ConfigureEvm, Evm as _, EvmFactory as _,
@@ -40,11 +41,7 @@ use crate::fast_transfer::N42EvmFactory;
 
 /// The block executor factory of a node with the transfer path: what
 /// [`execute_transfers`] requires of its EVM configuration.
-pub type FastExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
-    reth_evm_ethereum::RethReceiptBuilder,
-    std::sync::Arc<reth_chainspec::ChainSpec>,
-    N42EvmFactory,
->;
+pub type FastExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<reth_chainspec::ChainSpec>;
 
 /// The executor's phase timings, in milliseconds: partitioning, the groups'
 /// execution (wall), the merge into the block's state, the finish.
@@ -317,7 +314,6 @@ mod tests {
     use reth_chainspec::MAINNET;
     use reth_ethereum_primitives::TransactionSigned;
     use reth_evm::execute::Executor as _;
-    use reth_evm_ethereum::EthEvmConfig;
     use reth_primitives_traits::{Recovered, SealedBlock};
     use revm::database::{CacheDB, EmptyDB};
     use revm::state::AccountInfo;
@@ -359,7 +355,7 @@ mod tests {
                     ..Default::default()
                 };
                 let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
-                let tx = TransactionSigned::from(signed);
+                let tx = n42_tx_types::N42TxEnvelope::from(TransactionSigned::from(signed));
                 txs.push(tx.clone());
                 recovered.push(sender);
             }
@@ -377,7 +373,7 @@ mod tests {
             requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
         };
-        let body = reth_ethereum_primitives::BlockBody {
+        let body = n42_tx_types::BlockBody {
             transactions: txs,
             ommers: Vec::new(),
             withdrawals: Some(vec![alloy_eips::eip4895::Withdrawal { index: 0, validator_index: 0, address: addr(100), amount: 5 }].into()),
@@ -389,7 +385,7 @@ mod tests {
     #[test]
     fn parallel_matches_serial() {
         let (block, db) = fixture(8, 6);
-        let evm_config = EthEvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         let (parallel, phases) = execute_transfers(&evm_config, &block, db.clone(), &|| Some(db.clone()))
             .expect("no execution error")
@@ -419,7 +415,7 @@ mod tests {
         // Point the first transfer at the beneficiary.
         let hash = block.hash();
         let mut raw = block.clone_sealed_block().into_block();
-        if let TransactionSigned::Eip1559(signed) = &mut raw.body.transactions[0] {
+        if let n42_tx_types::N42TxEnvelope::Eth(TransactionSigned::Eip1559(signed)) = &mut raw.body.transactions[0] {
             let (mut tx, sig, _) = signed.clone().into_parts();
             tx.to = TxKind::Call(addr(1));
             *signed = Signed::new_unchecked(tx, sig, B256::random());
@@ -427,7 +423,7 @@ mod tests {
         let senders = block.senders().to_vec();
         block = RecoveredBlock::new_unhashed(raw, senders);
         let _ = hash;
-        let evm_config = EthEvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let out = execute_transfers(&evm_config, &block, db.clone(), &|| Some(db.clone())).expect("no execution error");
         assert!(matches!(out, Err(NotParallel::TouchesBeneficiary(0))), "{out:?}");
     }

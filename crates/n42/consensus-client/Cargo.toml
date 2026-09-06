@@ -9,6 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+n42-tx-types.workspace = true
 n42-clique-utils.workspace = true
 n42-engine-primitives.workspace = true
 merkle_db_rs.workspace=true

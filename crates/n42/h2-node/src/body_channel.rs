@@ -290,10 +290,10 @@ mod tests {
         listen(addr, tx).await.unwrap();
         let pushers = BodyPushers::connect(vec![addr]);
         let body: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
-        assert_eq!(pushers.push(Arc::new(body.clone())), 1);
+        assert_eq!(pushers.push(alloy_primitives::Bytes::from(body.clone())), 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert_eq!(&got[..], &body[..]);
-        assert_eq!(pushers.push(Arc::new(vec![7u8; 10])), 1);
+        assert_eq!(pushers.push(alloy_primitives::Bytes::from(vec![7u8; 10])), 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert_eq!(&got[..], &[7u8; 10][..]);
     }

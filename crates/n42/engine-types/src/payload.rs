@@ -19,13 +19,14 @@ use reth_basic_payload_builder::{
 };
 use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError};
-use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use n42_tx_types::{N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
+use alloy_consensus::transaction::TxHashRef as _;
 use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
-use reth_payload_builder::EthBuiltPayload;
+use crate::engine_types::N42BuiltPayload as EthBuiltPayload;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -215,11 +216,7 @@ where
         Primitives = EthPrimitives,
         NextBlockEnvCtx = NextBlockEnvAttributes,
         BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
-        BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
-            reth_evm_ethereum::RethReceiptBuilder,
-            Arc<Client::ChainSpec>,
-            crate::fast_transfer::N42EvmFactory,
-        >,
+        BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
         + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>
@@ -335,11 +332,7 @@ where
         Primitives = EthPrimitives,
         NextBlockEnvCtx = NextBlockEnvAttributes,
         BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
-        BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
-            reth_evm_ethereum::RethReceiptBuilder,
-            Arc<Client::ChainSpec>,
-            crate::fast_transfer::N42EvmFactory,
-        >,
+        BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
     >,
     Client: StateProviderFactory
         + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>,
@@ -693,7 +686,7 @@ where
 
         // There's only limited amount of blob space available per block, so we need to check if
         // the EIP-4844 can still fit in the block
-        if let Some(blob_tx) = tx.as_eip4844() {
+        if let Some(blob_tx) = tx.as_eth().and_then(|tx| tx.as_eip4844()) {
             let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
 
             if block_blob_count + tx_blob_count > max_blob_count {
@@ -718,7 +711,7 @@ where
         // What the bookkeeping after execution needs, taken before the
         // transaction is moved into the executor (it used to be cloned).
         let tx_hash = *tx.hash();
-        let blob_count = tx.as_eip4844().map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
+        let blob_count = tx.as_eth().and_then(|tx| tx.as_eip4844()).map(|blob_tx| blob_tx.tx().blob_versioned_hashes.len() as u64);
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let executed = builder.execute_transaction(tx);
         tail_at = ticks();
@@ -944,7 +937,7 @@ where
     }
     let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
 
-    let recovered: Arc<reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>> =
+    let recovered: Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>> =
         Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
     crate::built_executions::remember(
         block_hash,
@@ -1078,7 +1071,7 @@ where
         let payload_builder = N42PayloadBuilder::new(
             ctx.provider().clone(),
             pool.clone(),
-            EthEvmConfig::new_with_evm_factory(ctx.chain_spec(), crate::fast_transfer::N42EvmFactory::from_env()),
+            crate::n42_evm::N42EvmConfig::new_with_evm_factory(ctx.chain_spec(), crate::fast_transfer::N42EvmFactory::from_env()),
             EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             consensus,
         )

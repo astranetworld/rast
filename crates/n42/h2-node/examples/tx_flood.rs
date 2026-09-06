@@ -49,7 +49,8 @@ use std::time::{Duration, Instant};
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{keccak256, Address, Signature, TxKind, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, Signature, TxKind, B256, U256};
+use n42_tx_types::{alt_sig::sender_of, TxAltSig, ALG_ED25519};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use serde_json::{json, Value};
@@ -97,6 +98,8 @@ const TRANSFER_GAS: u64 = 21_000;
 const MAX_RPC_BATCH: usize = 2000;
 
 struct Args {
+    /// `secp256k1` (EIP-1559 transfers) or `ed25519` (0x50 transfers).
+    alg: String,
     rpcs: Vec<String>,
     chain_id: u64,
     faucet: String,
@@ -145,7 +148,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?,
     );
 
-    let keys: Vec<PrivateKeySigner> = (0..args.senders).map(|i| derive(args.offset, i)).collect();
+    let ed25519 = match args.alg.as_str() {
+        "secp256k1" => false,
+        "ed25519" => true,
+        other => return Err(format!("--alg {other}: secp256k1 or ed25519").into()),
+    };
+    let keys: Vec<Signer> = (0..args.senders).map(|i| derive(args.offset, i, ed25519)).collect();
+    println!("algorithm    : {}", args.alg);
     println!(
         "senders      : {} derived at offset {} (first {})",
         keys.len(),
@@ -327,40 +336,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A flood sender: a secp256k1 key for EIP-1559 transfers, or an Ed25519 key
+/// for 0x50 transfers, whose account is `keccak256(0x01 || pubkey)[12..]`.
+enum Signer {
+    Secp(PrivateKeySigner),
+    Ed { key: ed25519_dalek::SigningKey, pubkey: Bytes, address: Address },
+}
+
+impl Signer {
+    fn address(&self) -> Address {
+        match self {
+            Self::Secp(key) => key.address(),
+            Self::Ed { address, .. } => *address,
+        }
+    }
+}
+
 /// gov5 `deriveKey`: `keccak256("n42-txflood-sender-v1" ‖ be64(offset+i+1))`.
 ///
 /// A hash that does not land on a valid secp256k1 scalar is hashed again rather
 /// than skipped, so the set stays dense and the same index always names the
-/// same account.
-fn derive(offset: u64, index: usize) -> PrivateKeySigner {
-    let mut seed = {
-        let mut input = Vec::with_capacity(21 + 8);
-        input.extend_from_slice(b"n42-txflood-sender-v1");
+/// same account. Ed25519 senders use `"n42-txflood-ed25519-v1"` and every
+/// 32-byte seed is a key.
+fn derive(offset: u64, index: usize, ed25519: bool) -> Signer {
+    let seed_of = |domain: &[u8]| {
+        let mut input = Vec::with_capacity(domain.len() + 8);
+        input.extend_from_slice(domain);
         input.extend_from_slice(&(offset + index as u64 + 1).to_be_bytes());
         keccak256(input)
     };
+    if ed25519 {
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed_of(b"n42-txflood-ed25519-v1").0);
+        let pubkey = Bytes::copy_from_slice(key.verifying_key().as_bytes());
+        let address = sender_of(ALG_ED25519, &pubkey);
+        return Signer::Ed { key, pubkey, address };
+    }
+    let mut seed = seed_of(b"n42-txflood-sender-v1");
     loop {
         match PrivateKeySigner::from_bytes(&seed) {
-            Ok(signer) => return signer,
+            Ok(signer) => return Signer::Secp(signer),
             Err(_) => seed = keccak256(seed),
         }
     }
 }
 
-fn signed(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, gas: u64, value: u64, to: Address) -> String {
-    let tx = TxEip1559 {
-        chain_id,
-        nonce,
-        gas_limit: gas,
-        max_fee_per_gas: gas_price,
-        max_priority_fee_per_gas: gas_price / 10,
-        to: TxKind::Call(to),
-        value: U256::from(value),
-        ..Default::default()
-    };
-    let signature = key.sign_hash_sync(&tx.signature_hash()).expect("sign");
-    let envelope: TxEnvelope = tx.into_signed(signature).into();
-    alloy_primitives::hex::encode_prefixed(envelope.encoded_2718())
+fn signed(key: &Signer, nonce: u64, chain_id: u64, gas_price: u128, gas: u64, value: u64, to: Address) -> String {
+    alloy_primitives::hex::encode_prefixed(signed_raw(key, nonce, chain_id, gas_price, gas, value, to))
 }
 
 /// Time all workers spent signing, sending frames, and waiting for answers,
@@ -379,7 +400,7 @@ static DEEPEST: AtomicU64 = AtomicU64::new(0);
 /// moving while one is being validated.
 fn flood_over_ingest(
     conn: &mut Ingest,
-    part: &[PrivateKeySigner],
+    part: &[Signer],
     nonce: &mut [u64],
     stalls: &mut [u32],
     args: &Args,
@@ -558,20 +579,40 @@ impl Ingest {
 }
 
 /// The same transaction as [`signed`], as bytes rather than as a hex string.
-fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, gas: u64, value: u64, to: Address) -> Vec<u8> {
-    let tx = TxEip1559 {
-        chain_id,
-        nonce,
-        gas_limit: gas,
-        max_fee_per_gas: gas_price,
-        max_priority_fee_per_gas: gas_price / 10,
-        to: TxKind::Call(to),
-        value: U256::from(value),
-        ..Default::default()
-    };
-    let signature = sign_hash(key, &tx.signature_hash());
-    let envelope: TxEnvelope = tx.into_signed(signature).into();
-    envelope.encoded_2718()
+fn signed_raw(key: &Signer, nonce: u64, chain_id: u64, gas_price: u128, gas: u64, value: u64, to: Address) -> Vec<u8> {
+    match key {
+        Signer::Secp(key) => {
+            let tx = TxEip1559 {
+                chain_id,
+                nonce,
+                gas_limit: gas,
+                max_fee_per_gas: gas_price,
+                max_priority_fee_per_gas: gas_price / 10,
+                to: TxKind::Call(to),
+                value: U256::from(value),
+                ..Default::default()
+            };
+            let signature = sign_hash(key, &tx.signature_hash());
+            let envelope: TxEnvelope = tx.into_signed(signature).into();
+            envelope.encoded_2718()
+        }
+        Signer::Ed { key, pubkey, .. } => {
+            let tx = TxAltSig {
+                chain_id,
+                nonce,
+                max_priority_fee_per_gas: gas_price / 10,
+                max_fee_per_gas: gas_price,
+                gas_limit: gas,
+                to,
+                value: U256::from(value),
+                input: Bytes::new(),
+                access_list: Default::default(),
+                alg_type: ALG_ED25519,
+                pubkey: pubkey.clone(),
+            };
+            tx.sign_ed25519(key).encoded_2718()
+        }
+    }
 }
 
 /// Signs a hash with libsecp256k1 rather than the signer's k256.
@@ -671,7 +712,7 @@ fn submit(
 fn fund(
     client: &reqwest::blocking::Client,
     args: &Args,
-    keys: &[PrivateKeySigner],
+    keys: &[Signer],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let faucet: PrivateKeySigner = args.faucet.parse()?;
     let rpc = &args.rpcs[0];
@@ -774,6 +815,7 @@ fn fund(
 
 fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = Args {
+        alg: "secp256k1".into(),
         rpcs: vec!["http://127.0.0.1:8700".into()],
         chain_id: 1143,
         // hardhat account 0, which this chain's genesis funds; tests/e2e.sh uses it too.
@@ -797,6 +839,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         let mut next = || it.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "--rpc" => args.rpcs = next()?.split(',').map(str::to_owned).collect(),
+            "--alg" => args.alg = next()?,
             "--chain-id" => args.chain_id = next()?.parse()?,
             "--key" => args.faucet = next()?,
             "--senders" => args.senders = next()?.parse()?,
@@ -843,6 +886,7 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --conc <n>          concurrent submitters (default 32)
   --rpcbatch <n>      transactions per JSON-RPC batch, 1-200 (default 100)
   --shard-senders     pin each sender to one node (cold-follower path)
+  --alg <secp256k1|ed25519>  signature scheme of the senders (default secp256k1; ed25519 sends 0x50 transactions)
   --skip-funding      the senders are already funded
 ";
 

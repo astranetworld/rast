@@ -18,7 +18,7 @@ use reth_chainspec::EthereumHardforks;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire_types::{NetworkPrimitives, NewBlock};
-use reth_ethereum_primitives::EthPrimitives;
+use n42_tx_types::N42Primitives as EthPrimitives;
 use reth_network_api::{
     BlockAnnounceProvider, BlockDownloaderProvider, FullNetwork, NetworkEventListenerProvider,
 };
@@ -28,7 +28,7 @@ use reth_network_p2p::{
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::EngineApiMessageVersion;
 use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
-use reth_ethereum_primitives::{Block, TransactionSigned};
+use n42_tx_types::{Block, N42TxEnvelope as TransactionSigned};
 use reth_primitives_traits::Header;
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
 type SealedBlock<B = Block> = reth_primitives_traits::SealedBlock<B>;
@@ -139,8 +139,8 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
         SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>,
     >,
     recent_num_to_td: schnellru::LruMap<u64, U256>,
-    new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
-    new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
+    new_block_tx: mpsc::Sender<(NewBlock<Block>, BlockHash)>,
+    new_block_rx: mpsc::Receiver<(NewBlock<Block>, BlockHash)>,
     beacon: Beacon<Provider>,
     broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
     block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
@@ -177,7 +177,7 @@ impl<T, Provider, B, Network> N42Miner<T, Provider, B, Network>
 where
     T: PayloadTypes,
     <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
-    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
+    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives<Block = Block>,
     Provider: BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
@@ -187,7 +187,7 @@ where
         + 'static + Clone,
     B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
     Network: FullNetwork,
-    // reth_ethereum_primitives::Block is already Block<TransactionSigned>;
+    // Block is already Block<TransactionSigned>;
     // reth-primitives' alias was generic over the transaction type, this one is not.
     Network: BlockAnnounceProvider<Block = Block>,
     <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
@@ -207,7 +207,7 @@ where
         broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
         block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     ) {
-        let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
+        let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock<Block>, BlockHash)>(128);
         let beacon = Beacon::new(provider.clone());
 
         let mode_interval = match mode {

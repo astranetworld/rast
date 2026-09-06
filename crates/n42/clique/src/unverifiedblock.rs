@@ -4,7 +4,7 @@
 use alloy_primitives::{B256, U256};
 use n42_primitives::{AttestationData, CommitteeIndex};
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
-type SealedBlock<B = reth_ethereum_primitives::Block> = reth_primitives_traits::SealedBlock<B>;
+type SealedBlock<B = n42_tx_types::Block> = reth_primitives_traits::SealedBlock<B>;
 use reth_revm::cached::CachedReads;
 use serde::{Deserialize, Serialize};
 

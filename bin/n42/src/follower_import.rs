@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use reth_consensus::{Consensus, FullConsensus, HeaderValidator};
-use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
+use n42_tx_types::{Block, N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
+use reth_primitives_traits::transaction::TxHashRef as _;
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_payload_primitives::BuiltPayloadExecutedBlock;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock, SignerRecoverable};
@@ -88,24 +89,50 @@ where
     let senders_at = std::time::Instant::now();
 
     // Senders: the recovery cache the ingest fills (what the engine's own
-    // path reads), the rest recovered on the worker pool.
+    // path reads), the rest recovered on the worker pool. 0x50 transactions
+    // read the shared Ed25519 sender cache; the misses are verified in
+    // batches rather than one signature at a time.
     let cache_hits = std::sync::atomic::AtomicU64::new(0);
-    let senders: Vec<Address> = {
+    let alt_cache = n42_tx_types::AltSigSenderCache::global();
+    let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
+    let mut senders: Vec<Option<Address>> = {
         use rayon::prelude::*;
-        sealed
-            .body()
-            .transactions()
-            .collect::<Vec<_>>()
-            .par_iter()
-            .map(|tx| {
-                if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
+        txs.par_iter()
+            .map(|tx| match tx {
+                TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
                     cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(sender);
+                })),
+                TransactionSigned::Eth(_) => {
+                    if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
+                        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(Some(sender));
+                    }
+                    tx.recover_signer().map(Some).map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
                 }
-                tx.recover_signer().map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
             })
             .collect::<Result<Vec<_>, String>>()?
     };
+    let misses: Vec<usize> = senders.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i).collect();
+    if !misses.is_empty() {
+        use rayon::prelude::*;
+        let batch = n42_tx_types::ed25519_batch_size();
+        let verified: Vec<(usize, Result<Address, n42_tx_types::AltSigError>)> = misses
+            .par_chunks(batch)
+            .flat_map_iter(|chunk| {
+                let refs: Vec<&n42_tx_types::AltSigTx> = chunk
+                    .iter()
+                    .filter_map(|&i| txs[i].as_alt_sig())
+                    .collect();
+                chunk.iter().copied().zip(n42_tx_types::verify_batch(&refs)).collect::<Vec<_>>()
+            })
+            .collect();
+        for (i, verdict) in verified {
+            let sender = verdict.map_err(|err| format!("sender of {}: {err}", txs[i].tx_hash()))?;
+            alt_cache.insert(*txs[i].tx_hash(), sender);
+            senders[i] = Some(sender);
+        }
+    }
+    let senders: Vec<Address> = senders.into_iter().map(|s| s.expect("every sender resolved")).collect();
     let cache_hits = cache_hits.into_inner();
     let recovered = RecoveredBlock::new_sealed(sealed, senders);
     let senders_ms = senders_at.elapsed().as_millis() as u64;

@@ -42,7 +42,7 @@ use reth_consensus_common::validation::{
     validate_header_gas,
 };
 use reth_ethereum_consensus::EthBeaconConsensus;
-use reth_ethereum_primitives::{Block as EthBlock, BlockBody as EthBlockBody, EthPrimitives, Receipt};
+use n42_tx_types::{Block as EthBlock, BlockBody as EthBlockBody, N42Primitives as EthPrimitives, Receipt};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{BlockBody as _, GotExpected, RecoveredBlock, SealedBlock, SealedHeader};
 use std::sync::{Arc, RwLock};

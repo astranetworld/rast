@@ -100,8 +100,10 @@ pub struct BuiltBlock {
 pub struct ChainBlock {
     /// The header.
     pub header: alloy_consensus::Header,
-    /// The transactions, in order.
-    pub transactions: Vec<alloy_consensus::TxEnvelope>,
+    /// The transactions' EIP-2718 bytes, in order. Bytes rather than a typed
+    /// envelope: a block may carry transaction types this crate does not
+    /// model (N42's 0x50), and every consumer wants the bytes anyway.
+    pub transactions: Vec<alloy_primitives::Bytes>,
     /// The withdrawals; `None` before Shanghai.
     pub withdrawals: Option<Vec<alloy_eips::eip4895::Withdrawal>>,
 }

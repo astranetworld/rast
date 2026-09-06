@@ -21,10 +21,10 @@ use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
 };
-use reth_ethereum_primitives::TransactionSigned;
+use n42_tx_types::N42TxEnvelope as TransactionSigned;
 use reth_primitives_traits::Recovered;
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
-type SealedBlock<B = reth_ethereum_primitives::Block> = reth_primitives_traits::SealedBlock<B>;
+type SealedBlock<B = n42_tx_types::Block> = reth_primitives_traits::SealedBlock<B>;
 use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives, SignedTransaction};
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
@@ -54,7 +54,7 @@ impl<T, Provider, B, Pool> N42Migrate<T, Provider, B, Pool>
 where
     T: PayloadTypes,
     <T::BuiltPayload as BuiltPayload>::Primitives:
-        NodePrimitives<Block = reth_ethereum_primitives::Block>,
+        NodePrimitives<Block = n42_tx_types::Block>,
     Provider: BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
@@ -63,7 +63,7 @@ where
         + 'static
         + Clone,
     B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
-    Pool: TransactionPool<Transaction = EthPooledTransaction> + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     pub fn spawn_new(
         provider: Provider,
@@ -186,22 +186,20 @@ where
 
             debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
-            let txs: Vec<EthPooledTransaction> = transactions
+            let txs: Vec<Pool::Transaction> = transactions
                 .into_iter()
                 .filter_map(|rpc_tx: RpcTransaction| {
                     debug!(target: "consensus-client", ?rpc_tx);
 
-                    let tx_signed: TransactionSigned = match rpc_tx.try_into() {
-                        Ok(tx) => tx,
+                    let tx_signed: TransactionSigned = match reth_ethereum_primitives::TransactionSigned::try_from(rpc_tx) {
+                        Ok(tx) => tx.into(),
                         Err(e) => {
                             warn!(target: "consensus-client", ?e, "Failed to convert RPC transaction");
                             return None;
                         }
                     };
-                    // Calculate encoded length for pool transaction (using EIP-2718 encoding)
-                    let encoded_length = tx_signed.encode_2718_len();
                     match tx_signed.try_into_recovered() {
-                        Ok(recovered) => Some(EthPooledTransaction::new(recovered, encoded_length)),
+                        Ok(recovered) => <Pool::Transaction as PoolTransaction>::try_from_consensus(recovered).ok(),
                         Err(e) => {
                             warn!(target: "consensus-client", ?e, "Failed to recover transaction");
                             None

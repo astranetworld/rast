@@ -24,7 +24,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     types::{error::INTERNAL_ERROR_CODE, ErrorObject},
 };
-use reth_ethereum_engine_primitives::EthBuiltPayload;
+use n42_engine_types::N42BuiltPayload;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,7 @@ pub struct N42EngineExt<T: PayloadTypes> {
 #[jsonrpsee::core::async_trait]
 impl<T> N42EngineApiServer for N42EngineExt<T>
 where
-    T: PayloadTypes<BuiltPayload = EthBuiltPayload> + 'static,
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload> + 'static,
 {
     async fn get_payload_raw(&self, id: PayloadId) -> RpcResult<Option<RawBuiltPayload>> {
         // WaitForPending, as `engine_getPayload` does: a build in progress is

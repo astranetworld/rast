@@ -705,9 +705,12 @@ pub fn normalize_to_gov5_h2_with_header(
     view: u64,
     sealer: Option<&BlsSecretKey>,
 ) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+    // Raw: the transactions stay the bytes the payload carries, so a block
+    // with a transaction type this crate does not model (N42's 0x50) seals
+    // like any other, and 163,000 of them are not decoded to be re-encoded.
     let mut block = execution
         .clone()
-        .try_into_block::<TxEnvelope>()
+        .into_block_raw()
         .map_err(|e| HeaderProfileError::Reconstruction(e.to_string()))?;
     block.header.ommers_hash = B256::ZERO;
     block.header.difficulty = U256::ZERO;
@@ -743,7 +746,8 @@ pub fn normalize_to_gov5_h2_with_header(
         ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
         _ => None,
     };
-    Ok((execution_data_for_block_with_bal(hash, &block, bal), header))
+    let withdrawals = block.body.withdrawals.map(|w| w.0).unwrap_or_default();
+    Ok((execution_data_from_raw_parts(hash, &header, block.body.transactions, withdrawals, bal), header))
 }
 
 /// A block body with these transactions and, on a post-Shanghai header, the

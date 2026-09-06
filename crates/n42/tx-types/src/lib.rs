@@ -23,7 +23,10 @@ extern crate alloc;
 pub mod alt_sig;
 mod compact;
 pub mod envelope;
+pub mod evm;
 pub mod primitives;
+pub mod rpc;
+pub mod sender_cache;
 
 pub use alt_sig::{
     verify_batch, AltSigError, AltSigTx, TxAltSig, ALG_ED25519, ALT_SIG_TX_TYPE_ID,
@@ -31,6 +34,8 @@ pub use alt_sig::{
 };
 pub use envelope::{N42PooledTxEnvelope, N42PooledTxType, N42TxEnvelope, N42TxType};
 pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
+pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
+pub use sender_cache::{alt_sig_enabled, ed25519_batch_size, set_alt_sig_enabled, AltSigSenderCache};
 
 #[cfg(test)]
 mod tests {

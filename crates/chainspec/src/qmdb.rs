@@ -49,6 +49,22 @@ pub fn state_scheme(genesis: &Genesis) -> StateScheme {
     }
 }
 
+/// Genesis `config` key that enables the 0x50 alternative-signature
+/// transaction (`docs/spec/N42_TX_0x50.md`).
+pub const ALT_SIG_TX_KEY: &str = "altSigTx";
+
+/// Whether a genesis enables the 0x50 alternative-signature transaction.
+/// Absent or anything but `true` means disabled: the type is rejected at
+/// admission and in block validation.
+pub fn alt_sig_tx_enabled(genesis: &Genesis) -> bool {
+    genesis
+        .config
+        .extra_fields
+        .get_deserialized::<bool>(ALT_SIG_TX_KEY)
+        .and_then(Result::ok)
+        .unwrap_or(false)
+}
+
 /// The QMDB root of a genesis allocation.
 pub fn qmdb_genesis_root(genesis: &Genesis) -> Result<B256, StateError> {
     // The hash the forest is filed under does not affect the root; the real

@@ -15,7 +15,7 @@
 //! start the moment the block exists.
 
 use alloy_primitives::B256;
-use reth_ethereum_primitives::{Block, Receipt};
+use n42_tx_types::{Block, Receipt};
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_trie::{updates::TrieUpdates, HashedPostState};

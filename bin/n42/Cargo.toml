@@ -13,6 +13,7 @@ default-run = "n42"
 workspace = true
 
 [dependencies]
+n42-tx-types.workspace = true
 libc.workspace = true
 reth-primitives-traits.workspace = true
 #n42

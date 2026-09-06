@@ -180,7 +180,7 @@ impl ExecutionLayer for MockExecutionLayer {
         // An accepted block is one this mock can serve and count, as a real
         // execution layer would.
         if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid)
-            && let Ok(block) = payload.clone().try_into_block::<alloy_consensus::TxEnvelope>()
+            && let Ok(block) = payload.clone().into_block_raw()
         {
             let number = block.header.number;
             self.state
@@ -266,7 +266,7 @@ impl ExecutionLayer for MockExecutionLayer {
             state.next_block
         };
         let built = Self::built_block(number);
-        if let Ok(block) = built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
+        if let Ok(block) = built.execution_data.clone().into_block_raw() {
             self.state
                 .lock()
                 .expect("mock state lock")

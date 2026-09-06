@@ -166,16 +166,18 @@ pub fn decode_block_gossip(
 }
 
 /// The uncompressed wire form: `[header, tx_bytes, verifiers, rewards]`.
+///
+/// The payload's transactions are already the bytes the wire wants; none is
+/// decoded, so a block may carry any transaction type the execution layer
+/// accepts (N42's 0x50 included). The header is reconstructed from the
+/// payload's fields and checked against the payload's hash.
 pub fn encode_block_rlp(
     execution: &ExecutionData,
     profile: HeaderProfile,
 ) -> Result<Vec<u8>, BlockGossipError> {
-    let block = reconstruct_block(execution, profile)?;
-    if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
-        return Err(BlockGossipError::TransactionRootMismatch);
-    }
+    let block = reconstruct_block_raw(execution, profile)?;
     let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
-    Ok(encode_block_rlp_parts(&block.header, &block.body.transactions, &rewards))
+    Ok(encode_block_rlp_raw(&block.header, &block.body.transactions, &rewards, None))
 }
 
 /// One reward on the wire: gov5's `Reward{Address, Amount}` under
@@ -499,14 +501,14 @@ fn decode_block_rlp_raw_with(
 /// Engine payloads carry neither `ommers_hash` nor `difficulty`; the profile
 /// says what they were. Both gov5 H2 difficulty variants are tried and the
 /// payload's block hash selects the right one — no guessing is involved.
-fn reconstruct_block(
+fn reconstruct_block_raw(
     execution: &ExecutionData,
     profile: HeaderProfile,
-) -> Result<Block<TxEnvelope>, BlockGossipError> {
+) -> Result<Block<Bytes>, BlockGossipError> {
     let expected_hash = execution.block_hash();
     let direct = execution
         .clone()
-        .try_into_block::<TxEnvelope>()
+        .into_block_raw()
         .map_err(|error| BlockGossipError::PayloadReconstruction(error.to_string()))?;
     match profile {
         HeaderProfile::Ethereum => {
@@ -516,7 +518,7 @@ fn reconstruct_block(
             }
             Ok(direct)
         }
-        HeaderProfile::Gov5H2 => n42_h2_consensus::reconstruct_gov5_h2_block::<TxEnvelope>(execution)
+        HeaderProfile::Gov5H2 => n42_h2_consensus::reconstruct_gov5_h2_block_from(direct, execution)
             .map_err(|e| BlockGossipError::HeaderProfile(profile, e.to_string())),
     }
 }

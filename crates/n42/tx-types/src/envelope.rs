@@ -100,6 +100,19 @@ impl N42TxEnvelope {
 }
 
 impl N42PooledTxEnvelope {
+    /// The 0x50 transaction, if this is one.
+    pub const fn as_alt_sig(&self) -> Option<&AltSigTx> {
+        match self {
+            Self::Eth(_) => None,
+            Self::AltSig(tx) => Some(tx),
+        }
+    }
+
+    /// Whether this is a 0x50 transaction.
+    pub const fn is_alt_sig(&self) -> bool {
+        matches!(self, Self::AltSig(_))
+    }
+
     /// The transaction hash.
     pub fn hash(&self) -> &B256 {
         match self {
@@ -223,6 +236,13 @@ impl InMemorySize for N42PooledTxEnvelope {
             Self::Eth(tx) => tx.size(),
             Self::AltSig(tx) => tx.size(),
         }
+    }
+}
+
+/// Legacy, as `TxType`'s default is.
+impl Default for N42TxType {
+    fn default() -> Self {
+        Self::Eth(alloy_consensus::TxType::default())
     }
 }
 

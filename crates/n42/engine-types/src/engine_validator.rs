@@ -24,7 +24,7 @@ use n42_h2_consensus::reconstruct_gov5_h2_block_from;
 use n42_qmdb_reth::HotStuffGenesisConfig;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_primitives::{EngineApiValidator, EngineTypes, PayloadValidator};
-use reth_ethereum_primitives::{Block as EthBlock, EthPrimitives, TransactionSigned};
+use n42_tx_types::{Block as EthBlock, N42Primitives as EthPrimitives, N42TxEnvelope as TransactionSigned};
 use reth_node_api::{AddOnsContext, FullNodeComponents, NodeTypes};
 use reth_node_builder::rpc::PayloadValidatorBuilder;
 use reth_node_ethereum::node::EthereumEngineValidator;
@@ -85,10 +85,15 @@ where
         payload: ExecutionData,
     ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
         if self.profile == N42HeaderProfile::Ethereum {
-            return <EthereumEngineValidator<ChainSpec> as PayloadValidator<Types>>::convert_payload_to_block(
-                &self.inner,
-                payload,
-            );
+            // reth's own conversion is pinned to its Ethereum envelope; this is
+            // the same decode over the node's, checked against the announced hash.
+            let expected_hash = payload.block_hash();
+            let block = payload.try_into_block::<TransactionSigned>()?;
+            let sealed = SealedBlock::seal_slow(block);
+            if sealed.hash() != expected_hash {
+                return Err(PayloadError::BlockHash { execution: sealed.hash(), consensus: expected_hash }.into());
+            }
+            return Ok(sealed);
         }
 
         let expected_hash = payload.block_hash();
@@ -263,7 +268,7 @@ mod tests {
     use alloy_primitives::{Bytes, U256};
     use n42_h2_consensus::{block_for_header, execution_data_for_block, HeaderExtra, GOV5_NIL_HASH};
     use reth_chainspec::{ChainSpec, MAINNET};
-    use reth_node_ethereum::EthEngineTypes;
+    use crate::engine_types::N42EngineTypes as EthEngineTypes;
 
     fn gov5_header(ommers_hash: B256, difficulty: U256) -> Header {
         Header {

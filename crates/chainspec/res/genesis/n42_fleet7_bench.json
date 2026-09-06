@@ -47,6 +47,7 @@
     },
     "stateScheme": "qmdb",
     "consensus": "hotstuff",
+    "altSigTx": true,
     "hotstuff": {
       "period": 1,
       "baseTimeout": 6000,

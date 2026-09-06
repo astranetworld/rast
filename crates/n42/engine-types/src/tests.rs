@@ -26,7 +26,7 @@ mod node_tests {
 
     #[test]
     fn test_n42_node_primitives() {
-        use reth_ethereum_primitives::EthPrimitives;
+        use n42_tx_types::N42Primitives as EthPrimitives;
         // Verify N42Node uses EthPrimitives
         fn check_primitives<T: NodeTypes<Primitives = EthPrimitives>>() {}
         check_primitives::<N42Node>();

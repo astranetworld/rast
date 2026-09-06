@@ -63,7 +63,7 @@ fn main() {
         std::sync::Mutex<
             Option<
                 std::sync::Arc<
-                    dyn reth_consensus::FullConsensus<reth_ethereum_primitives::EthPrimitives>
+                    dyn reth_consensus::FullConsensus<n42_tx_types::N42Primitives>
                         + Send
                         + Sync,
                 >,
@@ -255,7 +255,7 @@ fn main() {
                                     let qmdb = qmdb_for_startup.clone();
                                     let consensus = consensus.clone();
                                     let chain_spec = node.chain_spec();
-                                    std::sync::Arc::new(move |sealed: reth_primitives_traits::SealedBlock<reth_ethereum_primitives::Block>| {
+                                    std::sync::Arc::new(move |sealed: reth_primitives_traits::SealedBlock<n42_tx_types::Block>| {
                                         n42::follower_import::import_foreign_block(
                                             sealed, &provider, &evm_config, senders_cache.as_ref(), &carry, qmdb.as_ref(), consensus.as_ref(), &chain_spec,
                                         )
@@ -264,7 +264,7 @@ fn main() {
                                 exec_probe: (std::env::var("N42_FOLLOWER_EXEC_PROBE").is_ok()).then(|| {
                                     let provider = node.provider.clone();
                                     let evm_config = node.evm_config.clone();
-                                    std::sync::Arc::new(move |block: reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>| {
+                                    std::sync::Arc::new(move |block: reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>| {
                                         use reth_evm::execute::Executor as _;
                                         use reth_evm::ConfigureEvm as _;
                                         use reth_provider::StateProviderFactory as _;
@@ -274,7 +274,7 @@ fn main() {
                                         let mut executor = evm_config.executor(db);
                                         let out = executor.execute_one(&block).map_err(|e| e.to_string())?;
                                         Ok((started.elapsed().as_millis() as u64, out.gas_used, out.receipts.len()))
-                                    }) as std::sync::Arc<dyn Fn(reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>) -> Result<(u64, u64, usize), String> + Send + Sync>
+                                    }) as std::sync::Arc<dyn Fn(reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(u64, u64, usize), String> + Send + Sync>
                                 }),
                                 prune_pool: (std::env::var("N42_PRUNE_POOL_ON_IMPORT").is_ok()).then(|| {
                                     let pool = node.pool.clone();
@@ -298,7 +298,7 @@ fn main() {
             // n42_tx_queue. Fed by the ingest, drained by the builder, pruned
             // here by every canonical block on every node.
             if std::env::var("N42_TX_QUEUE").is_ok() {
-                let queue: n42_tx_queue::TxQueue<reth_transaction_pool::EthPooledTransaction> = n42_tx_queue::TxQueue::new();
+                let queue: n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction> = n42_tx_queue::TxQueue::new();
                 if std::env::var("N42_TX_QUEUE_DRAINER").is_ok() {
                     // The inbox drained off the builder's thread; see TxQueue::drain_now.
                     let drained = queue.clone();

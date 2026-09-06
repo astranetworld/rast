@@ -33,9 +33,9 @@
 
 | 周 | 阶段 | 交付 | 验收 |
 | --- | --- | --- | --- |
-| W1 | 1A 规范 + 1B 原语 crate | `docs/spec/N42_TX_0x50.md`；`crates/n42/primitives-tx` 通过单测与 fixture | 编码/解码/哈希/地址推导与规范一致 |
-| W2–W3 | 1C 节点贯通 | 节点接受、打包、执行、存储、RPC 返回 0x50 交易 | `n42 node` 单机跑通 `send_tx --alg ed25519`；`cargo check --workspace` 干净 |
-| W4 | 1D 批量验证 + 1E 负载工具 + 1F 测量 | ingest 批验；`tx_flood --alg ed25519`；A-B-A 三轮 | **M1** |
+| W1 ✅ 2026-09-06 | 1A 规范 + 1B 原语 crate | `docs/spec/N42_TX_0x50.md`；`crates/n42/primitives-tx` 通过单测与 fixture | 编码/解码/哈希/地址推导与规范一致 |
+| W2–W3 ✅ 2026-09-06（编译通过，未上 fleet） | 1C 节点贯通 | 节点接受、打包、执行、存储、RPC 返回 0x50 交易 | `n42 node` 单机跑通 `send_tx --alg ed25519`；`cargo check --workspace` 干净 |
+| W4（1D/1E 已写，1F 待测） | 1D 批量验证 + 1E 负载工具 + 1F 测量 | ingest 批验；`tx_flood --alg ed25519`；A-B-A 三轮 | **M1** |
 | W5–W6 | 2A–2D 链周期 | 更大的块、follower sender 路径、body 传输、pacing 复测 | **M2** |
 | W7 | 缓冲、文档、tag | `docs/NATIVE_FLEET7.md` 记录，打 tag | — |
 | W8–W11 | 3A–3D 冲 1,000k | 并行出块、body 分片传输、ingest 非签名成本、写 IO | **M3** |
@@ -88,7 +88,7 @@ mempool   = signature 必须 canonical（s < L，dalek verify_strict 的规则�
 | 出块（`payload.rs`、`assembler.rs`、`built_executions.rs`） | 泛型随 primitives 变；交易根用 `encode_2718` 已覆盖新类型 |
 | 执行层通道（`h2-execution/raw_engine.rs`、`bin/n42/src/payload_serve.rs`） | `execution_data_from_raw_parts` 的交易字节按 2718 解码，接受 0x50；OWN_BLOCK 头路径不受影响 |
 | follower（`bin/n42/src/follower_import.rs`、`parallel_transfer.rs`） | `Evm`/`Provider` 约束改到 `N42Primitives`；sender 缓存 miss 时走批量验证（1D） |
-| h2 wire body（`h2-net/block_gossip.rs`、`h2-node/service.rs`） | RLP `[header, txs, verifiers, rewards]` 里 txs 用 2718 字节；解码器泛型化到 N42 envelope |
+| h2 wire body（`h2-net/block_gossip.rs`、`h2-node/service.rs`） | RLP `[header, txs, verifiers, rewards]` 里 txs 用 2718 字节；✅ 已改为全程原始字节：出块者封装（`encode_block_rlp` → `into_block_raw`）、封印（`normalize_to_gov5_h2_with_header`）、执行层取块（`ChainBlock.transactions: Vec<Bytes>`，RPC 解析节点自己的交易类型）都不再解码成 alloy `TxEnvelope` |
 | RPC（`crates/rpc/rpc-types-compat`，已 vendored） | AltSig → `alloy_rpc_types_eth::Transaction` 的映射（`type=0x50`，`r/s/v` 置空，新增 `pubkey/signature` 字段）；回执不变 |
 | 存储（`crates/storage/*`，已 vendored） | 表的 value 类型跟随 `Compact`；`n42-init-snapshot`/`qmdb-export` 不涉及交易，不动 |
 

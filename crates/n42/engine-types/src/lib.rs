@@ -19,6 +19,10 @@ pub use node::N42Node;
 
 mod payload;
 pub mod assembler;
+pub mod engine_types;
+pub mod n42_evm;
+pub mod pool;
+pub mod rpc;
 pub mod built_executions;
 //mod job_generator;
 //mod job;
@@ -34,6 +38,10 @@ pub use consensus::{is_hotstuff_chain, N42Consensus, N42ConsensusBuilder, N42Ful
 pub use engine_validator::{header_profile_for, N42EngineValidator, N42EngineValidatorBuilder};
 pub use hotstuff_consensus::{gov5_receipt_root_bloom, HotStuffConsensus};
 pub use payload::N42PayloadServiceBuilder;
+pub use engine_types::{N42BuiltPayload, N42EngineTypes};
+pub use n42_evm::{N42EvmConfig, N42ReceiptBuilder};
+pub use pool::{N42PooledTransaction, N42TransactionPool};
+pub use rpc::{N42EthApiBuilder, N42RpcTypes};
 
 #[cfg(test)]
 mod tests;

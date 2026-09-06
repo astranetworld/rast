@@ -45,7 +45,8 @@ use alloy_eips::Encodable2718;
 use alloy_rlp::Encodable;
 use n42_h2_execution::raw_engine::{self, request};
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_ethereum_engine_primitives::EthBuiltPayload;
+use n42_engine_types::N42BuiltPayload;
+use reth_primitives_traits::transaction::TxHashRef as _;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{Block as _, BlockBody as _, SealedBlock};
@@ -139,7 +140,7 @@ pub struct OwnBlockReuse {
     /// is not a measurement of the chain. Returns (ms, gas used, receipts).
     pub exec_probe: Option<
         std::sync::Arc<
-            dyn Fn(reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>) -> Result<(u64, u64, usize), String>
+            dyn Fn(reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Result<(u64, u64, usize), String>
                 + Send
                 + Sync,
         >,
@@ -159,9 +160,9 @@ pub struct OwnBlockReuse {
 /// Returns the executed block for the engine and the phase timings in
 /// milliseconds: senders, execution, checks, state root, hashed state.
 pub type ForeignImport = dyn Fn(
-        SealedBlock<reth_ethereum_primitives::Block>,
+        SealedBlock<n42_tx_types::Block>,
     ) -> Result<
-        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<reth_ethereum_primitives::EthPrimitives>>, [u64; 7]),
+        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 7]),
         String,
     > + Send
     + Sync;
@@ -265,7 +266,7 @@ where
         sealed_hash,
         SealedBlock::from_sealed_parts(sealed_header.clone(), body.clone()),
     );
-    let recovered: reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block> = reth_primitives_traits::RecoveredBlock::new_sealed(
+    let recovered: reth_primitives_traits::RecoveredBlock<n42_tx_types::Block> = reth_primitives_traits::RecoveredBlock::new_sealed(
         SealedBlock::from_sealed_parts(sealed_header, body),
         senders,
     );
@@ -281,7 +282,7 @@ where
             return None;
         }
     }
-    let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<reth_ethereum_primitives::EthPrimitives> {
+    let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<n42_tx_types::N42Primitives> {
         recovered_block: std::sync::Arc::new(recovered),
         execution_output: built.execution_output,
         hashed_state: built.hashed_state,
@@ -301,7 +302,7 @@ where
     // puller's batches in flight when the block filled -- a few thousand
     // transactions across every sender -- and every sender's lane then
     // started above the chain's nonce (loop29E400a: 7% occupancy).
-    let queue_prune_ms = n42_tx_queue::global::<reth_transaction_pool::EthPooledTransaction>().map(|queue| {
+    let queue_prune_ms = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>().map(|queue| {
         let at = std::time::Instant::now();
         let mined = executed
             .recovered_block
@@ -369,7 +370,7 @@ async fn own_block_by_header<T>(
     frame: &[u8],
 ) -> Result<(alloy_rpc_types_engine::PayloadStatus, u64, u64, u64), String>
 where
-    T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     use alloy_rlp::Decodable;
     let reuse = reuse.ok_or("no own-block reuse on this node")?;
@@ -490,7 +491,7 @@ pub async fn serve<T>(
     reuse: Option<OwnBlockReuse>,
 ) -> std::io::Result<()>
 where
-    T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
     // Said at start-up so a round can grep that its switch reached this
@@ -528,7 +529,7 @@ async fn serve_connection<T>(
     reuse: Option<OwnBlockReuse>,
 ) -> std::io::Result<()>
 where
-    T: PayloadTypes<BuiltPayload = EthBuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     stream.set_nodelay(true)?;
     // Buffers retained across frames. A newPayload frame is ~19 MB at the
@@ -661,7 +662,7 @@ where
                                 // ahead starts the moment this import returns and
                                 // would otherwise take them again (87,800 stale
                                 // transactions in one build, round 38).
-                                if let Some(queue) = n42_tx_queue::global::<reth_transaction_pool::EthPooledTransaction>() {
+                                if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
                                     let mined: Vec<(alloy_primitives::Address, u64)> = executed
                                         .recovered_block
                                         .transactions_with_sender()

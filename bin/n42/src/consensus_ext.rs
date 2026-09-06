@@ -21,7 +21,7 @@ use n42_primitives::{
 };
 use pubsub_mem::{subscribe, RouterMsg};
 use reth_consensus::{ConsensusError, FullConsensus};
-use reth_ethereum_primitives::EthPrimitives;
+use n42_tx_types::N42Primitives as EthPrimitives;
 use reth_node_core::primitives::AlloyBlockHeader;
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
 use std::collections::HashMap;

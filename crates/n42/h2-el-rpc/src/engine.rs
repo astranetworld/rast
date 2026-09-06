@@ -422,7 +422,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
     }
 
     async fn block_by_hash(&self, hash: B256) -> Result<Option<ChainBlock>, ElError> {
-        let block: Option<alloy_rpc_types_eth::Block> = self
+        let block: Option<RpcBlock> = self
             .call("eth_getBlockByHash", vec![json!(hash), json!(true)])
             .await
             .map_err(|e| ElError::new(e.to_string()))?;
@@ -433,7 +433,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         // The Engine API's auth endpoint also serves the handful of `eth_`
         // methods the spec requires of it, this one among them, so no second
         // endpoint is needed to serve peers the chain.
-        let block: Option<alloy_rpc_types_eth::Block> = self
+        let block: Option<RpcBlock> = self
             .call("eth_getBlockByNumber", vec![json!(format!("0x{number:x}")), json!(true)])
             .await
             .map_err(|e| ElError::new(e.to_string()))?;
@@ -1052,15 +1052,20 @@ pub fn built_block_from_parts(
     })
 }
 
+/// A block as the node's RPC returns it: its transactions are the node's
+/// envelope, which includes the 0x50 type alloy's does not know.
+pub type RpcBlock = alloy_rpc_types_eth::Block<alloy_rpc_types_eth::Transaction<n42_tx_types::N42TxEnvelope>>;
+
 /// The consensus header and transactions inside an `eth_getBlockByNumber`
 /// answer, which is what gov5's block form is built from.
-pub fn block_parts(block: alloy_rpc_types_eth::Block) -> ChainBlock {
+pub fn block_parts(block: RpcBlock) -> ChainBlock {
+    use alloy_eips::Encodable2718;
     let header = block.header.inner;
     let transactions = block
         .transactions
         .into_transactions_vec()
         .into_iter()
-        .map(|tx| tx.inner.into_inner())
+        .map(|tx| alloy_primitives::Bytes::from(tx.inner.into_inner().encoded_2718()))
         .collect();
     ChainBlock { header, transactions, withdrawals: block.withdrawals.map(|w| w.0) }
 }

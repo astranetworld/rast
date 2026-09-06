@@ -24,6 +24,15 @@ ed25519-dalek = { version = "2.2", default-features = false, features = ["std", 
 serde = { workspace = true, features = ["derive"] }
 bytes.workspace = true
 thiserror.workspace = true
+# The EVM environment and RPC request conversions for the envelope; both are
+# foreign traits, so they can only be implemented here, where the type lives.
+alloy-evm.workspace = true
+revm.workspace = true
+alloy-rpc-types-eth = { workspace = true, features = ["std", "serde"] }
+alloy-network.workspace = true
+reth-rpc-traits = "0.6.0"
+# The same fixed-size cache reth's sender-recovery cache is built on.
+fixed-cache = "0.1.8"
 
 [dev-dependencies]
 serde_json.workspace = true

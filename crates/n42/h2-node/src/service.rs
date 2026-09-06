@@ -1362,10 +1362,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
             let body = match self.driver.execution_layer().block_by_hash(hash).await {
-                Ok(Some(block)) => Some(encode_block_rlp_parts(
+                Ok(Some(block)) => Some(n42_h2_net::encode_block_rlp_raw(
                     &block.header,
                     &block.transactions,
                     &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+                    None,
                 )),
                 Ok(None) => None,
                 Err(err) => {
@@ -1747,7 +1748,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(header) = built.header.clone() {
                     self.remember_block(built.hash, &header);
                 } else {
-                    match built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
+                    match built.execution_data.clone().into_block_raw() {
                         Ok(block) => self.remember_block(built.hash, &block.header),
                         Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
                     }
@@ -2466,10 +2467,11 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
     for number in request.start..request.start.saturating_add(count) {
         match el.block_by_number(number).await {
             Ok(Some(block)) => {
-                rlps.push(encode_block_rlp_parts(
+                rlps.push(n42_h2_net::encode_block_rlp_raw(
                     &block.header,
                     &block.transactions,
                     &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+                    None,
                 ));
             }
             Ok(None) => break,

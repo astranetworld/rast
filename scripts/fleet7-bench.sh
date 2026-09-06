@@ -75,6 +75,9 @@ while (( $# )); do
     --decay-sec)    DECAY_SEC=$2; shift 2 ;;
     --conc)         CONC=$2; shift 2 ;;
     --rpcbatch)     RPCBATCH=$2; shift 2 ;;
+    # F7_FLOOD_ALG=ed25519: the flood's senders sign 0x50 (Ed25519) transfers
+    # instead of EIP-1559 ones (tx_flood --alg); the chain's genesis must
+    # carry altSigTx: true.
     # F7_FLOOD_WINDOW=<frames>: the flood's frames in flight per worker
     # (tx_flood --window, default 32) -- the closed loop's depth.
     --gasprice)     GASPRICE=$2; shift 2 ;;
@@ -384,6 +387,7 @@ for ((fp = 0; fp < FLOOD_PROCS; fp++)); do
     "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
     --senders "$fp_senders" --pertx "$PERTX" --offset "$fp_offset" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
     --conc "$fp_conc" --rpcbatch "$RPCBATCH" ${F7_FLOOD_WINDOW:+--window "$F7_FLOOD_WINDOW"} $SHARD \
+    ${F7_FLOOD_ALG:+--alg "$F7_FLOOD_ALG"} \
     > "$fp_log" 2>&1 < /dev/null 9>&- &
   FLOODS+=($!)
   echo "flood        : pid ${FLOODS[-1]}, $fp_senders senders from $fp_offset, $fp_conc workers, log $fp_log"

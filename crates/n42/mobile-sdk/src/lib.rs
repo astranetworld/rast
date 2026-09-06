@@ -8,7 +8,7 @@ use jsonrpsee::ws_client::WsClientBuilder;
 use n42_clique::UnverifiedBlock;
 use n42_primitives::AttestationData;
 use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork, ForkCondition, N42_DEVNET};
-use reth_ethereum_primitives::{Block, Receipt};
+use n42_tx_types::{Block, Receipt};
 use reth_evm::execute::Executor;
 use reth_evm::ConfigureEvm;
 use reth_evm_ethereum::EthEvmConfig;
@@ -176,6 +176,6 @@ fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
     Ok(receipts_root)
 }
 
-fn evm_config(chain_spec: Arc<ChainSpec>) -> EthEvmConfig {
-    EthEvmConfig::new(chain_spec)
+fn evm_config(chain_spec: Arc<ChainSpec>) -> n42_engine_types::N42EvmConfig {
+    n42_engine_types::N42EvmConfig::new_with_evm_factory(chain_spec, n42_engine_types::fast_transfer::N42EvmFactory::from_env())
 }

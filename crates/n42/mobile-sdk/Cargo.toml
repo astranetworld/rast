@@ -12,6 +12,8 @@ exclude.workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
+n42-tx-types.workspace = true
+n42-engine-types.workspace = true
 jni = "0.21"
 once_cell = "1.21"
 alloy-rpc-types-beacon.workspace = true

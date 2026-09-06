@@ -23,7 +23,7 @@ use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
     ReceiptRootBloom, TransactionRoot,
 };
-use reth_ethereum_primitives::{Block as EthBlock, BlockBody as EthBlockBody, EthPrimitives, Receipt};
+use n42_tx_types::{Block as EthBlock, BlockBody as EthBlockBody, N42Primitives as EthPrimitives, Receipt};
 use reth_execution_types::BlockExecutionResult;
 use reth_node_api::FullNodeTypes;
 use reth_node_builder::components::ConsensusBuilder;
@@ -133,6 +133,7 @@ where
     }
 
     fn validate_block_pre_execution(&self, block: &SealedBlock<EthBlock>) -> Result<(), ConsensusError> {
+        alt_sig_allowed(block)?;
         delegate!(self, c => Consensus::<EthBlock>::validate_block_pre_execution(c, block))
     }
 
@@ -145,6 +146,7 @@ where
         block: &SealedBlock<EthBlock>,
         transaction_root: Option<TransactionRoot>,
     ) -> Result<(), ConsensusError> {
+        alt_sig_allowed(block)?;
         delegate!(self, c => Consensus::<EthBlock>::validate_block_pre_execution_with_tx_root(c, block, transaction_root))
     }
 
@@ -206,6 +208,17 @@ where
     }
 }
 
+/// A block carrying a 0x50 transaction is valid only on a chain whose genesis
+/// enables the type (`altSigTx: true`).
+fn alt_sig_allowed(block: &SealedBlock<EthBlock>) -> Result<(), ConsensusError> {
+    if !n42_tx_types::alt_sig_enabled() && block.body().transactions().any(|tx| tx.is_alt_sig()) {
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(
+            "0x50 alternative-signature transactions are not enabled on this chain",
+        ))));
+    }
+    Ok(())
+}
+
 impl<Provider> FullConsensus<EthPrimitives> for N42Consensus<Provider>
 where
     Provider: ConsensusProvider,
@@ -248,6 +261,7 @@ where
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         let chain_spec = ctx.chain_spec();
+        n42_tx_types::set_alt_sig_enabled(reth_chainspec::qmdb::alt_sig_tx_enabled(chain_spec.genesis()));
         let consensus = if is_hotstuff_chain(&chain_spec) {
             let consensus = HotStuffConsensus::new(chain_spec);
             if let Some(key) = ctx.config().dev.consensus_signer_private_key.clone() {

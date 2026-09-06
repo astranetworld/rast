@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::network::PeersHandleProvider;
-use reth_ethereum_primitives::EthPrimitives;
+use n42_tx_types::N42Primitives;
 use reth_evm::ConfigureEvm;
 use reth_network::{protocol::IntoRlpxSubProtocol, NetworkProtocols};
 use reth_network_api::FullNetwork;

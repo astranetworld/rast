@@ -123,6 +123,16 @@ lost to direct compaction until the host runs `defrag=defer`. Host rules that ma
 (not `always`: with it the fleet's reads faulted by the million), swap empty, one warm-up leg before
 any leg is read, and `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md` for sharing the box.
 `docs/NATIVE_FLEET7.md` "Where it stands today".
+**Transaction type 0x50 (Ed25519, `docs/spec/N42_TX_0x50.md`)** is implemented in `crates/n42/tx-types`
+(`N42TxEnvelope` = reth's envelope + `AltSig`; the node runs on `N42Primitives`, `N42EvmConfig`,
+`N42EngineTypes`, `N42PooledTransaction`, `N42RpcTypes` from `crates/n42/engine-types`). It is admitted only
+on a chain whose genesis `config` has `"altSigTx": true` (both fleet7 genesis files do; the devnet does not):
+the pool refuses the type, the ingest drops it and block validation rejects it elsewhere. The ingest verifies
+0x50 signatures in batches (`N42_ED25519_BATCH`, default 64) and records senders in a shared cache
+(`N42_ALTSIG_SENDER_CACHE` entries, default 2^20) that the follower import and the engine's payload
+conversion read. `tx_flood --alg ed25519` floods with 0x50 transfers; `F7_FLOOD_ALG=ed25519` passes it
+through `fleet7-bench.sh`. Test vectors: `crates/n42/tx-types/testdata/altsig_vectors.json`, checked
+independently by `docs/sigbench/altsig_vectors.py`.
 The next step is scheduled in `docs/ROADMAP_ED25519_TX.md` (an Ed25519 transaction type with batch
 verification to lift the supply bound, then the chain cycle); the research behind it, with a signature
 benchmark for this host, is `docs/SIGNATURE_AND_BATCH_TX_SURVEY.md` and `docs/sigbench/`.

@@ -144,7 +144,7 @@ impl std::fmt::Debug for CapturingConsensusBuilder {
 #[cfg(test)]
 impl<Node> reth_node_builder::components::ConsensusBuilder<Node> for CapturingConsensusBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = reth_ethereum_primitives::EthPrimitives>>,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = n42_tx_types::N42Primitives>>,
 {
     type Consensus = Arc<n42_engine_types::N42Consensus<<Node as FullNodeTypes>::Provider>>;
 
@@ -162,7 +162,7 @@ where
             .lock()
             .map_err(|e| eyre::eyre!("consensus setups lock poisoned: {e}"))?
             .push(Arc::new(move |key: String, vote: Option<(Address, bool)>| {
-                type Block = reth_ethereum_primitives::Block;
+                type Block = n42_tx_types::Block;
                 <_ as Consensus<Block>>::set_eth_signer_by_key(&*handle, Some(key))?;
                 // Each block casts at most one vote, so clear whatever the previous
                 // block left pending before arming the next one.
@@ -181,7 +181,7 @@ where
             .lock()
             .map_err(|e| eyre::eyre!("snapshot readers lock poisoned: {e}"))?
             .push(Arc::new(move |number: u64, hash: B256| {
-                Ok(<_ as Consensus<reth_ethereum_primitives::Block>>::snapshot(
+                Ok(<_ as Consensus<n42_tx_types::Block>>::snapshot(
                     &*handle, number, hash, None,
                 )?)
             }));
@@ -201,7 +201,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
     // bound; upstream removed that associated type
     <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes:
         From<reth::rpc::types::engine::PayloadAttributes>,
-    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives: NodePrimitives<Block = n42_tx_types::Block>,
     <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
 {
     let best_number = node.provider.chain_info().unwrap().best_number;
@@ -1439,14 +1439,14 @@ async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::
                 &sender,
                 &alloy_consensus::SignableTransaction::signature_hash(&tx),
             )?;
-            let signed = reth_ethereum_primitives::TransactionSigned::new_unhashed(
+            let signed = n42_tx_types::N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::new_unhashed(
                 tx.into(),
                 signature,
-            );
+            ));
             let encoded_len = alloy_eips::eip2718::Encodable2718::encode_2718_len(&signed);
             let recovered =
                 reth_primitives_traits::Recovered::new_unchecked(signed, sender.address());
-            let pooled = reth_transaction_pool::EthPooledTransaction::new(recovered, encoded_len);
+            let pooled = n42_engine_types::N42PooledTransaction::new(recovered, encoded_len);
             reth_transaction_pool::TransactionPool::add_transaction(
                 &node.pool,
                 reth_transaction_pool::TransactionOrigin::Local,

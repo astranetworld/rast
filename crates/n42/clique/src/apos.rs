@@ -7,7 +7,7 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::SealedHeader;
 // reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
-type SealedBlock<B = reth_ethereum_primitives::Block> = reth_primitives_traits::SealedBlock<B>;
+type SealedBlock<B = n42_tx_types::Block> = reth_primitives_traits::SealedBlock<B>;
 use reth_primitives_traits::AlloyBlockHeader;
 use n42_clique_utils::{recover_address_generic, seal_hash, SIGNATURE_LENGTH};
 use reth_primitives_traits::{Header, RecoveredBlock};

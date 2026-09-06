@@ -63,6 +63,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::Bytes;
+use n42_tx_types::{ed25519_batch_size, AltSigSenderCache, AltSigTx, N42PooledTxEnvelope};
+use reth_primitives_traits::Recovered;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -381,6 +383,8 @@ fn spawn_stats_reporter() {
                     chan_us_per_frame = chan_us,
                     acq_us_per_frame = acq_us,
                     spawn_us_per_frame = spawn_us,
+                    altsig_txs = STATS.altsig_txs.load(Ordering::Relaxed),
+                    altsig_batches = STATS.altsig_batches.load(Ordering::Relaxed),
                     "ingest"
                 );
             }
@@ -407,6 +411,7 @@ pub async fn serve<P>(
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
     spawn_stats_reporter();
     spawn_gate_watcher(pool.clone(), std::sync::Arc::clone(&head), high_water(), block_txs_allowance());
@@ -446,6 +451,7 @@ async fn serve_connection<P>(
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
     P::Transaction: 'static,
 {
     let gate = high_water();
@@ -637,6 +643,9 @@ struct IngestStats {
     /// wait for room in the connection's admission channel (`chan_ns`). What
     /// the generator sees as an answer's latency, minus the wire.
     reply_ns: AtomicU64,
+    /// 0x50 transactions verified here, and the batches they went through.
+    altsig_txs: AtomicU64,
+    altsig_batches: AtomicU64,
     gate_ns: AtomicU64,
     chan_ns: AtomicU64,
     /// Waiting for a recovery slot (`acq_ns`), and from the slot granted to
@@ -657,6 +666,8 @@ static STATS: IngestStats = IngestStats {
     chan_ns: AtomicU64::new(0),
     acq_ns: AtomicU64::new(0),
     spawn_ns: AtomicU64::new(0),
+    altsig_batches: AtomicU64::new(0),
+    altsig_txs: AtomicU64::new(0),
 };
 
 
@@ -667,7 +678,7 @@ async fn admit<P>(
 ) -> u32
 where
     P: TransactionPool + 'static,
-    P::Transaction: 'static,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope> + 'static,
 {
     // Decoding and sender recovery are CPU work -- ~50 us of secp256k1 per
     // transaction, so a 10,000-transaction frame is half a second -- and they
@@ -791,15 +802,27 @@ where
 /// exactly two consumers -- devp2p transaction gossip and block import -- and
 /// both recover-or-insert, so on a fleet that runs `--disable-tx-gossip` and
 /// admits over this path, nothing else populates it before import.
+///
+/// 0x50 (Ed25519) transactions are verified together: `N42_ED25519_BATCH`
+/// at a time through the cofactored batch equation (13 us a signature at 64
+/// against 29-63 us of ecrecover on this host), a failed batch retried one
+/// by one. Their senders go to the shared [`AltSigSenderCache`], which the
+/// block import and the engine's payload conversion read.
 fn recover_decoded<P>(
     pooled: Vec<PooledOf<P>>,
     cache: Option<&reth_evm::SenderRecoveryCache>,
 ) -> Vec<P::Transaction>
 where
     P: TransactionPool,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
     let mut recovered = Vec::with_capacity(pooled.len());
+    let mut alt: Vec<N42PooledTxEnvelope> = Vec::new();
     for tx in pooled {
+        if tx.is_alt_sig() {
+            alt.push(tx);
+            continue;
+        }
         let result = match cache {
             Some(cache) => <P::Transaction as PoolTransaction>::try_recover_with_cache(tx, cache),
             None => <P::Transaction as PoolTransaction>::try_recover(tx),
@@ -807,6 +830,44 @@ where
         match result {
             Ok(tx) => recovered.push(tx),
             Err(_) => debug!(target: "n42.tx_ingest", "invalid signature"),
+        }
+    }
+    if alt.is_empty() {
+        return recovered;
+    }
+    if !n42_tx_types::alt_sig_enabled() {
+        debug!(target: "n42.tx_ingest", dropped = alt.len(), "0x50 transactions on a chain that does not enable them");
+        return recovered;
+    }
+    let senders = AltSigSenderCache::global();
+    let mut todo: Vec<N42PooledTxEnvelope> = Vec::with_capacity(alt.len());
+    for tx in alt {
+        match senders.get(tx.hash()) {
+            Some(sender) => recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender))),
+            None => todo.push(tx),
+        }
+    }
+    let batch = ed25519_batch_size();
+    let mut verdicts = Vec::with_capacity(todo.len());
+    for chunk in todo.chunks(batch) {
+        let refs: Vec<&AltSigTx> = chunk
+            .iter()
+            .filter_map(|tx| match tx {
+                N42PooledTxEnvelope::AltSig(tx) => Some(tx),
+                N42PooledTxEnvelope::Eth(_) => None,
+            })
+            .collect();
+        verdicts.extend(n42_tx_types::verify_batch(&refs));
+        STATS.altsig_batches.fetch_add(1, Ordering::Relaxed);
+    }
+    STATS.altsig_txs.fetch_add(todo.len() as u64, Ordering::Relaxed);
+    for (tx, verdict) in todo.into_iter().zip(verdicts) {
+        match verdict {
+            Ok(sender) => {
+                senders.insert(*tx.hash(), sender);
+                recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
+            }
+            Err(err) => debug!(target: "n42.tx_ingest", %err, "invalid 0x50 signature"),
         }
     }
     recovered
