@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rate: Option<f64> = None;
     let mut seconds: Option<u64> = None;
     let mut quiet = false;
+    let mut alg = "secp256k1".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -47,10 +48,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A sustained run prints one line per transaction otherwise, which
             // at any useful rate is its own kind of load.
             "--quiet" => quiet = true,
+            "--alg" => alg = args.next().ok_or("--alg needs secp256k1 or ed25519")?,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
-    let signer: PrivateKeySigner = key.ok_or("--key is required")?.parse()?;
+    let key = key.ok_or("--key is required")?;
+    // `--alg ed25519`: the 32-byte hex key is an Ed25519 seed, the account is
+    // keccak256(0x01 || pubkey)[12..], and the transfers are 0x50 transactions.
+    let ed25519 = match alg.as_str() {
+        "secp256k1" => None,
+        "ed25519" => {
+            let seed: [u8; 32] = alloy_primitives::hex::decode(key.trim_start_matches("0x"))?
+                .try_into()
+                .map_err(|_| "--key for ed25519 must be 32 bytes")?;
+            Some(ed25519_dalek::SigningKey::from_bytes(&seed))
+        }
+        other => return Err(format!("--alg {other}: secp256k1 or ed25519").into()),
+    };
+    let signer: PrivateKeySigner = match &ed25519 {
+        None => key.parse()?,
+        // Unused when signing with Ed25519; any key gives the type.
+        Some(_) => PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(1))?,
+    };
+    let pubkey = ed25519.as_ref().map(|k| alloy_primitives::Bytes::copy_from_slice(k.verifying_key().as_bytes()));
+    let from = match &pubkey {
+        Some(pk) => n42_tx_types::alt_sig::sender_of(n42_tx_types::ALG_ED25519, pk),
+        None => signer.address(),
+    };
     let to: Address = to.ok_or("--to is required")?.parse()?;
     let client = reqwest::blocking::Client::new();
     let call = |method: &str, params: Vec<Value>| -> Result<Value, Box<dyn std::error::Error>> {
@@ -61,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     };
-    let nonce_hex = call("eth_getTransactionCount", vec![json!(signer.address()), json!("pending")])?;
+    let nonce_hex = call("eth_getTransactionCount", vec![json!(from), json!("pending")])?;
     let mut nonce = u64::from_str_radix(nonce_hex.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?;
 
     let started = std::time::Instant::now();
@@ -94,9 +118,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             value: U256::from(1_000_000_000_000_000u64),
             ..Default::default()
         };
-        let signature = signer.sign_hash_sync(&tx.signature_hash())?;
-        let envelope: TxEnvelope = tx.into_signed(signature).into();
-        let raw = alloy_primitives::hex::encode_prefixed(envelope.encoded_2718());
+        let raw = match (&ed25519, &pubkey) {
+            (Some(ed), Some(pk)) => {
+                let alt = n42_tx_types::TxAltSig {
+                    chain_id: tx.chain_id,
+                    nonce: tx.nonce,
+                    max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
+                    max_fee_per_gas: tx.max_fee_per_gas,
+                    gas_limit: tx.gas_limit,
+                    to,
+                    value: tx.value,
+                    input: Default::default(),
+                    access_list: Default::default(),
+                    alg_type: n42_tx_types::ALG_ED25519,
+                    pubkey: pk.clone(),
+                };
+                alloy_primitives::hex::encode_prefixed(alt.sign_ed25519(ed).encoded_2718())
+            }
+            _ => {
+                let signature = signer.sign_hash_sync(&tx.signature_hash())?;
+                let envelope: TxEnvelope = tx.into_signed(signature).into();
+                alloy_primitives::hex::encode_prefixed(envelope.encoded_2718())
+            }
+        };
         match call("eth_sendRawTransaction", vec![json!(raw)]) {
             Ok(hash) => {
                 if !quiet {
