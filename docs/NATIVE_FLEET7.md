@@ -4975,3 +4975,24 @@ and the change is reverted. rayon at 1.6-1.8 cores with it is not worth
 110 ms of the cycle. What remains is the signature work itself -- seven
 recoveries a transaction across the fleet at 48-63 us each under SMT --
 or a host with more physical cores per node.
+
+### loop59: the final configuration, repeated
+
+Pacing 300, 20 slots, run length 64, jemalloc huge pages, the own block by
+header, 48M flood; the parallel follower (P) alternating with the serial
+one (S), one warm-up leg (void):
+
+    leg  follower  win1     cycle    win2     cycle    win3     cycle    3-window total
+    P1   parallel  355,720  0.361 s  341,284  0.441 s  309,600  0.526 s  30.2M
+    S1   serial    364,323  0.417 s  340,999  0.469 s  287,953  0.435 s  29.8M
+    P2   parallel  360,925  0.361 s  342,785  0.345 s  326,690  0.400 s  30.9M
+    S2   serial    364,246  0.411 s  335,764  0.484 s  287,956  0.455 s  29.6M
+    P3   parallel  356,749  0.361 s  333,512  0.345 s  318,195  0.361 s  30.3M
+
+The serial legs agree on window 1 to 0.02% (364,323 / 364,246) and the
+parallel ones to 1.5%; both read the supply. The parallel follower takes
+the round's total up 2-4% (its window 3 is 310-327k against 288k) at a
+0.36 s cycle with 75-80% of each block filled; the serial follower fills
+the block at 0.41 s. On this host that is the number: 356-364k on window
+1, ~30M transactions in three windows, supply-bound with the chain able to
+take ~450k/s.
