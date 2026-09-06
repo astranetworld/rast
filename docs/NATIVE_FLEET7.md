@@ -4951,3 +4951,27 @@ Slots with the parallel follower (loop55, pacing 300):
 The next lever is the signature work itself (seven recoveries per
 transaction across the fleet) or a bigger box; the builder's revm
 bookkeeping (item 2) is off the binding chain for now.
+
+### loop56-58: where a node's CPU goes, and a lookup that must stay parallel
+
+Per-thread CPU of one execution layer over 30 s of the loaded phase
+(`scratchpad/thread-cpu.sh`, loop57T20b: 20 slots, the parallel follower,
+pacing 300, 354,728 / 328,332 / 330,595):
+
+    tokio threads (the 20 recovery slots and the async ingest)   ~20.2 cores
+    rayon (threads named n42: the parallel import, the trie, the sender lookups)   1.9-3.2
+    persistence 0.6   rocksdb 0.5   storage 0.3   engine / builder / receipt root < 0.5
+    total 26.5 of 32 SMT threads on 16 physical cores -- saturated
+
+Recovery is three quarters of the node's CPU, on a node that has no
+spare physical core; that is the fleet's ceiling on this host, 350-365k
+on window 1 with the chain able to cycle at 0.36 s. The one lever left in
+the accounting was the rayon share, and the first attempt at it was
+wrong: the follower's 163,000 sender-cache lookups done serially cost
+153 ms of the import (each get is a DRAM miss on a 500 MB cache; the
+worker pool was hiding the latency, not wasting the CPU) against 35-48 ms
+in parallel, the cycle rose 0.36 -> 0.46 s (loop58T20c 349,681 / 325,988),
+and the change is reverted. rayon at 1.6-1.8 cores with it is not worth
+110 ms of the cycle. What remains is the signature work itself -- seven
+recoveries a transaction across the fleet at 48-63 us each under SMT --
+or a host with more physical cores per node.
