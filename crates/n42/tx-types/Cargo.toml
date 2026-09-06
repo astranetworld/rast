@@ -1,0 +1,30 @@
+[package]
+name = "n42-tx-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "N42 transaction types: reth's Ethereum envelope plus the 0x50 alternative-signature (Ed25519) transaction"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus = { workspace = true, features = ["std", "serde", "secp256k1"] }
+alloy-eips = { workspace = true, features = ["std", "serde"] }
+alloy-primitives = { workspace = true, features = ["std", "serde", "rlp"] }
+alloy-rlp.workspace = true
+alloy-serde.workspace = true
+reth-primitives-traits = { workspace = true, features = ["std", "serde", "reth-codec"] }
+reth-ethereum-primitives = { workspace = true, features = ["std", "serde", "reth-codec"] }
+reth-codecs = { workspace = true, features = ["std", "alloy"] }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "fast", "batch", "zeroize"] }
+serde = { workspace = true, features = ["derive"] }
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+hex.workspace = true

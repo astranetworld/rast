@@ -1,0 +1,30 @@
+threads for parallel rows: 20; samples per scheme: 2048
+
+keccak256 of a 110 B transaction                  0.26 us/op     3780147 op/s/thread   sig     0 B  pk     0 B
+secp256k1 ECDSA recover (libsecp256k1)           29.37 us/op       34045 op/s/thread   sig    65 B  pk     0 B
+secp256k1 ECDSA verify, pk given (libsecp256k1)     25.33 us/op       39482 op/s/thread   sig    64 B  pk    33 B
+secp256k1 ECDSA recover (libsecp256k1) parallel     676160 op/s on 20 threads (29.6 us/op effective per thread)
+secp256k1 ECDSA recover (k256 pure Rust)        135.63 us/op        7373 op/s/thread   sig    65 B  pk     0 B
+secp256k1 Schnorr BIP-340 verify (k256)          56.68 us/op       17644 op/s/thread   sig    64 B  pk    32 B
+P-256 ECDSA verify (p256 pure Rust)             163.59 us/op        6113 op/s/thread   sig    64 B  pk    33 B
+Ed25519 verify (dalek)                           26.34 us/op       37969 op/s/thread   sig    64 B  pk    32 B
+Ed25519 verify_strict (dalek)                    30.10 us/op       33221 op/s/thread   sig    64 B  pk    32 B
+Ed25519 batch verify, per sig (batch 16)         13.28 us/op       75317 op/s/thread
+Ed25519 batch verify, per sig (batch 64)         12.99 us/op       76990 op/s/thread
+Ed25519 batch verify, per sig (batch 256)        10.22 us/op       97849 op/s/thread
+Ed25519 verify (dalek) parallel                  758880 op/s on 20 threads (26.4 us/op effective per thread)
+Ed25519 batch-64 verify parallel (per sig)        25600 op/s on 20 threads (781.2 us/op effective per thread)
+   (the parallel batch row above counts 1 op = 64 signatures; multiply op/s by 64)
+BLS12-381 single verify (blst)                  667.07 us/op        1499 op/s/thread   sig    96 B  pk    48 B
+BLS12-381 aggregate verify per sig (n=64)        20.55 us/op       48669 op/s/thread   (distinct messages, aggregate sig 96 B)
+BLS12-381 aggregate verify per sig (n=256)        8.37 us/op      119472 op/s/thread   (distinct messages, aggregate sig 96 B)
+BLS12-381 fast_aggregate_verify (n=512)         834.78 us total for 512 signers (one message)
+BLS12-381 single verify (blst) parallel           30400 op/s on 20 threads (657.9 us/op effective per thread)
+ML-DSA-44 verify (fips204 pure Rust)             60.69 us/op       16478 op/s/thread   sig  2420 B  pk  1312 B
+ML-DSA-44 verify parallel                        330000 op/s on 20 threads (60.6 us/op effective per thread)
+ML-DSA-65 verify (fips204 pure Rust)             97.72 us/op       10234 op/s/thread   sig  3309 B  pk  1952 B
+Falcon-512 verify (PQClean C, AVX2)              31.31 us/op       31937 op/s/thread   sig   656 B  pk   897 B
+Falcon-512 verify parallel                       639120 op/s on 20 threads (31.3 us/op effective per thread)
+Falcon-512 sign                                 150.08 us/op  (signing, for reference)
+Falcon-1024 verify (PQClean C, AVX2)             60.92 us/op       16416 op/s/thread   sig  1275 B  pk  1793 B
+SLH-DSA-SHAKE-128f verify (fips205)            3447.63 us/op         290 op/s/thread   sig 17088 B  pk    32 B

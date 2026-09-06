@@ -35,6 +35,7 @@ members = [
     "crates/n42/qmdb-reth",
     "crates/n42/tx-ingest",
     "crates/n42/tx-queue",
+    "crates/n42/tx-types",
     "crates/n42/h2-node",
     "crates/n42/mobile-verify",
     "crates/n42/twig-core",
@@ -249,6 +250,7 @@ n42-consensus-traits = {path="crates/n42/consensus-traits"}
 n42-consensus-core = {path="crates/n42/consensus-core"}
 n42-storage = {path="crates/n42/storage"}
 n42-fusaka = {path="crates/n42/fusaka"}
+n42-tx-types = { path = "crates/n42/tx-types" }
 n42-ef-tests = {path="crates/n42/ef-tests"}
 
 blst = "0.3.17"

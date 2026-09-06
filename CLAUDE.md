@@ -123,6 +123,9 @@ lost to direct compaction until the host runs `defrag=defer`. Host rules that ma
 (not `always`: with it the fleet's reads faulted by the million), swap empty, one warm-up leg before
 any leg is read, and `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md` for sharing the box.
 `docs/NATIVE_FLEET7.md` "Where it stands today".
+The next step is scheduled in `docs/ROADMAP_ED25519_TX.md` (an Ed25519 transaction type with batch
+verification to lift the supply bound, then the chain cycle); the research behind it, with a signature
+benchmark for this host, is `docs/SIGNATURE_AND_BATCH_TX_SURVEY.md` and `docs/sigbench/`.
 
 **Never draw a conclusion from one round.** `scripts/fleet7-repeat.sh <n>` runs a
 configuration repeatedly and prints the spread. Measured over three runs: the

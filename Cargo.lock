@@ -3959,6 +3959,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "merlin",
  "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
@@ -7363,6 +7364,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "merlin"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58c38e2799fc0978b65dfff8023ec7843e2330bb462f19198840b34b6582397d"
+dependencies = [
+ "byteorder",
+ "keccak 0.1.6",
+ "rand_core 0.6.4",
+ "zeroize",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8349,6 +8362,26 @@ dependencies = [
  "reth-transaction-pool",
  "revm 42.0.1",
  "tracing",
+]
+
+[[package]]
+name = "n42-tx-types"
+version = "2.1.5"
+dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
+ "alloy-primitives 1.7.1",
+ "alloy-rlp",
+ "alloy-serde 2.4.1",
+ "bytes",
+ "ed25519-dalek",
+ "hex",
+ "reth-codecs",
+ "reth-ethereum-primitives",
+ "reth-primitives-traits",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
