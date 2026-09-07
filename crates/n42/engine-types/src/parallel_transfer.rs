@@ -153,30 +153,24 @@ pub fn partition(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>
 }
 
 /// Groups candidate transfers by sender: every sender's transfers, in
-/// candidate order, form one group. Recipients do not join groups -- a
-/// transfer only adds to its recipient's balance, and additions commute, so
-/// [`rebase`] can fold groups that share a recipient in any order. (Grouping
-/// by connected component, as the follower's [`partition`] does, merges a
-/// full block of random transfers into a handful of giant groups: round 43.)
+/// candidate order, form one group. `keys` is each candidate's (sender,
+/// recipient). Recipients do not join groups -- a transfer only adds to its
+/// recipient's balance, and additions commute, so [`graft_bundles`] can fold
+/// batches that share a recipient in any order. (Grouping by connected
+/// component, as the follower's [`partition`] does, merges a full block of
+/// random transfers into a handful of giant groups: round 43.)
 ///
-/// Returns `Err` when a candidate is not a plain transfer or touches the
-/// beneficiary.
-pub fn partition_by_sender(txs: &[TxEnv], beneficiary: Address) -> Result<Vec<Vec<usize>>, NotParallel> {
+/// Returns `Err` when a candidate touches the beneficiary.
+pub fn partition_by_sender(keys: &[(Address, Address)], beneficiary: Address) -> Result<Vec<Vec<usize>>, NotParallel> {
     let mut group_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
-    group_of.reserve(txs.len() / 8);
+    group_of.reserve(keys.len() / 8);
     let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (i, tx) in txs.iter().enumerate() {
-        let alloy_primitives::TxKind::Call(to) = tx.kind else {
-            return Err(NotParallel::NotATransfer(i));
-        };
-        if !tx.data.is_empty() {
-            return Err(NotParallel::NotATransfer(i));
-        }
-        if tx.caller == beneficiary || to == beneficiary {
+    for (i, (sender, to)) in keys.iter().enumerate() {
+        if *sender == beneficiary || *to == beneficiary {
             return Err(NotParallel::TouchesBeneficiary(i));
         }
         let next = groups.len();
-        let g = *group_of.entry(tx.caller).or_insert(next);
+        let g = *group_of.entry(*sender).or_insert(next);
         if g == next {
             groups.push(Vec::new());
         }
@@ -185,13 +179,32 @@ pub fn partition_by_sender(txs: &[TxEnv], beneficiary: Address) -> Result<Vec<Ve
     Ok(groups)
 }
 
+/// The worker pool the build's batches run on: its own, so that they do not
+/// queue behind the global pool's other jobs (the QMDB root of the block
+/// before, a follower import). `N42_PARALLEL_BUILD_THREADS` threads, 16 by
+/// default.
+pub fn build_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("N42_PARALLEL_BUILD_THREADS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(16);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-build-{i}"))
+            .build()
+            .expect("a thread pool for the parallel build")
+    })
+}
+
 /// One transfer executed for a block being built: its index in the candidate
-/// list, the EVM's result, and the gas it used. Its state changes are in its
-/// batch's bundle ([`BuildRun::bundles`]).
+/// list, the transaction as `convert` produced it, the EVM's result, and the
+/// gas it used. Its state changes are in its batch's bundle
+/// ([`BuildRun::bundles`]).
 #[derive(Debug)]
-pub struct BuiltTransfer {
+pub struct BuiltTransfer<T> {
     /// Index into the candidates.
     pub index: usize,
+    /// The transaction, as `convert` produced it.
+    pub tx: T,
     /// The EVM's result, for the receipt.
     pub result: revm::context::result::ExecutionResult<revm::context::result::HaltReason>,
     /// Gas used.
@@ -199,12 +212,12 @@ pub struct BuiltTransfer {
 }
 
 /// What [`execute_for_build`] produced.
-#[derive(Debug, Default)]
-pub struct BuildRun {
+#[derive(Debug)]
+pub struct BuildRun<T> {
     /// The transfers that executed, in the order they must appear in the
     /// block: batch by batch, sender by sender, each sender in candidate
     /// order.
-    pub executed: Vec<BuiltTransfer>,
+    pub executed: Vec<BuiltTransfer<T>>,
     /// Candidates the transfer path refused (a nonce that is not the
     /// account's, a balance short, a shape it does not take): left for the
     /// serial builder, in candidate order.
@@ -214,6 +227,12 @@ pub struct BuildRun {
     pub bundles: Vec<BundleState>,
     /// Phase timings.
     pub phases: Phases,
+}
+
+impl<T> Default for BuildRun<T> {
+    fn default() -> Self {
+        Self { executed: Vec::new(), skipped: Vec::new(), bundles: Vec::new(), phases: Phases::default() }
+    }
 }
 
 /// Folds bundles that were each computed against the parent's state into
@@ -436,26 +455,29 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
 ///
 /// Returns `Err` when the candidates are not all plain transfers away from
 /// the beneficiary: then the serial builder takes all of them.
-pub fn execute_for_build<G>(
+pub fn execute_for_build<T, G>(
     evm_env: &reth_evm::EvmEnv,
-    txs: &[TxEnv],
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
     open: &(dyn Fn() -> Option<G> + Sync),
-) -> Result<BuildRun, NotParallel>
+) -> Result<BuildRun<T>, NotParallel>
 where
+    T: Send,
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let beneficiary = evm_env.block_env.beneficiary;
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
-    let groups = partition_by_sender(txs, beneficiary)?;
+    let groups = partition_by_sender(keys, beneficiary)?;
     phases.groups = groups.len();
     // Batches of whole groups, about equal in transfers: a couple of
     // thousand transfers each, at most two per worker. Each batch opens its
     // own view of the parent, which is not free.
-    let workers = rayon::current_num_threads().max(1);
-    let wanted = (txs.len() / 2048).clamp(1, workers * 2);
-    let per_batch = txs.len().div_ceil(wanted).max(1);
+    let pool = build_pool();
+    let workers = pool.current_num_threads().max(1);
+    let wanted = (keys.len() / 2048).clamp(1, workers * 2);
+    let per_batch = keys.len().div_ceil(wanted).max(1);
     let mut batches: Vec<Vec<&Vec<usize>>> = Vec::with_capacity(wanted + 1);
     let mut current: Vec<&Vec<usize>> = Vec::new();
     let mut filled = 0usize;
@@ -474,7 +496,7 @@ where
     phases.partition_ms = at.elapsed().as_millis() as u64;
 
     let at = std::time::Instant::now();
-    let results: Vec<Result<(Vec<BuiltTransfer>, Vec<usize>, revm::database::BundleState), NotParallel>> = {
+    let results: Vec<Result<(Vec<BuiltTransfer<T>>, Vec<usize>, BundleState), NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
             .par_iter()
@@ -487,11 +509,15 @@ where
                     let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
                     for group in members {
                         for &i in group.iter() {
-                            match evm.transfer(&txs[i]) {
+                            // Converted here, on the batch's thread: the
+                            // conversion of a full block was 55-100 ms of
+                            // the builder's own thread otherwise.
+                            let (tx, env) = convert(i);
+                            match evm.transfer(&env) {
                                 Ok(Some(out)) => {
                                     let gas_used = out.result.gas_used();
                                     evm.db_mut().commit(out.state);
-                                    done.push(BuiltTransfer { index: i, result: out.result, gas_used });
+                                    done.push(BuiltTransfer { index: i, tx, result: out.result, gas_used });
                                 }
                                 Ok(None) => skipped.push(i),
                                 Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
@@ -503,7 +529,7 @@ where
                 Ok((done, skipped, state.take_bundle()))
             })
             .collect()
-    };
+    });
     phases.groups_ms = at.elapsed().as_millis() as u64;
 
     let mut run = BuildRun { phases, ..Default::default() };
@@ -763,7 +789,8 @@ mod tests {
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
         let evm_env = evm_config.evm_env(block.header()).expect("env");
         let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
-        let run = execute_for_build(&evm_env, &envs, &|| Some(db.clone())).expect("a block of transfers");
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+        let run = execute_for_build(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone())).expect("a block of transfers");
         assert!(run.skipped.is_empty(), "{:?}", run.skipped);
         assert_eq!(run.executed.len(), envs.len());
         assert_eq!(run.phases.groups, 8, "one group per sender");
@@ -897,7 +924,8 @@ mod tests {
             let merge = at.elapsed();
             eprintln!("serial: transfer {in_transfer:?} commit {in_commit:?} merge {merge:?} ({} accounts)", bundle.state.len());
             let at = std::time::Instant::now();
-            let run = execute_for_build(&evm_env, &envs, &|| Some(db.clone())).expect("a block of transfers");
+            let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+            let run = execute_for_build(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone())).expect("a block of transfers");
             let groups = at.elapsed();
             let at = std::time::Instant::now();
             let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();

@@ -626,24 +626,26 @@ where
                 lookahead.push_front(tx);
             }
         } else {
-            let mut consensus: Vec<Option<reth_primitives_traits::Recovered<TransactionSigned>>> =
-                cands.iter().map(|tx| Some(tx.to_consensus())).collect();
-            let envs: Vec<revm::context::TxEnv> = consensus
+            let keys: Vec<(alloy_primitives::Address, alloy_primitives::Address)> = cands
                 .iter()
-                .map(|tx| evm_config.tx_env(tx.as_ref().expect("just built").as_recovered_ref()))
+                .map(|tx| (tx.sender(), tx.transaction.to().unwrap_or_default()))
                 .collect();
+            let convert = |i: usize| {
+                let recovered: reth_primitives_traits::Recovered<TransactionSigned> = cands[i].to_consensus();
+                let env = evm_config.tx_env(recovered.as_recovered_ref());
+                (recovered, env)
+            };
             let parent_hash = parent_header.hash();
             let open = || client.state_by_block_hash(parent_hash).ok().map(StateProviderDatabase::new);
-            match crate::parallel_transfer::execute_for_build(&group_env, &envs, &open) {
+            match crate::parallel_transfer::execute_for_build(&group_env, &keys, &convert, &open) {
                 Ok(run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
                     let fold_at = std::time::Instant::now();
                     // The receipts and the gas, one transfer at a time, with
                     // no state to commit: the state comes in one piece below.
-                    for built in &run.executed {
-                        let i = built.index;
-                        let recovered = consensus[i].take().expect("executed once");
+                    for built in run.executed {
+                        let recovered = built.tx;
                         let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
                         total_fees += U256::from(tip) * U256::from(built.gas_used);
                         cumulative_gas_used += built.gas_used;
@@ -651,7 +653,7 @@ where
                         let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(recovered.inner());
                         builder.executor.commit_transaction(alloy_evm::eth::EthTxResult {
                             result: revm::context::result::ResultAndState {
-                                result: built.result.clone(),
+                                result: built.result,
                                 state: revm::state::EvmState::default(),
                             },
                             blob_gas_used: 0,
