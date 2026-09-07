@@ -590,6 +590,7 @@ where
     let mut par_exec_ms = 0u64;
     let mut par_fold_ms = 0u64;
     let mut par_committed = 0usize;
+    let mut deferred: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> = Vec::new();
     let mut par_reverts: Vec<(alloy_primitives::Address, revm::database::AccountRevert)> = Vec::new();
     if parallel_build() && pulled.is_some() {
         let par_at = std::time::Instant::now();
@@ -691,8 +692,13 @@ where
                     par_part_ms = run.phases.partition_ms;
                     par_exec_ms = run.phases.groups_ms;
                     par_skipped = run.skipped.len();
+                    // Not offered to the serial loop: what the transfer path
+                    // refused it would refuse too, one full validation per
+                    // transaction -- 5.2 s for a block's worth when the
+                    // base fee had run past every candidate's fee (round 43).
+                    // Given back with the leftovers at the end instead.
                     for i in run.skipped {
-                        lookahead.push_back(Arc::clone(&cands[i]));
+                        deferred.push(Arc::clone(&cands[i]));
                     }
                 }
                 Err(why) => {
@@ -933,7 +939,7 @@ where
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
     // Whatever was taken ahead and not built goes back to the queue, last
     // taken first so each is the queue's last and the return is O(1).
-    for pool_tx in lookahead.into_iter().rev() {
+    for pool_tx in lookahead.into_iter().rev().chain(deferred.into_iter().rev()) {
         refuse!(
             &pool_tx,
             InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)

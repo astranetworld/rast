@@ -421,7 +421,13 @@ pub fn graft_bundles<DB: Database>(
 
 /// Appends a graft's reverts to a taken bundle's revert set for the block
 /// (the last one, which the state's merge created; a new one if the merge
-/// found nothing to revert).
+/// found nothing to revert). An account the block touched again after the
+/// graft (a later transaction's sender, a withdrawal's recipient) got a
+/// second revert from the merge, back to the grafted value: that one is
+/// dropped, since the block's revert is to the parent's value, which the
+/// graft's carries -- and two entries for one account in a block's
+/// changeset fail persistence's history index (round 43, `UnsortedInput`).
+/// The set is sorted by address, as the merge leaves it.
 pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
     if reverts.is_empty() {
         return;
@@ -430,8 +436,14 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
         bundle.reverts.push(Vec::new());
     }
     let last = bundle.reverts.len() - 1;
-    bundle.reverts_size += reverts.len();
-    bundle.reverts[last].extend(reverts);
+    let merged = &mut bundle.reverts[last];
+    if !merged.is_empty() {
+        let grafted: alloy_primitives::map::AddressHashSet = reverts.iter().map(|(a, _)| *a).collect();
+        merged.retain(|(address, _)| !grafted.contains(address));
+    }
+    merged.extend(reverts);
+    merged.sort_unstable_by_key(|(address, _)| *address);
+    bundle.reverts_size = bundle.reverts.iter().map(Vec::len).sum();
 }
 
 /// Executes candidate transfers for a block being built, one group per
@@ -508,7 +520,8 @@ where
                 {
                     let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
                     for group in members {
-                        for &i in group.iter() {
+                        let mut rest = group.iter();
+                        for &i in rest.by_ref() {
                             // Converted here, on the batch's thread: the
                             // conversion of a full block was 55-100 ms of
                             // the builder's own thread otherwise.
@@ -519,10 +532,16 @@ where
                                     evm.db_mut().commit(out.state);
                                     done.push(BuiltTransfer { index: i, tx, result: out.result, gas_used });
                                 }
-                                Ok(None) => skipped.push(i),
+                                Ok(None) => {
+                                    // The sender's later transfers would only
+                                    // fail their nonce check: skipped unrun.
+                                    skipped.push(i);
+                                    break;
+                                }
                                 Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
                             }
                         }
+                        skipped.extend(rest.copied());
                     }
                 }
                 state.merge_transitions(BundleRetention::Reverts);
@@ -855,6 +874,50 @@ mod tests {
         for (address, revert) in &theirs {
             assert_eq!(ours.get(address), Some(revert), "revert {address}");
         }
+    }
+
+    /// An account the block touches again after the graft -- here a sender
+    /// that a later, serially executed transfer debits -- keeps one revert
+    /// in the block's set, the graft's, to the parent's value.
+    #[test]
+    fn a_later_touch_of_a_grafted_account_keeps_the_grafts_revert() {
+        let (block, db) = fixture(3, 2);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(block.header()).expect("env");
+        let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+        // Graft all but the last transfer; run the last one serially after.
+        let n = envs.len() - 1;
+        let run = execute_for_build(&evm_env, &keys[..n], &|i| ((), envs[i].clone()), &|| Some(db.clone())).expect("transfers");
+        assert_eq!(run.executed.len(), n);
+        let beneficiary = evm_env.block_env.beneficiary;
+        let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+        let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+        let last = &envs[n];
+        let sender = last.caller;
+        let grafted_sender = state.cache.accounts.get(&sender).and_then(|a| a.account.as_ref()).map(|a| a.info.clone()).expect("the sender was grafted");
+        {
+            let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+            let out = evm.transfer(last).unwrap().expect("a transfer");
+            evm.db_mut().commit(out.state);
+        }
+        state.merge_transitions(BundleRetention::Reverts);
+        let mut bundle = state.take_bundle();
+        // Before the append: the merge's revert for the sender, to the grafted value.
+        let merged: Vec<_> = bundle.reverts[0].iter().filter(|(a, _)| *a == sender).collect();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].1.account, revm::database::states::reverts::AccountInfoRevert::RevertTo(grafted_sender));
+        append_reverts(&mut bundle, graft.reverts);
+        let reverts: Vec<_> = bundle.reverts[0].iter().filter(|(a, _)| *a == sender).collect();
+        assert_eq!(reverts.len(), 1, "one revert for the sender");
+        let parent = db.clone().basic(sender).unwrap().unwrap();
+        assert_eq!(reverts[0].1.account, revm::database::states::reverts::AccountInfoRevert::RevertTo(parent));
+        let mut addresses: Vec<Address> = bundle.reverts[0].iter().map(|(a, _)| *a).collect();
+        let sorted = { let mut v = addresses.clone(); v.sort(); v };
+        assert_eq!(addresses, sorted, "sorted by address");
+        addresses.dedup();
+        assert_eq!(addresses.len(), bundle.reverts[0].len(), "no account twice");
+        assert_eq!(bundle.reverts_size, bundle.reverts[0].len());
     }
 
     /// A full bench-tier block (163,000 transfers, 6,000 senders, recipients
