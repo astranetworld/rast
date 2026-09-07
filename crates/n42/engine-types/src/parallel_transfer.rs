@@ -214,9 +214,8 @@ pub struct BuiltTransfer<T> {
 /// What [`execute_for_build`] produced.
 #[derive(Debug)]
 pub struct BuildRun<T> {
-    /// The transfers that executed, in the order they must appear in the
-    /// block: batch by batch, sender by sender, each sender in candidate
-    /// order.
+    /// The transfers that executed, in candidate order, which is the order
+    /// they take in the block.
     pub executed: Vec<BuiltTransfer<T>>,
     /// Candidates the transfer path refused (a nonce that is not the
     /// account's, a balance short, a shape it does not take): left for the
@@ -559,6 +558,11 @@ where
         run.bundles.push(bundle);
     }
     run.skipped.sort_unstable();
+    // Candidate order, as the serial builder would have laid the block out
+    // (each sender's transfers were run in that order, and the graft does
+    // not care): round 43's followers imported a sender-grouped block 35%
+    // slower than the serial builder's.
+    run.executed.sort_unstable_by_key(|built| built.index);
     Ok(run)
 }
 
