@@ -411,6 +411,41 @@ fn main() {
                                     warn!(target: "reth::cli", behind, "canonical subscriber lag: queue pruner");
                                 }
                                 let started = std::time::Instant::now();
+                                // A reorg: the reverted blocks' transactions are
+                                // nowhere else -- with the direct ingest the queue
+                                // is their only holder -- so those the new chain
+                                // does not carry are offered again, before the new
+                                // chain's prune (which then removes any the new
+                                // chain mined at a higher nonce). Without this the
+                                // affected senders' lanes started at a nonce ahead
+                                // of the chain and every leader refused them:
+                                // half-empty blocks for the rest of the leg
+                                // (round 43).
+                                if let reth_provider::CanonStateNotification::Reorg { old, new } = &notification {
+                                    use alloy_consensus::transaction::TxHashRef as _;
+                                    use reth_transaction_pool::PoolTransaction as _;
+                                    let carried: std::collections::HashSet<alloy_primitives::B256> = new
+                                        .blocks_iter()
+                                        .flat_map(|b| b.body().transactions().map(|tx| *tx.tx_hash()))
+                                        .collect();
+                                    let mut back: Vec<n42_engine_types::N42PooledTransaction> = Vec::new();
+                                    let mut reverted_blocks = 0usize;
+                                    for block in old.blocks_iter() {
+                                        reverted_blocks += 1;
+                                        for (sender, tx) in block.transactions_with_sender() {
+                                            if carried.contains(tx.tx_hash()) {
+                                                continue;
+                                            }
+                                            let recovered = reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender);
+                                            if let Ok(pooled) = n42_engine_types::N42PooledTransaction::try_from_consensus(recovered) {
+                                                back.push(pooled);
+                                            }
+                                        }
+                                    }
+                                    let offered = back.len();
+                                    queue.push(back);
+                                    warn!(target: "n42.tx_queue", reverted_blocks, offered, new_blocks = new.blocks_iter().count(), "reorg: the reverted blocks' transactions are offered again");
+                                }
                                 let mut mined = 0usize;
                                 for (_, block) in notification.committed().blocks_iter().map(|b| (b.number(), b)) {
                                     let pairs: Vec<(alloy_primitives::Address, u64)> = block
