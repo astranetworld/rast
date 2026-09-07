@@ -109,7 +109,16 @@ block's cycle goes — run at the END of a round and compare whole rounds only)
 and `scripts/fleet7-profile.sh` (perf between windows; `--alloc` for jemalloc
 heap profiles, the instrument a CPU profile cannot replace).
 
-**Record (2026-09-07, round 41, Ed25519 0x50 transactions): 396,601 / 342,288 TPS** (loop65C2, every block full at a 0.411 s cycle; 385,742 on loop65C3; the record configuration below plus `F7_FLOOD_ALG=ed25519 N42_ALTSIG_SENDER_CACHE=4194304 N42_ED25519_BATCH=128`, see `docs/NATIVE_FLEET7.md` rounds 40-41). Previous secp256k1 record (2026-09-05, round 39): 365,399 / 343,885 TPS (win1/win2 of loop53Q300a at pacing 300,
+**Round 43 (2026-09-07) found that the flood's ingest path had every worker's senders paying the same
+recipients: a "full" 163k block touched ~13,000 accounts, so every number below through round 42 was
+measured on that shape (fixed in ab3c79240; `docs/NATIVE_FLEET7.md` round 43). With the flood fixed a full
+block touches ~147,000 accounts and the fleet reads 163-168k TPS at a 0.97-1.0 s cycle with the round-41
+configuration, ~200k at 0.8 s with `N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1` (the leader's transfers in
+parallel per-sender batches grafted onto the block's state; the follower's groups grafted the same way;
+both off by default, both bookended: 201-206k against 172-182k). The follower's import (622-657 ms:
+QMDB root 190, hashed 75, convert 55, execution 183-224) is the cycle; a stall near block 200-222 under
+load and the queue's reorg handling are open (tasks #8, #11).**
+**Previous record (2026-09-07, round 41, Ed25519 0x50 transactions, 13k-recipient blocks): 396,601 / 342,288 TPS** (loop65C2, every block full at a 0.411 s cycle; 385,742 on loop65C3; the record configuration below plus `F7_FLOOD_ALG=ed25519 N42_ALTSIG_SENDER_CACHE=4194304 N42_ED25519_BATCH=128`, see `docs/NATIVE_FLEET7.md` rounds 40-41). Previous secp256k1 record (2026-09-05, round 39): 365,399 / 343,885 TPS (win1/win2 of loop53Q300a at pacing 300,
 0.423 s cycle; pacing 350 reads 357k twice, 400 reads 349-353k; the same legs without huge pages for
 the heap 310k / 293k) with the round-39 configuration plus `N42_TX_INGEST_RECOVER_PARALLEL=20
 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always N42_FOLLOWER_PARALLEL=1 TOKIO_WORKER_THREADS=8

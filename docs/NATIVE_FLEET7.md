@@ -188,6 +188,145 @@ to decide 10-13 ms. The leader path is the long pole -- the same as the
 roadmap's 3A: the builder executes serially where the follower already
 runs 44 groups in parallel.
 
+## Round 43: the parallel builder, and the flood that paid 13,000 recipients (2026-09-07)
+
+Roadmap 3A: the leader executes a block's transfers in parallel instead of
+serially. Four versions were needed, each measured on the fleet, and the
+measurement found a defect in the flood that every earlier round ran on.
+
+**The builder.** `N42_PARALLEL_BUILD=1` (`payload.rs`, `parallel_transfer::
+execute_for_build`, `graft_bundles`, `append_reverts`):
+
+- v1 (f6d329b32) grouped by connected component, as the follower does, and
+  committed each transfer's state into the builder's `State`. Slower than
+  serial: 292-342 ms against 192 for a full block (loop67W). A block of
+  random transfers is ~9 giant components; and the microbenchmark
+  `bench_build_run` (163,000 transfers, 6,000 senders) split the serial
+  transfer path into 112 ms of execution, 110 ms of per-transaction commits
+  and 55 ms of transition merge -- half the cost is revm's `State`.
+- v2 (b8da4fdb5) groups by sender only (a transfer only adds to its
+  recipient; additions commute) and grafts each batch's bundle straight
+  into the builder's cache and bundle, adding accounts two batches touched
+  and taking the few the block already holds through a commit; reverts
+  join the block's set once the bundle is taken. Microbenchmark: 105 ms
+  parallel + 71 graft + 8 merge against 245 serial.
+- v3 (7278d982a) converts the pool transactions on the batch threads
+  (55-100 ms of the builder's thread otherwise) and runs the batches on
+  their own 16-thread pool (`N42_PARALLEL_BUILD_THREADS`): on the fleet the
+  batches had queued behind the global pool (execution 25-466 ms a block).
+- Fixes from the legs (a9659d38f, 221a4e809): an account the block touched
+  again after the graft (a later sender, a withdrawal) got a second revert
+  from the merge, and two changeset entries for one account in one block
+  fail persistence's history index (`UnsortedInput`) -- a leader died
+  mid-round; the merge's revert is dropped for the graft's. When the base
+  fee had run past every candidate's fee the batches skipped all 163,000
+  and the serial loop then refused each with a full validation (5.2 s
+  builds of empty blocks); a sender's group now stops at its first refusal
+  and skipped candidates go back to the queue. The block is laid out in
+  candidate order.
+
+The equivalence test `build_run_matches_serial` compares the grafted
+bundle with the serial executor's account by account, originals, statuses
+and reverts included.
+
+**On the fleet (2,000,000-recipient flood, round-41 configuration), the
+builder's full-block build went from a 285 ms median (loop65C2) to 220-243
+ms, and the chain's cycle from 0.405-0.417 s to 0.375-0.400 s -- and TPS did
+not move:**
+
+    loop70  P1 398,821 / 293,618 / 215,970   S1 401,905 / 347,722 / 232,312
+            P2 393,518 / 323,736 / 247,261   S2 402,040 / 353,151 / 233,623
+            P3 403,370 / 314,040 / 271,494
+    loop71  P1 397,620 / 275,916 / 255,838   S1 396,616 / 331,421 / 238,113   (candidate order)
+            P2 398,573 / 344,517 / 190,457   S2 391,162 / 274,544 / 282,522
+            P3 405,593 / 307,646 / 266,222
+
+Window 1 equal within the spread (P 394-406k, S 391-402k) at a shorter
+cycle but 92-98% occupancy; window 2 lower by up to 10%. Two reasons, both
+measured: every execution layer is at 27 of its 32 cores under the flood
+(19 of them tokio threads doing ingest and Ed25519 verification), so the
+batches get what is left; and the followers imported a parallel-built
+block in 332 ms against 244 (execution 129 against 85, merge 59 against
+28, senders 52 against 38). The second was traced to the blocks
+themselves: a parallel-built block touched 24,000 distinct recipients, a
+serial-built one 13,000, with the same 376-392 senders in runs of 64.
+
+**The flood.** 163,000 transfers to 13,000 recipients is not the shape the
+harness claims (`recipient()` is documented as writing 163,000 accounts a
+block). The ingest path derived a transfer's recipient from the sender's
+index within the worker's own part, not the global index the JSON-RPC
+path uses, so the 64 workers' senders at one local index paid the same
+recipients at the same nonces. Fixed in ab3c79240; `blockmix.py` on a
+live block reads 141,000 distinct recipients now. **Every number through
+round 42 -- the 365k and 396k records included -- was measured on blocks
+that touched ~13,000 recipients**, and the follower's import, the roots
+and persistence all scale with the accounts a block touches. (A prime
+recipient spread, loop72, changed nothing: the multiplicative hash is a
+bijection either way.)
+
+With the flood fixed, the serial builder's first legs (loop73 W/S1) read
+114-168k TPS at a 0.97-1.43 s cycle, every block full. A full block is now
+`created=14,196 updated=132,803`; the leader's build is 1,054 ms (serial
+execution 336, finish 338, assemble 35 with a 191 ms QMDB root) and a
+follower's import 736 ms (execution 349 in 212 groups of which the merge
+into the block's state is 265, root 170, hashed 73, convert 46, senders
+33). That is the chain's honest cycle at 163,000 scattered transfers, and
+the parallel builder and the follower's fold are now measured against it
+(loop73, and `N42_FOLLOWER_GRAFT=1`, 344e598d2, which grafts the
+follower's groups the way the builder does).
+
+**loop73, the fixed flood, serial against parallel builder (S-P-S-P-S after a
+warm-up):**
+
+    leg  builder   win1     cycle    win2     cycle    win3     cycle
+    S1   serial    168,426  0.968 s  108,630  1.501 s   92,308  1.766 s
+    P1   parallel  166,620  0.968 s   94,490  0.811 s  120,567  0.698 s  (occupancy 99 / 47 / 52%)
+    S2   serial    162,994  1.000 s  119,142  1.154 s   76,047  2.143 s
+    P2   parallel  168,428  0.968 s  126,500  0.652 s   51,746  1.486 s  (occupancy 100 / 51 / 47%)
+    S3   serial    162,994  1.000 s  114,078  1.429 s   86,892  1.876 s
+
+Window 1 is the same with either builder (163-168k at 0.97-1.00 s): the
+leader's build is 537 ms parallel against 1,054 serial, and the cycle does
+not move because the follower's import is 736-759 ms. The parallel legs'
+later windows are half-empty blocks after a stall: node0's commits ran
+219, 221, 222 at 14:57:02 and then nothing until 223 at 14:57:14, three
+leaders' builds took 3.3 s at once, a view change followed and block 224
+was committed twice. From then on every leader's batches skipped 92-100%
+of their candidates for the transfer path's reason 6 (the sender's nonce
+is not the state's) while the pool sat at its cap and the flood stalled:
+the queue had pruned the orphaned block's transactions as mined and never
+got them back. The serial legs did not reach block 220 inside their
+windows. Two defects, neither the builder's: the stall near block 200-222
+(the same height as round 40's halts; task #8) and the queue's reorg
+handling (task #11).
+
+**loop74, the follower's fold grafted (`N42_FOLLOWER_GRAFT=1`), parallel
+builder on in every leg, G-N-G-N-G:**
+
+    leg  follower   win1     cycle    win2     cycle    win3     cycle
+    G1   grafted    201,025  0.811 s  152,044  1.072 s  152,041  1.072 s
+    N1   committed  181,543  0.882 s  116,759  1.251 s      200  (halt at block 207, 23 view timeouts)
+    G2   grafted    206,423  0.769 s   81,453  2.001 s  157,510  1.035 s
+    N2   committed  172,053  0.938 s  138,293  0.910 s   84,486  1.765 s
+    G3   grafted    201,025  0.811 s  135,793  1.200 s   59,169  0.857 s  (occupancy 31% in window 3)
+
+**Window 1: 201-206k grafted against 172-182k committed, +14-17% over two
+bookends**, every block full at 0.77-0.81 s. A follower's full-block import
+is 622-657 ms grafted (execution 183-224 of which merge 80-89, root 187-190,
+hashed 74, convert 54-59, senders 35) against 1,054 (merge 417) in N2 and
+736-759 in loop73's legs. What is left of the follower's import is the QMDB
+root (190), the hashed post-state (75), the body convert (55-59) and the
+execution's partition and groups (42 + 43-71). The later windows in both
+directions carry the block-200 stall and its aftermath, and are not read.
+
+Where round 43 leaves the fleet at 163,000 scattered transfers a block:
+**~200k TPS at a 0.8 s cycle with the parallel builder and the grafted
+follower, both off by default (`N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1`)**;
+the leader's build 700 ms of which finish 371 (the state root machinery of
+147,000 accounts) and its own import ~10; the follower's import 622-657.
+The 396k of round 41 stands as the number for a flood that paid 13,000
+recipients a block and is not comparable.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
