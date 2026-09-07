@@ -467,8 +467,11 @@ impl DatabaseEnv {
         inner_env.set_flags(EnvironmentFlags {
             mode,
             // We disable readahead because it improves performance for linear scans, but
-            // worsens it for random access (which is our access pattern outside of sync)
-            no_rdahead: true,
+            // worsens it for random access (which is our access pattern outside of sync).
+            // N42: `N42_MDBX_READAHEAD=1` turns it back on -- under memory pressure the
+            // engine thread refaults the map one 4 KB page at a time (round 43), and a
+            // readahead cluster per fault is the alternative worth measuring.
+            no_rdahead: std::env::var("N42_MDBX_READAHEAD").map_or(true, |v| v != "1"),
             coalesce: true,
             exclusive: args.exclusive.unwrap_or_default(),
             ..Default::default()
