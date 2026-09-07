@@ -583,6 +583,36 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    execute_transfers_with(evm_config, block, main_db, open, follower_graft())
+}
+
+/// Whether `N42_FOLLOWER_GRAFT=1` is set: the follower folds the groups'
+/// bundles into the block's state with [`graft_bundles`] instead of one
+/// commit of the folded changes (round 43: the commit and its transition
+/// merge were 265 ms of a 736 ms import of a block touching 147,000
+/// accounts).
+pub fn follower_graft() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT").is_ok_and(|v| v == "1"))
+}
+
+/// [`execute_transfers`] with the fold chosen by the caller: `graft` folds
+/// the groups' bundles with [`graft_bundles`], otherwise they are folded
+/// with [`fold_bundles`] and committed.
+pub fn execute_transfers_with<EvmConfig, DB, G>(
+    evm_config: &EvmConfig,
+    block: &RecoveredBlock<Block>,
+    main_db: DB,
+    open: &(dyn Fn() -> Option<G> + Sync),
+    graft: bool,
+) -> Result<Result<(BlockExecutionOutput<Receipt>, Phases), NotParallel>, BlockExecutionError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory>,
+    DB: Database + std::fmt::Debug,
+    DB::Error: Send + Sync + 'static,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let mut phases = Phases::default();
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let beneficiary = evm_env.block_env.beneficiary;
@@ -662,10 +692,16 @@ where
     // The groups' changes, as deltas on whatever the main state holds now:
     // an account a reward reached and a transfer touched gets both.
     let at = std::time::Instant::now();
-    let (mut changes, beneficiary_delta) = fold_bundles(&mut state, &bundles, beneficiary)
-        .map_err(|e| BlockExecutionError::other(std::io::Error::other(e.to_string())))?;
+    let err = |e: &dyn std::fmt::Display| BlockExecutionError::other(std::io::Error::other(e.to_string()));
+    let (mut changes, beneficiary_delta, grafted) = if graft {
+        let grafted = graft_bundles(&mut state, bundles, beneficiary).map_err(|e| err(&e))?;
+        (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
+    } else {
+        let (changes, delta) = fold_bundles(&mut state, &bundles, beneficiary).map_err(|e| err(&e))?;
+        (changes, delta, None)
+    };
     if !beneficiary_delta.is_zero() {
-        let current = state.basic(beneficiary).map_err(|e| BlockExecutionError::other(std::io::Error::other(e.to_string())))?;
+        let current = state.basic(beneficiary).map_err(|e| err(&e))?;
         let existed = current.is_some();
         let mut merged = current.unwrap_or_default();
         merged.balance = merged.balance.saturating_add(beneficiary_delta);
@@ -676,9 +712,14 @@ where
         }
         changes.insert(beneficiary, acc);
     }
-    state.commit(changes);
+    if !changes.is_empty() {
+        state.commit(changes);
+    }
     state.merge_transitions(BundleRetention::Reverts);
-    let bundle = state.take_bundle();
+    let mut bundle = state.take_bundle();
+    if let Some(reverts) = grafted {
+        append_reverts(&mut bundle, reverts);
+    }
     phases.merge_ms = at.elapsed().as_millis() as u64;
 
     // Receipts in block order, gas cumulated.
@@ -776,10 +817,19 @@ mod tests {
 
     #[test]
     fn parallel_matches_serial() {
+        parallel_matches_serial_with(false);
+    }
+
+    #[test]
+    fn parallel_matches_serial_with_the_graft() {
+        parallel_matches_serial_with(true);
+    }
+
+    fn parallel_matches_serial_with(graft: bool) {
         let (block, db) = fixture(8, 6);
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
-        let (parallel, phases) = execute_transfers(&evm_config, &block, db.clone(), &|| Some(db.clone()))
+        let (parallel, phases) = execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft)
             .expect("no execution error")
             .expect("the block qualifies");
         assert!(phases.groups >= 1);
