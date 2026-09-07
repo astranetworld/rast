@@ -380,6 +380,35 @@ never return them) is not an option on this box: the seven heaps reached
 seconds), `MDBX_NORDAHEAD` off for this workload, and freeing the tmpfs.
 Task #8 closes as diagnosed; the fix is memory policy, not a lock.
 
+loop81 tried the two obvious knobs, bookended by the thp:always baseline
+(parallel builder and follower graft on, 2M-recipient fixed flood):
+
+    leg   change                                                   win1     win2     win3     total   fleet majflt  MemAvailable min
+    RA1   N42_MDBX_READAHEAD=1                                     173,379  117,288   21,839   8.72M  0.31M         40 GB
+    T1e   -                                                        195,592  146,622  152,046  14.83M  6.29M         31 GB
+    BG1   MALLOC_CONF=thp:always,background_thread:true,           201,024  152,055  157,461  15.32M  7.13M         28 GB
+          dirty_decay_ms:20000,muzzy_decay_ms:0
+    RA2   N42_MDBX_READAHEAD=1                                     184,643  104,235   11,912   8.67M  0.20M         50 GB
+    T1f   -                                                        195,592  152,101  152,092  15.00M  6.50M         31 GB
+    BG2   (as BG1)                                                 201,025   52,740  116,785  11.12M  3.02M         35 GB
+
+- **Readahead is a loss**: twenty times fewer major faults (each fault now
+  pulls a cluster) but 6-11% less on window 1 and both legs' later windows
+  collapse -- the clusters are IO volume into a cache that is being
+  emptied, and readahead stays off (the knob remains for a box with the
+  cache to hold it).
+- **Background purging with a 20 s decay reads +3% on window 1 both
+  times** (201k against 196k) and keeps the heaps bounded (MemAvailable
+  never under 28 GB), but one leg in two still loses a window (BG2's
+  window 2 at 2.1 s cycles). Not adopted on that evidence; the storm is
+  not a purging-cadence problem.
+
+What would actually remove the storm is less to reclaim: the tmpfs
+(27-34 GB of other drivers' leftovers under /tmp), the seven heaps'
+huge-page appetite (a 4 KB heap on the followers only, keeping the
+leader's speed, is untried), or a box with the memory to hold seven
+execution layers' files.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
