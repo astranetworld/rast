@@ -36,6 +36,7 @@ pub mod consensus_ext;
 pub mod engine_ext;
 pub mod follower_import;
 pub mod payload_serve;
+pub mod stacks;
 
 /// Re-exported utils.
 pub mod utils {

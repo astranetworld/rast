@@ -294,22 +294,29 @@ fn main() {
                 }
             }
 
-            // A watchdog for the direct import: a block that has been importing
-            // for six seconds is a stuck node, and the stages of the import and
-            // of any build running beside it are the first thing to know.
-            std::thread::Builder::new().name("n42-watchdog".into()).spawn(|| {
-                let mut last = (0u64, std::time::Instant::now());
+            // A watchdog for the direct import and the build: a block that
+            // has been importing, or a payload that has been building, for six
+            // seconds is a stuck node, and the stages of both are the first
+            // thing to know. With `N42_WATCHDOG_STACKS=1` every thread's stack
+            // follows (see `stacks`; symbols need `--profile profiling`).
+            let dump_stacks = std::env::var("N42_WATCHDOG_STACKS").is_ok_and(|v| v == "1");
+            if dump_stacks {
+                n42::stacks::install();
+            }
+            std::thread::Builder::new().name("n42-watchdog".into()).spawn(move || {
+                let mut last = ((0u64, 0u64), std::time::Instant::now());
+                let mut dumped_at = (0u64, 0u64);
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     let import = n42::follower_import::IMPORT_STAGE.load(std::sync::atomic::Ordering::Relaxed);
-                    if import != last.0 {
-                        last = (import, std::time::Instant::now());
-                        continue;
-                    }
-                    if import == 0 || last.1.elapsed() < std::time::Duration::from_secs(6) {
-                        continue;
-                    }
                     let build = n42_engine_types::BUILD_STAGE.load(std::sync::atomic::Ordering::Relaxed);
+                    if (import, build) != last.0 {
+                        last = ((import, build), std::time::Instant::now());
+                        continue;
+                    }
+                    if (import == 0 && build == 0) || last.1.elapsed() < std::time::Duration::from_secs(6) {
+                        continue;
+                    }
                     tracing::warn!(
                         target: "n42.watchdog",
                         stuck_secs = last.1.elapsed().as_secs(),
@@ -317,8 +324,15 @@ fn main() {
                         import_stage = n42::follower_import::IMPORT_STAGES[(import & 0xff) as usize % 8],
                         build_parent = build >> 8,
                         build_stage = n42_engine_types::BUILD_STAGES[(build & 0xff) as usize % 8],
-                        "direct import has not progressed",
+                        "the import or the build has not progressed",
                     );
+                    // One dump per stall: the same stages stuck again six
+                    // seconds later are the same stall.
+                    if dump_stacks && dumped_at != (import, build) {
+                        dumped_at = (import, build);
+                        let answered = n42::stacks::dump_all(std::time::Duration::from_millis(300));
+                        tracing::warn!(target: "n42.watchdog", answered, "thread stacks written to stderr");
+                    }
                     last.1 = std::time::Instant::now();
                 }
             }).ok();
