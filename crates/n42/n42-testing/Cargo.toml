@@ -77,6 +77,7 @@ alloy-contract.workspace = true
 alloy-rpc-types-beacon.workspace = true
 
 [dev-dependencies]
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "fast"] }
 reth.workspace = true
 reth-chainspec.workspace = true
 reth-db.workspace = true
