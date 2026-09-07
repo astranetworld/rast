@@ -92,6 +92,13 @@ python3 scripts/chainmix.py evm  https://bsc-rpc.publicnode.com 163000
 python3 scripts/chainmix.py tron https://api.trongrid.io/wallet/getblockbynum 163000
 ```
 
+The bench keeps the pre-round-43 shape as a knob for comparison:
+`F7_FLOOD_LEGACY_RECIPIENTS=1` (`tx_flood --legacy-recipients`) indexes the
+ingest path's recipients by the worker-local sender index again, so a full
+block touches ~13,000 accounts instead of ~147,000; `F7_RECIPIENTS=<n>`
+sets the spread the fixed flood draws recipients from (1 = a single sink
+account, 20,000, 100,000, ... 2,000,000).
+
 The script prints checkpoints at 10k, 25k, 50k, 100k and 163k transactions,
 so a rate-limited endpoint still yields a partial row. Ethereum and BNB take
 15-80 s; TronGrid without an API key takes about 15 minutes.

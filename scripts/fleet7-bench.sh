@@ -63,6 +63,8 @@ SHARD=
 # It also makes parallel execution measurable at all: every transfer paying the
 # same account is a write-write conflict on every transfer.
 RECIPIENTS=${F7_RECIPIENTS:-2000000}
+# F7_FLOOD_LEGACY_RECIPIENTS=1: the pre-round-43 recipient indexing (a full block touches
+# ~13,000 accounts instead of ~147,000), kept for comparison with the earlier rounds.
 
 while (( $# )); do
   case $1 in
@@ -346,7 +348,7 @@ fi
 if [[ $F7_PRECREATE == 1 ]]; then
   PRE_START=$SECONDS
   $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
-    "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
+    "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" ${F7_FLOOD_LEGACY_RECIPIENTS:+--legacy-recipients} \
     --senders 6000 --pertx 500 --offset $((OFFSET + 500000)) --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
     --conc "$CONC" --rpcbatch "$RPCBATCH" \
     > "$OUT/precreate.log" 2>&1 < /dev/null 9>&- || { echo "REFUSING: the precreate flood failed; see $OUT/precreate.log"; exit 1; }
@@ -384,7 +386,7 @@ for ((fp = 0; fp < FLOOD_PROCS; fp++)); do
   fp_conc=$(( CONC / FLOOD_PROCS )); (( fp_conc < 1 )) && fp_conc=1
   fp_log=$OUT/flood.log; (( fp > 0 )) && fp_log=$OUT/flood-$fp.log
   setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
-    "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
+    "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" ${F7_FLOOD_LEGACY_RECIPIENTS:+--legacy-recipients} \
     --senders "$fp_senders" --pertx "$PERTX" --offset "$fp_offset" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
     --conc "$fp_conc" --rpcbatch "$RPCBATCH" ${F7_FLOOD_WINDOW:+--window "$F7_FLOOD_WINDOW"} $SHARD \
     ${F7_FLOOD_ALG:+--alg "$F7_FLOOD_ALG"} \

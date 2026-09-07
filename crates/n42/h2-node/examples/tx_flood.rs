@@ -122,6 +122,13 @@ struct Args {
     /// says whether a node's answers or its own signing bound it.
     window: usize,
     shard_senders: bool,
+    /// `--legacy-recipients`: derive the ingest path's recipients from the
+    /// sender's index within the worker's part, as every round through 42
+    /// did (round 43 found it: the 64 workers' senders at one local index
+    /// paid the same recipients at the same nonces, so a full block of
+    /// 163,000 transfers touched ~13,000 accounts). Kept as a knob so that
+    /// shape can be reproduced next to the real one.
+    legacy_recipients: bool,
     skip_funding: bool,
     /// How many distinct recipients the transfers are spread over. 1 keeps the
     /// old single-sink shape.
@@ -443,7 +450,8 @@ fn flood_over_ingest(
             // 43, after every round through 42 had measured that shape).
             batch.extend(
                 (from..upto).map(|n| {
-                    let to = recipient(args.recipients, (first_sender + index) as u64 * args.per_tx + n);
+                    let base = if args.legacy_recipients { 0 } else { first_sender };
+                    let to = recipient(args.recipients, (base + index) as u64 * args.per_tx + n);
                     signed_raw(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
                 }),
             );
@@ -835,6 +843,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         rpc_batch: 100,
         window: 32,
         shard_senders: false,
+        legacy_recipients: false,
         skip_funding: false,
         ingest: Vec::new(),
         ingest_all: false,
@@ -860,6 +869,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--ingest-all" => args.ingest_all = true,
             "--recipients" => args.recipients = next()?.parse()?,
             "--shard-senders" => args.shard_senders = true,
+            "--legacy-recipients" => args.legacy_recipients = true,
             "--skip-funding" => args.skip_funding = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -892,6 +902,8 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --conc <n>          concurrent submitters (default 32)
   --rpcbatch <n>      transactions per JSON-RPC batch, 1-200 (default 100)
   --shard-senders     pin each sender to one node (cold-follower path)
+  --legacy-recipients     ingest path: recipients by the worker-local sender index (the
+                          pre-round-43 shape, ~13,000 accounts a full block), for comparison
   --alg <secp256k1|ed25519>  signature scheme of the senders (default secp256k1; ed25519 sends 0x50 transactions)
   --skip-funding      the senders are already funded
 ";
