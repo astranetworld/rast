@@ -327,6 +327,59 @@ the leader's build 700 ms of which finish 371 (the state root machinery of
 The 396k of round 41 stands as the number for a flood that paid 13,000
 recipients a block and is not comparable.
 
+### Round 43, continued: what the "block-200 stall" is (2026-09-07, loop75-78)
+
+The stall recurs at blocks ~190-225 in every configuration that reaches
+that height under the flood (round 40's halts at 222, loop73 P2, loop74 N1,
+loop75 D1-D3, loop77 T1a, loop78 T1c). Three runs with profiling binaries
+and the watchdog dumping thread stacks (`N42_WATCHDOG_STACKS=1`) never
+fired: the execution layer is not stuck. The validators are: several
+bodies "did not arrive within the grace", 4-23 view timeouts a node, a view
+change, and -- because the leader schedule is a tenure of 16 views -- up to
+16 timed-out views before the fleet moves on (N1: 15 s "cycle", the chain
+at block 207 for the rest of the window). Afterwards the queue has pruned
+the orphaned block's transactions as mined and every leader's batches
+refuse the affected senders on their nonce (task #11): half-empty blocks
+for the rest of the leg.
+
+What makes bodies late is the box's memory, measured with `legmem.sh`
+(vmstat deltas, `fincore`, per-process major faults) and `perf record -e
+major-faults`:
+
+- 98% of the execution layer's major faults are `mdbx_get` on the engine
+  thread (`tree_search_finalize` -- reth opens MDBX with `MDBX_NORDAHEAD`,
+  so every missing page is one 4 KB read). 140,000-200,000 of them per
+  node in the first 100 s of a leg.
+- They are missing because kswapd takes the page cache: 10-12 million
+  pages stolen per 30 s (44 GB) while `free` shows 30-43 GB free; the file
+  cache falls from 9-11 GB to 0.1-0.8 GB and `mdbx.dat` (137 MB in use) is
+  32 KB-400 KB resident.
+- kswapd runs because the heaps ask for huge pages: `MALLOC_CONF=thp:always`
+  with jemalloc's 10 s decay hands 2 MB pages back and faults them in again
+  (`thp_fault_alloc` +90,000 per 30 s with 30% fallbacks; `compact_fail`
+  4.9M against 1.5M successes over the box's life), and under `defrag=defer`
+  the kernel reclaims file pages to make contiguous blocks. The tmpfs under
+  /tmp holds another 27-34 GB of RAM (other drivers' build caches and
+  datadirs), which is why "free" is smaller than it looks.
+
+The A/B (loop77, parallel builder and follower graft on):
+
+    leg  heap             win1     win2     win3     total
+    T1a  thp:always       193,668   84,199   53,022   9.93M  (window 2: 26% occupancy after a stall)
+    T0a  4 KB pages       161,545  152,128  141,262  13.65M
+    T1b  thp:always       201,024  146,635  152,068  15.00M
+    T0b  4 KB pages       157,293  152,128  152,129  13.85M
+
+Without huge pages the leg is steady (no reclaim for the first 70 s, the
+file cache grows to 40 GB, MDBX stays resident) and 20% slower on window
+1; with them, window 1 is 194-201k and one leg in two loses a window.
+`dirty_decay_ms:-1,muzzy_decay_ms:-1` (loop78 Ra: keep the huge pages,
+never return them) is not an option on this box: the seven heaps reached
+56 GB of AnonHugePages in 20 s and the OOM killer took an execution layer
+(13.9 GB anon) at block 158. Not tried yet: a bounded decay (tens of
+seconds), `MDBX_NORDAHEAD` off for this workload, and freeing the tmpfs.
+Task #8 closes as diagnosed; the fix is memory policy, not a lock.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
