@@ -260,7 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 if let Some(conn) = ingest.as_mut() {
-                    flood_over_ingest(conn, part, &mut nonce, &mut stalls, args, &sent, &rejected);
+                    flood_over_ingest(conn, part, worker * chunk, &mut nonce, &mut stalls, args, &sent, &rejected);
                     return;
                 }
                 while live > 0 {
@@ -401,6 +401,7 @@ static DEEPEST: AtomicU64 = AtomicU64::new(0);
 fn flood_over_ingest(
     conn: &mut Ingest,
     part: &[Signer],
+    first_sender: usize,
     nonce: &mut [u64],
     stalls: &mut [u32],
     args: &Args,
@@ -435,9 +436,14 @@ fn flood_over_ingest(
             let upto = (from + args.rpc_batch as u64).min(args.per_tx);
             batch.clear();
             let at = Instant::now();
+            // The recipient's index is the sender's *global* index: with the
+            // worker's local one, the 64 workers' senders at one local index
+            // paid the same recipients at the same nonces, and a "full" block
+            // of 163,000 transfers touched 13,000 recipients (found in round
+            // 43, after every round through 42 had measured that shape).
             batch.extend(
                 (from..upto).map(|n| {
-                    let to = recipient(args.recipients, index as u64 * args.per_tx + n);
+                    let to = recipient(args.recipients, (first_sender + index) as u64 * args.per_tx + n);
                     signed_raw(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
                 }),
             );
