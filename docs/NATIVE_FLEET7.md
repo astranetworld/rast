@@ -380,6 +380,47 @@ never return them) is not an option on this box: the seven heaps reached
 seconds), `MDBX_NORDAHEAD` off for this workload, and freeing the tmpfs.
 Task #8 closes as diagnosed; the fix is memory policy, not a lock.
 
+### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
+
+Measured from the chains themselves with `chainmix.py` (the most recent
+163,000 consecutive transactions, walking back from the head; counted per
+transaction: the sender, `to`, and the recipient inside an ERC-20/TRC-20
+`transfer`/`transferFrom` calldata; contract-internal state is not visible
+without traces, so every count is a lower bound on state touched):
+
+    chain     txs      blocks  plain    token     other    distinct  distinct    distinct        all distinct
+                               transfers transfers calls   senders   `to`       token recipients accounts (ratio)
+    Ethereum  165,865    624   51,458   55,214    59,019   62,475    33,515     25,804           87,628  (0.53)
+    BNB       163,502  2,700   23,984   19,299   120,173   32,815    11,595     12,115           46,269  (0.28)
+    Polygon    50,022    780    3,386    3,908    42,714    7,817     2,936      2,056           10,821  (0.22, 50k sample; the public RPC rate-limited past it)
+    Tron      163,419    472  100,824   24,541    38,052  103,057    74,066     15,436          173,368  (1.06)
+
+    N42 fleet7 bench, fixed flood: 163,000 plain transfers -> created 14,196 + updated 132,803 = 147,000 accounts (0.90)
+    N42 fleet7 bench, old flood (rounds through 42): ~13,000 recipients + 380 senders (0.08)
+
+Reading it:
+
+- Tron -- the chain whose traffic is closest to ours (62% plain TRX/TRC-10
+  transfers, the rest mostly USDT) -- touches *more* distinct accounts than
+  transactions: 173k for 163k, because most senders and recipients appear
+  once in the window. Our 147k is below that.
+- Ethereum touches 88k distinct addresses for 166k transactions by this
+  count, but 69% of its transactions are contract calls whose state
+  effects (a swap: pool reserves, two token balances, fees; an ERC-20
+  transfer: two storage slots plus the sender's nonce and balance) are not
+  in the address count. In state entries written, Ethereum's 163k
+  transactions are well above 147k.
+- BNB and Polygon are dominated by bots and aggregators: few senders, many
+  calls to the same contracts -- 46k and (extrapolated) ~25k distinct
+  addresses. In addresses they are lighter than our shape; in storage slots
+  they are not.
+
+So 147,000 state entries per 163,000 transactions is a reasonable, if
+anything conservative, shape for a payments chain: Tron's real traffic is
+heavier in accounts, Ethereum's is heavier in state entries, and only the
+bot-heavy EVM chains are lighter by the address count. The old flood's
+13,000 was not a shape any of them has.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
