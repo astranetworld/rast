@@ -449,6 +449,7 @@ where
     let evm_env = evm_config
         .next_evm_env(&parent_header, &next_attributes)
         .map_err(PayloadBuilderError::other)?;
+    let group_env = evm_env.clone();
     let evm = evm_config.evm_with_env(&mut db, evm_env);
     let block_ctx = evm_config
         .context_for_next_block(&parent_header, next_attributes)
@@ -571,6 +572,117 @@ where
         .as_ref()
         .map(|params| params.max_blob_count)
         .unwrap_or_default();
+
+    // N42_PARALLEL_BUILD=1: the block's plain transfers are executed in
+    // conflict-free groups on the worker pool -- the way a follower imports
+    // the block -- and committed to the builder's state in group order, before
+    // the serial loop below takes whatever is left (transfers the path refused,
+    // anything that is not a transfer). Only with the puller, whose batches
+    // are the natural unit to take a block's worth from; the serial loop's
+    // lookahead receives the leftovers in candidate order.
+    let mut par_ms = 0u64;
+    let mut par_txs = 0u64;
+    let mut par_groups = 0usize;
+    let mut par_skipped = 0usize;
+    if parallel_build() && pulled.is_some() {
+        let par_at = std::time::Instant::now();
+        let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
+        let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
+            Vec::with_capacity(budget.min(262_144));
+        if let Some(puller) = pulled.as_ref() {
+            while cands.len() < budget {
+                match puller.batches.recv() {
+                    Ok(batch) if !batch.is_empty() => cands.extend(batch),
+                    _ => break,
+                }
+            }
+        }
+        if cands.len() > budget {
+            let extra = cands.split_off(budget);
+            for tx in extra.into_iter().rev() {
+                lookahead.push_front(tx);
+            }
+        }
+        let all_transfers = !cands.is_empty()
+            && cands.iter().all(|tx| {
+                let tx = &tx.transaction;
+                tx.gas_limit() == MIN_TRANSACTION_GAS
+                    && tx.input().is_empty()
+                    && !tx.is_create()
+                    && tx.access_list().is_none_or(|list| list.is_empty())
+                    && !tx.is_eip4844()
+                    && !tx.is_eip7702()
+            });
+        if !all_transfers {
+            for tx in cands.into_iter().rev() {
+                lookahead.push_front(tx);
+            }
+        } else {
+            let mut consensus: Vec<Option<reth_primitives_traits::Recovered<TransactionSigned>>> =
+                cands.iter().map(|tx| Some(tx.to_consensus())).collect();
+            let envs: Vec<revm::context::TxEnv> = consensus
+                .iter()
+                .map(|tx| evm_config.tx_env(tx.as_ref().expect("just built").as_recovered_ref()))
+                .collect();
+            let parent_hash = parent_header.hash();
+            let open = || client.state_by_block_hash(parent_hash).ok().map(StateProviderDatabase::new);
+            match crate::parallel_transfer::execute_for_build(&group_env, &envs, &open) {
+                Ok(run) => {
+                    use reth_evm::execute::BlockExecutor as _;
+                    let beneficiary = group_env.block_env.beneficiary;
+                    let mut fees = U256::ZERO;
+                    for built in run.executed {
+                        let i = built.index;
+                        let recovered = consensus[i].take().expect("executed once");
+                        let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
+                        let fee = U256::from(tip) * U256::from(built.gas_used);
+                        fees += fee;
+                        total_fees += fee;
+                        cumulative_gas_used += built.gas_used;
+                        tx_count += 1;
+                        let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(recovered.inner());
+                        builder.executor.commit_transaction(alloy_evm::eth::EthTxResult {
+                            result: built.result,
+                            blob_gas_used: 0,
+                            tx_type,
+                        });
+                        builder.transactions.push(recovered);
+                    }
+                    if !fees.is_zero() {
+                        // The groups each credited the beneficiary from the same
+                        // starting balance; their states came back without it, and
+                        // the block credits it once, here.
+                        let db = builder.evm_mut().db_mut();
+                        let current = db.basic(beneficiary).map_err(PayloadBuilderError::other)?;
+                        let existed = current.is_some();
+                        let mut info = current.unwrap_or_default();
+                        info.balance = info.balance.saturating_add(fees);
+                        let mut account = revm::state::Account::from(info);
+                        account.status = revm::state::AccountStatus::Touched;
+                        if !existed {
+                            account.status |= revm::state::AccountStatus::Created;
+                        }
+                        let mut changes = revm::state::EvmState::default();
+                        changes.insert(beneficiary, account);
+                        revm::DatabaseCommit::commit(db, changes);
+                    }
+                    par_txs = tx_count;
+                    par_groups = run.phases.groups;
+                    par_skipped = run.skipped.len();
+                    for i in run.skipped {
+                        lookahead.push_back(Arc::clone(&cands[i]));
+                    }
+                }
+                Err(why) => {
+                    debug!(target: "payload_builder", %why, candidates = cands.len(), "parallel build declined; building serially");
+                    for tx in cands.into_iter().rev() {
+                        lookahead.push_front(tx);
+                    }
+                }
+            }
+        }
+        par_ms = par_at.elapsed().as_millis() as u64;
+    }
 
     loop {
         // Once the block cannot fit even the smallest transaction there is
@@ -1009,6 +1121,10 @@ where
             pool_ms = (pool_ns / 1_000_000) as u64,
             prefetch_ms = (prefetch_ns / 1_000_000) as u64,
             fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
+            par_txs,
+            par_groups,
+            par_skipped,
+            par_ms,
             refused = ?crate::fast_transfer::rejected(),
             exec_ms = (exec_ns / 1_000_000) as u64,
             tail_ms = (tail_ns / 1_000_000) as u64,
@@ -1151,6 +1267,12 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
 /// Whether the builder reads each sender's account before executing, to
 /// skip stale transactions early: `N42_BUILDER_STALE_CHECK=1`; off by
 /// default (see the loop).
+/// `N42_PARALLEL_BUILD`, read once: the block's transfers built in parallel groups.
+fn parallel_build() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PARALLEL_BUILD").is_ok())
+}
+
 fn stale_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_BUILDER_STALE_CHECK").is_ok_and(|v| v == "1"))

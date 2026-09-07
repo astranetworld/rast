@@ -108,6 +108,145 @@ impl Groups {
     }
 }
 
+
+/// Partitions transfers into groups that share no sender or recipient: the
+/// groups can execute in any order relative to each other. Returns the groups
+/// (indices into `txs`, in order) and the number of distinct parties.
+pub fn partition(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>, usize), NotParallel> {
+    let mut index_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
+    index_of.reserve(txs.len() * 2);
+    let mut party = |a: Address| -> usize {
+        let next = index_of.len();
+        *index_of.entry(a).or_insert(next)
+    };
+    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(txs.len());
+    for (i, tx) in txs.iter().enumerate() {
+        let alloy_primitives::TxKind::Call(to) = tx.kind else {
+            return Err(NotParallel::NotATransfer(i));
+        };
+        if !tx.data.is_empty() {
+            return Err(NotParallel::NotATransfer(i));
+        }
+        if tx.caller == beneficiary || to == beneficiary {
+            return Err(NotParallel::TouchesBeneficiary(i));
+        }
+        edges.push((party(tx.caller), party(to)));
+    }
+    let mut sets = Groups::new(index_of.len());
+    for (a, b) in &edges {
+        sets.union(*a, *b);
+    }
+    let mut group_of_root: Vec<usize> = vec![usize::MAX; index_of.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, (a, _)) in edges.iter().enumerate() {
+        let root = sets.find(*a);
+        if group_of_root[root] == usize::MAX {
+            group_of_root[root] = groups.len();
+            groups.push(Vec::new());
+        }
+        groups[group_of_root[root]].push(i);
+    }
+    Ok((groups, index_of.len()))
+}
+
+/// One transfer executed for a block being built: its index in the candidate
+/// list, the EVM's result and post-state (the beneficiary's account removed,
+/// see [`execute_for_build`]), and the gas it used.
+#[derive(Debug)]
+pub struct BuiltTransfer {
+    /// Index into the candidates.
+    pub index: usize,
+    /// The result and the state it leaves, minus the beneficiary.
+    pub result: revm::context::result::ResultAndState<revm::context::result::HaltReason>,
+    /// Gas used.
+    pub gas_used: u64,
+}
+
+/// What [`execute_for_build`] produced.
+#[derive(Debug, Default)]
+pub struct BuildRun {
+    /// The transfers that executed, in the order they must appear in the
+    /// block: group by group, each group in candidate order.
+    pub executed: Vec<BuiltTransfer>,
+    /// Candidates the transfer path refused (a nonce that is not the
+    /// account's, a balance short, a shape it does not take): left for the
+    /// serial builder, in candidate order.
+    pub skipped: Vec<usize>,
+    /// Phase timings.
+    pub phases: Phases,
+}
+
+/// Executes candidate transfers for a block being built, in conflict-free
+/// groups on the worker pool, each group on its own view of the parent's
+/// state from `open`.
+///
+/// Unlike [`execute_transfers`], which must reproduce a sealed block exactly,
+/// this may drop candidates: one the transfer path refuses is reported in
+/// `skipped` and the group goes on (a later transfer of the same sender then
+/// fails its nonce check and is skipped too, which keeps the sender's order).
+/// The per-transaction states are what the caller commits to the block's
+/// state, in the returned order; the beneficiary is stripped from each of
+/// them, because every group credits it from the same starting balance and
+/// the fees have to be summed by the caller instead.
+///
+/// Returns `Err` when the candidates are not all plain transfers away from
+/// the beneficiary: then the serial builder takes all of them.
+pub fn execute_for_build<G>(
+    evm_env: &reth_evm::EvmEnv,
+    txs: &[TxEnv],
+    open: &(dyn Fn() -> Option<G> + Sync),
+) -> Result<BuildRun, NotParallel>
+where
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let beneficiary = evm_env.block_env.beneficiary;
+    let mut phases = Phases::default();
+    let at = std::time::Instant::now();
+    let (groups, _) = partition(txs, beneficiary)?;
+    phases.partition_ms = at.elapsed().as_millis() as u64;
+    phases.groups = groups.len();
+
+    let at = std::time::Instant::now();
+    let results: Vec<Result<(Vec<BuiltTransfer>, Vec<usize>), NotParallel>> = {
+        use rayon::prelude::*;
+        groups
+            .par_iter()
+            .map(|members| {
+                let db = open().ok_or(NotParallel::NoState)?;
+                let mut state = State::builder().with_database(db).build();
+                let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+                let mut done = Vec::with_capacity(members.len());
+                let mut skipped = Vec::new();
+                for &i in members {
+                    match evm.transfer(&txs[i]) {
+                        Ok(Some(out)) => {
+                            let gas_used = out.result.gas_used();
+                            let mut kept = out.state.clone();
+                            evm.db_mut().commit(out.state);
+                            kept.remove(&beneficiary);
+                            done.push(BuiltTransfer { index: i, result: revm::context::result::ResultAndState { result: out.result, state: kept }, gas_used });
+                        }
+                        Ok(None) => skipped.push(i),
+                        Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
+                    }
+                }
+                Ok((done, skipped))
+            })
+            .collect()
+    };
+    phases.groups_ms = at.elapsed().as_millis() as u64;
+
+    let mut run = BuildRun { phases, ..Default::default() };
+    for r in results {
+        let (done, skipped) = r?;
+        run.executed.extend(done);
+        run.skipped.extend(skipped);
+    }
+    run.skipped.sort_unstable();
+    Ok(run)
+}
+
 /// Executes `block` with its transfers spread over the worker pool, or says
 /// why it cannot. `main_db` is the parent's state the block's own executor
 /// runs its pre- and post-execution changes on; `open` yields a fresh view of
@@ -134,43 +273,13 @@ where
     let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
     // Address-keyed with the fixed-bytes hasher: the default hasher was
     // ~29 ms of a 163,000-transfer block's partition.
-    let mut index_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
-    index_of.reserve(txs.len() * 2);
-    let mut party = |a: Address| -> usize {
-        let next = index_of.len();
-        *index_of.entry(a).or_insert(next)
+    let (groups, parties) = match partition(&txs, beneficiary) {
+        Ok(p) => p,
+        Err(why) => return Ok(Err(why)),
     };
-    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(txs.len());
-    for (i, tx) in txs.iter().enumerate() {
-        let alloy_primitives::TxKind::Call(to) = tx.kind else {
-            return Ok(Err(NotParallel::NotATransfer(i)));
-        };
-        if !tx.data.is_empty() {
-            return Ok(Err(NotParallel::NotATransfer(i)));
-        }
-        if tx.caller == beneficiary || to == beneficiary {
-            return Ok(Err(NotParallel::TouchesBeneficiary(i)));
-        }
-        edges.push((party(tx.caller), party(to)));
-    }
-    let mut sets = Groups::new(index_of.len());
-    for (a, b) in &edges {
-        sets.union(*a, *b);
-    }
-    // Group id per transaction, then the transactions of each group in block
-    // order.
-    let mut group_of_root: Vec<usize> = vec![usize::MAX; index_of.len()];
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (i, (a, _)) in edges.iter().enumerate() {
-        let root = sets.find(*a);
-        if group_of_root[root] == usize::MAX {
-            group_of_root[root] = groups.len();
-            groups.push(Vec::new());
-        }
-        groups[group_of_root[root]].push(i);
-    }
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.groups = groups.len();
+    let index_of_len = parties;
 
     // The groups, on the worker pool. Each yields its bundle (the accounts
     // it changed, with their originals) and the gas each transaction used.
@@ -236,7 +345,7 @@ where
     // an account a reward reached and a transfer touched gets both.
     let at = std::time::Instant::now();
     let mut changes: revm::state::EvmState = Default::default();
-    changes.reserve(index_of.len() + 1);
+    changes.reserve(index_of_len + 1);
     let mut beneficiary_delta = U256::ZERO;
     for bundle in &bundles {
         for (address, account) in &bundle.state {
@@ -360,8 +469,10 @@ mod tests {
                 recovered.push(sender);
             }
         }
+        // Past the merge on mainnet, so the serial executor pays no
+        // block reward: the builder path credits only the fees.
         let header = Header {
-            number: 1,
+            number: 20_000_000,
             beneficiary,
             gas_limit: 1_000_000_000,
             base_fee_per_gas: Some(1_000_000_000),
@@ -407,6 +518,69 @@ mod tests {
         ours.sort_by_key(|(a, _)| *a);
         theirs.sort_by_key(|(a, _)| *a);
         assert_eq!(ours, theirs, "reverts");
+    }
+
+
+    /// The build-mode run, committed in its order with the beneficiary
+    /// credited once, ends in the same state as the serial executor.
+    #[test]
+    fn build_run_matches_serial() {
+        use alloy_consensus::Transaction as _;
+        let (block, db) = fixture(8, 6);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
+        let evm_env = evm_config.evm_env(block.header()).expect("env");
+        let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+        let run = execute_for_build(&evm_env, &envs, &|| Some(db.clone())).expect("a block of transfers");
+        assert!(run.skipped.is_empty(), "{:?}", run.skipped);
+        assert_eq!(run.executed.len(), envs.len());
+        assert!(run.phases.groups >= 1);
+
+        let beneficiary = evm_env.block_env.beneficiary;
+        let base_fee = evm_env.block_env.basefee;
+        let txs: Vec<_> = block.transactions_recovered().collect();
+        let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+        let mut fees = U256::ZERO;
+        let mut gas = 0u64;
+        for built in &run.executed {
+            assert!(!built.result.state.contains_key(&beneficiary), "beneficiary stripped");
+            let tip = txs[built.index].effective_tip_per_gas(base_fee).unwrap_or_default();
+            fees += U256::from(tip) * U256::from(built.gas_used);
+            gas += built.gas_used;
+            state.commit(built.result.state.clone());
+        }
+        let current = state.basic(beneficiary).unwrap();
+        let existed = current.is_some();
+        let mut info = current.unwrap_or_default();
+        info.balance += fees;
+        let mut account = Account::from(info);
+        account.status = AccountStatus::Touched;
+        if !existed {
+            account.status |= AccountStatus::Created;
+        }
+        let mut changes = revm::state::EvmState::default();
+        changes.insert(beneficiary, account);
+        state.commit(changes);
+        // The block executor pays the withdrawal at finish; the builder's
+        // parallel step does not, so apply it here before comparing.
+        for w in block.body().withdrawals.as_ref().unwrap().iter() {
+            let mut info = state.basic(w.address).unwrap().unwrap_or_default();
+            info.balance += U256::from(w.amount_wei());
+            let mut account = Account::from(info);
+            account.status = AccountStatus::Touched;
+            let mut changes = revm::state::EvmState::default();
+            changes.insert(w.address, account);
+            state.commit(changes);
+        }
+        state.merge_transitions(BundleRetention::Reverts);
+        let bundle = state.take_bundle();
+
+        assert_eq!(gas, serial.result.gas_used, "gas used");
+        assert_eq!(bundle.state.len(), serial.state.state.len(), "accounts in the bundle");
+        for (address, theirs) in &serial.state.state {
+            let ours = bundle.state.get(address).unwrap_or_else(|| panic!("account {address} missing"));
+            assert_eq!(ours.info, theirs.info, "info {address}");
+        }
     }
 
     #[test]

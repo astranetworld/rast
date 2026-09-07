@@ -8287,6 +8287,7 @@ dependencies = [
  "alloy-signer 2.4.1",
  "alloy-signer-local",
  "alloy-sol-types",
+ "ed25519-dalek",
  "eyre",
  "futures",
  "hex",
