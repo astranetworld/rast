@@ -382,6 +382,11 @@ Task #8 closes as diagnosed; the fix is memory policy, not a lock.
 
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
+(The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
+loop80 sweep of TPS against accounts touched: 393k at ~400 accounts a
+block, 337k at 20k, 283k at 67k, 201k at 145k -- cycle ~= 0.40 s + 2.8 us
+per account touched.)
+
 Measured from the chains themselves with `chainmix.py` (the most recent
 163,000 consecutive transactions, walking back from the head; counted per
 transaction: the sender, `to`, and the recipient inside an ERC-20/TRC-20

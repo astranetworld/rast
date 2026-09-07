@@ -84,6 +84,47 @@ footprint of contract calls, which needs traces (`debug_traceBlock` with the
 prestate tracer) rather than block bodies. Both would only raise the other
 chains' numbers.
 
+## TPS against the accounts a block touches (loop80, 2026-09-07)
+
+The same fleet and configuration (round-41 environment, parallel builder,
+follower graft, thp:always heap), one leg per recipient spread of the fixed
+flood plus one leg of the pre-fix flood, after a warm-up leg. "Touched" is
+the builder's `created + updated` for a full 163,000-transfer block;
+the follower's import is node0's mean over the leg's full blocks.
+
+| leg | flood | accounts touched per block | win1 TPS | cycle | win2 / win3 TPS | follower import (root / hashed) |
+|---|---|---:|---:|---:|---:|---:|
+| A1 | `F7_RECIPIENTS=1` (one sink) | 403 | **392,644** | 0.400 s | 385,860 / 271,658 | 264 ms (0 / 0) |
+| L13k | legacy indexing (pre-round-43) | 24,131 | **403,647** | 0.401 s | 323,399 / 244,492 | 256 ms (26 / 12) |
+| A20k | 20,000 | 20,372 | **336,848** | 0.484 s | 326,633 / 271,657 | 345 ms (18 / 9) |
+| A100k | 100,000 | 67,458 | **282,518** | 0.577 s | 228,067 / 216,651 | 426 ms (70 / 35) |
+| A500k | 500,000 | 144,352 | **201,009** | 0.811 s | 144,384 / 67,744 | 605 ms (190 / 74) |
+| A2M | 2,000,000 | 145,863 | **201,025** | 0.811 s | 120,154 / 146,590 | 624 ms (195 / 75) |
+
+Over the fixed-flood legs the cycle is linear in the accounts touched:
+
+    cycle  ~= 0.40 s + 2.8 us x accounts        (r^2 > 0.99 on A1..A2M)
+    import ~= 264 ms + 2.5 us x accounts        (QMDB root 1.3 us, hashed post-state 0.5 us, the rest 0.7 us)
+    TPS    ~= 163,000 / cycle
+
+so 0.40 s is the per-transaction floor of this configuration (the ingest
+supplies ~400k transactions a second per node and the block is built,
+shipped, verified and imported in that time regardless of state), and
+every 100,000 accounts a block touches add ~0.28 s to the cycle: 393k TPS
+at a few hundred accounts, 337k at 20k, 283k at 67k, 201k at 145k, and by
+extrapolation ~130k at 300k accounts (a contract-heavy shape by storage
+slots) and ~100k at 400k.
+
+Two footnotes. The legacy flood's 24,000 accounts read 404k, faster than
+the fixed flood's 20,000 (337k): its recipients repeat in a pattern (the
+same recipient at the same nonce across senders congruent mod 200) that
+the follower's execution handles in 73 ms against 161 -- the count of
+accounts is not the whole shape, their layout in the block matters too,
+which is one more reason the old rounds' numbers do not transfer. And
+the later windows of the two heaviest legs (A500k win3 39% occupancy,
+A2M win2 34%) are the page-cache reclaim storm of the thp:always heap
+(`docs/NATIVE_FLEET7.md`, "Round 43, continued"), not the state cost.
+
 ## Reproducing
 
 ```bash
