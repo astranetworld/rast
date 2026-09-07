@@ -69,6 +69,60 @@ The cycle is now set by the followers -- publish -> receive 74 ms,
 receive -> vote 447 ms, vote -> decide 120 ms -- not by the leader's build,
 which the build-ahead hides. The next 300k is a follower-side job.
 
+## Round 40: the 0x50 (Ed25519) transaction on the fleet (2026-09-07)
+
+`docs/ROADMAP_ED25519_TX.md` phase 1. The node runs on `N42Primitives`
+(`crates/n42/tx-types`), the fleet7 genesis files carry `altSigTx: true`,
+and `F7_FLOOD_ALG=ed25519` makes the flood sign 0x50 transfers. loop64,
+the record configuration (pacing 300, 20 slots, run 64, huge pages for the
+heap, parallel follower, 8 tokio workers, pertx 8000), A-B-A-B with a
+warm-up leg:
+
+    leg  algorithm  win1     cycle    occ    win2     cycle    win3     cycle
+    W    secp       269,666  0.600 s  99%    222,718  0.732 s  265,995  0.613 s   (warm-up, void)
+    A1   secp       355,559  0.349 s  76%    334,650  0.330 s  325,169  0.395 s
+    B1   ed25519    345,726  0.441 s  94%    --  chain halted at block 222 (below)  --
+    A2   secp       364,718  0.353 s  79%    339,397  0.330 s  323,338  0.380 s
+    B2   ed25519    350,713  0.423 s  91%    295,593  0.492 s  249,305  0.640 s
+    B3   ed25519    347,718  0.469 s  100%   294,841  0.526 s  221,277  0.625 s
+
+The secp256k1 legs reproduce the record with the new node (A2 364,718
+against 365,399): the type swap costs nothing. The Ed25519 legs read the
+same window 1 (345-351k, inside the spread) with the bound moved: the
+blocks are full (91-100% occupancy, 61/71 and 64/64 full) and the cycle
+is 0.42-0.47 s, where the secp legs run 76-79% full at 0.35 s. The supply
+side did what it was built to do -- node0's ingest at 20 slots:
+
+    algorithm  rate       busy us/tx  slots busy  altsig batches
+    secp       333-345k   54-56       93%         --
+    ed25519    336-345k   28-31       48-53%      64 a batch
+
+-- half the CPU a transaction, half the slots idle, the flood throttled by
+the ingest gate (pool at its 410k high-water mark) rather than by
+recovery. What binds now is the follower. Full-block direct import, node0
+medians:
+
+    algorithm  senders  exec  root  total   senders cached
+    secp       58 ms    79    11    251 ms  153k / 163k (94%)
+    ed25519    107 ms   92    23    336 ms  102k / 163k (63%)
+
+The 0x50 sender cache (`N42_ALTSIG_SENDER_CACHE`, 2^20 entries) is a
+direct-mapped fixed cache and a million in-flight transactions collide in
+it: 37% of a block's senders miss and are verified again on the follower,
+in batches, 50 ms of the 107. A 0x50 block is also 23 MB against 19
+(141 B a transaction against 110), which shows in the exec/root numbers
+and in the second and third windows, which fall to 0.63 s cycles where
+the secp legs hold 0.38-0.40. loop65 runs the cache at 2^22 and the batch
+at 128.
+
+**B1 halted at block 222.** Six followers imported it; node0, the leader
+of the next view, logged `parallel import phases number=222` and then
+nothing -- no error, no `direct import` line -- while its build-ahead for
+view 224 had just started on the same execution layer. Every later view
+timed out waiting for it. It did not recur in B2 or B3; a watchdog now
+dumps every thread's state and a perf sample if a chain stalls for 20 s
+during a round.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
