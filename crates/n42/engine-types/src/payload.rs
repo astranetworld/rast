@@ -583,7 +583,14 @@ where
     let mut par_ms = 0u64;
     let mut par_txs = 0u64;
     let mut par_groups = 0usize;
+    let mut par_batches = 0usize;
     let mut par_skipped = 0usize;
+    let mut par_pull_ms = 0u64;
+    let mut par_part_ms = 0u64;
+    let mut par_exec_ms = 0u64;
+    let mut par_fold_ms = 0u64;
+    let mut par_committed = 0usize;
+    let mut par_reverts: Vec<(alloy_primitives::Address, revm::database::AccountRevert)> = Vec::new();
     if parallel_build() && pulled.is_some() {
         let par_at = std::time::Instant::now();
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
@@ -597,6 +604,7 @@ where
                 }
             }
         }
+        par_pull_ms = par_at.elapsed().as_millis() as u64;
         if cands.len() > budget {
             let extra = cands.split_off(budget);
             for tx in extra.into_iter().rev() {
@@ -630,29 +638,38 @@ where
                 Ok(run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
-                    let mut fees = U256::ZERO;
-                    for built in run.executed {
+                    let fold_at = std::time::Instant::now();
+                    // The receipts and the gas, one transfer at a time, with
+                    // no state to commit: the state comes in one piece below.
+                    for built in &run.executed {
                         let i = built.index;
                         let recovered = consensus[i].take().expect("executed once");
                         let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
-                        let fee = U256::from(tip) * U256::from(built.gas_used);
-                        fees += fee;
-                        total_fees += fee;
+                        total_fees += U256::from(tip) * U256::from(built.gas_used);
                         cumulative_gas_used += built.gas_used;
                         tx_count += 1;
                         let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(recovered.inner());
                         builder.executor.commit_transaction(alloy_evm::eth::EthTxResult {
-                            result: built.result,
+                            result: revm::context::result::ResultAndState {
+                                result: built.result.clone(),
+                                state: revm::state::EvmState::default(),
+                            },
                             blob_gas_used: 0,
                             tx_type,
                         });
                         builder.transactions.push(recovered);
                     }
+                    // The batches' changes, grafted onto the block's state;
+                    // the beneficiary, whom every batch credited from the
+                    // same starting balance, once, through a commit.
+                    let db = builder.evm_mut().db_mut();
+                    let graft = crate::parallel_transfer::graft_bundles(db, run.bundles, beneficiary)
+                        .map_err(PayloadBuilderError::other)?;
+                    let fees = graft.beneficiary_delta;
+                    par_committed = graft.committed;
+                    par_reverts = graft.reverts;
+                    let mut changes = revm::state::EvmState::default();
                     if !fees.is_zero() {
-                        // The groups each credited the beneficiary from the same
-                        // starting balance; their states came back without it, and
-                        // the block credits it once, here.
-                        let db = builder.evm_mut().db_mut();
                         let current = db.basic(beneficiary).map_err(PayloadBuilderError::other)?;
                         let existed = current.is_some();
                         let mut info = current.unwrap_or_default();
@@ -662,12 +679,15 @@ where
                         if !existed {
                             account.status |= revm::state::AccountStatus::Created;
                         }
-                        let mut changes = revm::state::EvmState::default();
                         changes.insert(beneficiary, account);
-                        revm::DatabaseCommit::commit(db, changes);
                     }
+                    revm::DatabaseCommit::commit(db, changes);
+                    par_fold_ms = fold_at.elapsed().as_millis() as u64;
                     par_txs = tx_count;
                     par_groups = run.phases.groups;
+                    par_batches = run.phases.batches;
+                    par_part_ms = run.phases.partition_ms;
+                    par_exec_ms = run.phases.groups_ms;
                     par_skipped = run.skipped.len();
                     for i in run.skipped {
                         lookahead.push_back(Arc::clone(&cands[i]));
@@ -997,8 +1017,12 @@ where
     // The bundle and the receipts, kept for the sealed block's import. Taken
     // here, after the QMDB changes were read from it, and moved rather than
     // cloned: 163,000 receipts are not free to copy on the build's own path.
+    let mut bundle = db.take_bundle();
+    // The parallel step's accounts went into the bundle directly; their
+    // reverts join the block's set here.
+    crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
     let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
-        state: db.take_bundle(),
+        state: bundle,
         result: execution_result,
     });
     // How scattered the block is: accounts the bundle created against
@@ -1123,7 +1147,13 @@ where
             fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
             par_txs,
             par_groups,
+            par_batches,
             par_skipped,
+            par_pull_ms,
+            par_part_ms,
+            par_exec_ms,
+            par_fold_ms,
+            par_committed,
             par_ms,
             refused = ?crate::fast_transfer::rejected(),
             exec_ms = (exec_ns / 1_000_000) as u64,

@@ -32,7 +32,7 @@ use reth_primitives_traits::{RecoveredBlock, SignedTransaction};
 use reth_revm::db::State;
 use revm::{
     context::TxEnv,
-    database::{states::bundle_state::BundleRetention, BundleAccount},
+    database::{states::bundle_state::BundleRetention, states::CacheAccount, AccountRevert, BundleAccount, BundleState, PlainAccount},
     state::{Account, AccountStatus},
     Database, DatabaseCommit,
 };
@@ -57,6 +57,9 @@ pub struct Phases {
     pub finish_ms: u64,
     /// How many groups there were.
     pub groups: usize,
+    /// How many batches of groups ran (the build's [`execute_for_build`]
+    /// runs a sender per group and several groups per batch).
+    pub batches: usize,
 }
 
 /// Why the parallel path did not run; the caller executes serially.
@@ -149,15 +152,48 @@ pub fn partition(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>
     Ok((groups, index_of.len()))
 }
 
+/// Groups candidate transfers by sender: every sender's transfers, in
+/// candidate order, form one group. Recipients do not join groups -- a
+/// transfer only adds to its recipient's balance, and additions commute, so
+/// [`rebase`] can fold groups that share a recipient in any order. (Grouping
+/// by connected component, as the follower's [`partition`] does, merges a
+/// full block of random transfers into a handful of giant groups: round 43.)
+///
+/// Returns `Err` when a candidate is not a plain transfer or touches the
+/// beneficiary.
+pub fn partition_by_sender(txs: &[TxEnv], beneficiary: Address) -> Result<Vec<Vec<usize>>, NotParallel> {
+    let mut group_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
+    group_of.reserve(txs.len() / 8);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, tx) in txs.iter().enumerate() {
+        let alloy_primitives::TxKind::Call(to) = tx.kind else {
+            return Err(NotParallel::NotATransfer(i));
+        };
+        if !tx.data.is_empty() {
+            return Err(NotParallel::NotATransfer(i));
+        }
+        if tx.caller == beneficiary || to == beneficiary {
+            return Err(NotParallel::TouchesBeneficiary(i));
+        }
+        let next = groups.len();
+        let g = *group_of.entry(tx.caller).or_insert(next);
+        if g == next {
+            groups.push(Vec::new());
+        }
+        groups[g].push(i);
+    }
+    Ok(groups)
+}
+
 /// One transfer executed for a block being built: its index in the candidate
-/// list, the EVM's result and post-state (the beneficiary's account removed,
-/// see [`execute_for_build`]), and the gas it used.
+/// list, the EVM's result, and the gas it used. Its state changes are in its
+/// batch's bundle ([`BuildRun::bundles`]).
 #[derive(Debug)]
 pub struct BuiltTransfer {
     /// Index into the candidates.
     pub index: usize,
-    /// The result and the state it leaves, minus the beneficiary.
-    pub result: revm::context::result::ResultAndState<revm::context::result::HaltReason>,
+    /// The EVM's result, for the receipt.
+    pub result: revm::context::result::ExecutionResult<revm::context::result::HaltReason>,
     /// Gas used.
     pub gas_used: u64,
 }
@@ -166,28 +202,237 @@ pub struct BuiltTransfer {
 #[derive(Debug, Default)]
 pub struct BuildRun {
     /// The transfers that executed, in the order they must appear in the
-    /// block: group by group, each group in candidate order.
+    /// block: batch by batch, sender by sender, each sender in candidate
+    /// order.
     pub executed: Vec<BuiltTransfer>,
     /// Candidates the transfer path refused (a nonce that is not the
     /// account's, a balance short, a shape it does not take): left for the
     /// serial builder, in candidate order.
     pub skipped: Vec<usize>,
+    /// Each batch's changes against the parent's state, with reverts, for
+    /// [`graft_bundles`].
+    pub bundles: Vec<BundleState>,
     /// Phase timings.
     pub phases: Phases,
 }
 
-/// Executes candidate transfers for a block being built, in conflict-free
-/// groups on the worker pool, each group on its own view of the parent's
-/// state from `open`.
+/// Folds bundles that were each computed against the parent's state into
+/// one set of changes on `state`, the block's state as it stands: every
+/// account gets what the bundles changed it by, added to what `state` holds
+/// (an account two bundles credited gets both credits; one a reward reached
+/// and a transfer touched gets both). The beneficiary is left out and its
+/// total credit returned, for the caller to apply with the block's other
+/// credits. Nothing is committed here.
+pub fn fold_bundles<DB: Database>(
+    state: &mut State<DB>,
+    bundles: &[revm::database::BundleState],
+    beneficiary: Address,
+) -> Result<(revm::state::EvmState, U256), <State<DB> as Database>::Error> {
+    let mut changes: revm::state::EvmState = Default::default();
+    changes.reserve(bundles.iter().map(|b| b.state.len()).sum::<usize>() + 1);
+    let mut beneficiary_delta = U256::ZERO;
+    for bundle in bundles {
+        for (address, account) in &bundle.state {
+            let BundleAccount { info, original_info, .. } = account;
+            let (new_balance, new_nonce) = match info {
+                Some(info) => (info.balance, info.nonce),
+                None => continue,
+            };
+            let (old_balance, old_nonce) = match original_info {
+                Some(orig) => (orig.balance, orig.nonce),
+                None => (U256::ZERO, 0),
+            };
+            if *address == beneficiary {
+                beneficiary_delta = beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+                continue;
+            }
+            // Another bundle's change to the same account is already in
+            // `changes`; otherwise the block's view, loaded so the transition
+            // records the parent's original.
+            let (mut merged, existed) = match changes.remove(address) {
+                Some(acc) => (acc.info, !acc.status.contains(AccountStatus::Created)),
+                None => {
+                    let current = state.basic(*address)?;
+                    let existed = current.is_some();
+                    (current.unwrap_or_default(), existed)
+                }
+            };
+            merged.balance = if new_balance >= old_balance {
+                merged.balance.saturating_add(new_balance - old_balance)
+            } else {
+                merged.balance.saturating_sub(old_balance - new_balance)
+            };
+            if new_nonce != old_nonce {
+                merged.nonce += new_nonce - old_nonce;
+            }
+            let mut acc = Account::from(merged);
+            acc.status = AccountStatus::Touched;
+            if !existed && original_info.is_none() {
+                acc.status |= AccountStatus::Created;
+            }
+            changes.insert(*address, acc);
+        }
+    }
+    Ok((changes, beneficiary_delta))
+}
+
+/// What [`graft_bundles`] left for the caller.
+#[derive(Debug, Default)]
+pub struct Graft {
+    /// The beneficiary's total credit across the bundles, not applied.
+    pub beneficiary_delta: U256,
+    /// The grafted accounts' reverts. They belong to the block's revert set,
+    /// which the state's own merge creates later: append them to it once the
+    /// bundle is taken (see [`append_reverts`]).
+    pub reverts: Vec<(Address, AccountRevert)>,
+    /// Accounts grafted.
+    pub accounts: usize,
+    /// Accounts the block's state already held and that went in as deltas
+    /// through a commit instead.
+    pub committed: usize,
+}
+
+/// Grafts the batches' bundles onto the block's state directly: each account
+/// goes into the state's cache and bundle as its batch left it (the batch's
+/// original is the parent's, which is what the block's state holds for an
+/// account nothing before it touched), an account two batches touched gets
+/// both changes added together, and the beneficiary is left out with its
+/// credit returned. This goes around the state's transition machinery, which
+/// is the point: committing 160,000 accounts through it and merging the
+/// transitions cost more than executing the transfers did (round 43). The
+/// few accounts the block's state already has in its cache (a system
+/// contract, an earlier transaction's) are applied as deltas through a
+/// commit, as [`fold_bundles`] does for all.
+///
+/// Each bundle must have been built with [`BundleRetention::Reverts`] against
+/// the parent's state.
+pub fn graft_bundles<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+) -> Result<Graft, <State<DB> as Database>::Error> {
+    let mut graft = Graft::default();
+    let total: usize = bundles.iter().map(|b| b.state.len()).sum();
+    state.cache.accounts.reserve(total);
+    state.bundle_state.state.reserve(total);
+    graft.reverts.reserve(total);
+    let mut slow: revm::state::EvmState = Default::default();
+    for bundle in bundles {
+        let BundleState { state: accounts, reverts, .. } = bundle;
+        // Addresses this bundle changed that an earlier one had already put
+        // in: their reverts are the earlier one's.
+        let mut repeated: alloy_primitives::map::AddressHashSet = Default::default();
+        for (address, account) in accounts {
+            let Some(info) = account.info.as_ref() else { continue };
+            let (new_balance, new_nonce) = (info.balance, info.nonce);
+            let (old_balance, old_nonce) = match &account.original_info {
+                Some(orig) => (orig.balance, orig.nonce),
+                None => (U256::ZERO, 0),
+            };
+            if address == beneficiary {
+                graft.beneficiary_delta = graft.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+                repeated.insert(address);
+                continue;
+            }
+            if state.bundle_state.state.contains_key(&address) {
+                // An earlier bundle put it in (or an earlier merge did, in
+                // which case the cache holds the block's view too): added to
+                // what is there, in both places.
+                repeated.insert(address);
+                let add = |info: &mut revm::state::AccountInfo| {
+                    info.balance = if new_balance >= old_balance {
+                        info.balance.saturating_add(new_balance - old_balance)
+                    } else {
+                        info.balance.saturating_sub(old_balance - new_balance)
+                    };
+                    info.nonce += new_nonce - old_nonce;
+                };
+                if let Some(info) = state.bundle_state.state.get_mut(&address).and_then(|a| a.info.as_mut()) {
+                    add(info);
+                }
+                if let Some(info) = state.cache.accounts.get_mut(&address).and_then(|a| a.account.as_mut()) {
+                    add(&mut info.info);
+                }
+                continue;
+            }
+            if let Some(cached) = state.cache.accounts.get(&address) {
+                // The block's state has its own view of this account; a
+                // delta through the ordinary path.
+                repeated.insert(address);
+                let existed = cached.account.is_some();
+                let mut merged = cached.account.as_ref().map(|a| a.info.clone()).unwrap_or_default();
+                merged.balance = if new_balance >= old_balance {
+                    merged.balance.saturating_add(new_balance - old_balance)
+                } else {
+                    merged.balance.saturating_sub(old_balance - new_balance)
+                };
+                merged.nonce += new_nonce - old_nonce;
+                let mut acc = Account::from(merged);
+                acc.status = AccountStatus::Touched;
+                if !existed && account.original_info.is_none() {
+                    acc.status |= AccountStatus::Created;
+                }
+                slow.insert(address, acc);
+                continue;
+            }
+            state.cache.accounts.insert(
+                address,
+                CacheAccount {
+                    account: Some(PlainAccount { info: info.clone(), storage: Default::default() }),
+                    status: account.status,
+                },
+            );
+            state.bundle_state.state_size += account.size_hint();
+            state.bundle_state.state.insert(address, account);
+            graft.accounts += 1;
+        }
+        let mut reverts = reverts;
+        for (address, revert) in std::mem::take(&mut *reverts).into_iter().flatten() {
+            if !repeated.contains(&address) {
+                graft.reverts.push((address, revert));
+            }
+        }
+    }
+    if !slow.is_empty() {
+        graft.committed = slow.len();
+        state.commit(slow);
+    }
+    Ok(graft)
+}
+
+/// Appends a graft's reverts to a taken bundle's revert set for the block
+/// (the last one, which the state's merge created; a new one if the merge
+/// found nothing to revert).
+pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
+    if reverts.is_empty() {
+        return;
+    }
+    if bundle.reverts.is_empty() {
+        bundle.reverts.push(Vec::new());
+    }
+    let last = bundle.reverts.len() - 1;
+    bundle.reverts_size += reverts.len();
+    bundle.reverts[last].extend(reverts);
+}
+
+/// Executes candidate transfers for a block being built, one group per
+/// sender ([`partition_by_sender`]), the groups spread over batches on the
+/// worker pool, each batch on its own view of the parent's state from `open`
+/// and yielding its own bundle.
 ///
 /// Unlike [`execute_transfers`], which must reproduce a sealed block exactly,
 /// this may drop candidates: one the transfer path refuses is reported in
 /// `skipped` and the group goes on (a later transfer of the same sender then
 /// fails its nonce check and is skipped too, which keeps the sender's order).
-/// The per-transaction states are what the caller commits to the block's
-/// state, in the returned order; the beneficiary is stripped from each of
-/// them, because every group credits it from the same starting balance and
-/// the fees have to be summed by the caller instead.
+/// A sender's view lacks what other groups credit it in the same block, so a
+/// transfer that only those credits would fund is skipped rather than built:
+/// conservative, and the serial builder that follows may still take it.
+///
+/// The caller grafts the bundles onto the block's state with
+/// [`graft_bundles`]: committing each transfer's state on its own is what
+/// the serial path spends half its time on (round 43: 112 ms of execution,
+/// 110 ms of commits and 55 ms of transition merging for 163,000 transfers),
+/// and one commit of the folded changes ([`fold_bundles`]) costs the same.
 ///
 /// Returns `Err` when the candidates are not all plain transfers away from
 /// the beneficiary: then the serial builder takes all of them.
@@ -203,35 +448,59 @@ where
     let beneficiary = evm_env.block_env.beneficiary;
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
-    let (groups, _) = partition(txs, beneficiary)?;
-    phases.partition_ms = at.elapsed().as_millis() as u64;
+    let groups = partition_by_sender(txs, beneficiary)?;
     phases.groups = groups.len();
+    // Batches of whole groups, about equal in transfers: a couple of
+    // thousand transfers each, at most two per worker. Each batch opens its
+    // own view of the parent, which is not free.
+    let workers = rayon::current_num_threads().max(1);
+    let wanted = (txs.len() / 2048).clamp(1, workers * 2);
+    let per_batch = txs.len().div_ceil(wanted).max(1);
+    let mut batches: Vec<Vec<&Vec<usize>>> = Vec::with_capacity(wanted + 1);
+    let mut current: Vec<&Vec<usize>> = Vec::new();
+    let mut filled = 0usize;
+    for group in &groups {
+        current.push(group);
+        filled += group.len();
+        if filled >= per_batch {
+            batches.push(std::mem::take(&mut current));
+            filled = 0;
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    phases.batches = batches.len();
+    phases.partition_ms = at.elapsed().as_millis() as u64;
 
     let at = std::time::Instant::now();
-    let results: Vec<Result<(Vec<BuiltTransfer>, Vec<usize>), NotParallel>> = {
+    let results: Vec<Result<(Vec<BuiltTransfer>, Vec<usize>, revm::database::BundleState), NotParallel>> = {
         use rayon::prelude::*;
-        groups
+        batches
             .par_iter()
             .map(|members| {
                 let db = open().ok_or(NotParallel::NoState)?;
-                let mut state = State::builder().with_database(db).build();
-                let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
-                let mut done = Vec::with_capacity(members.len());
+                let mut state = State::builder().with_database(db).with_bundle_update().build();
+                let mut done = Vec::with_capacity(members.iter().map(|g| g.len()).sum());
                 let mut skipped = Vec::new();
-                for &i in members {
-                    match evm.transfer(&txs[i]) {
-                        Ok(Some(out)) => {
-                            let gas_used = out.result.gas_used();
-                            let mut kept = out.state.clone();
-                            evm.db_mut().commit(out.state);
-                            kept.remove(&beneficiary);
-                            done.push(BuiltTransfer { index: i, result: revm::context::result::ResultAndState { result: out.result, state: kept }, gas_used });
+                {
+                    let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+                    for group in members {
+                        for &i in group.iter() {
+                            match evm.transfer(&txs[i]) {
+                                Ok(Some(out)) => {
+                                    let gas_used = out.result.gas_used();
+                                    evm.db_mut().commit(out.state);
+                                    done.push(BuiltTransfer { index: i, result: out.result, gas_used });
+                                }
+                                Ok(None) => skipped.push(i),
+                                Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
+                            }
                         }
-                        Ok(None) => skipped.push(i),
-                        Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
                     }
                 }
-                Ok((done, skipped))
+                state.merge_transitions(BundleRetention::Reverts);
+                Ok((done, skipped, state.take_bundle()))
             })
             .collect()
     };
@@ -239,9 +508,10 @@ where
 
     let mut run = BuildRun { phases, ..Default::default() };
     for r in results {
-        let (done, skipped) = r?;
+        let (done, skipped, bundle) = r?;
         run.executed.extend(done);
         run.skipped.extend(skipped);
+        run.bundles.push(bundle);
     }
     run.skipped.sort_unstable();
     Ok(run)
@@ -273,13 +543,12 @@ where
     let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
     // Address-keyed with the fixed-bytes hasher: the default hasher was
     // ~29 ms of a 163,000-transfer block's partition.
-    let (groups, parties) = match partition(&txs, beneficiary) {
+    let (groups, _parties) = match partition(&txs, beneficiary) {
         Ok(p) => p,
         Err(why) => return Ok(Err(why)),
     };
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.groups = groups.len();
-    let index_of_len = parties;
 
     // The groups, on the worker pool. Each yields its bundle (the accounts
     // it changed, with their originals) and the gas each transaction used.
@@ -344,45 +613,8 @@ where
     // The groups' changes, as deltas on whatever the main state holds now:
     // an account a reward reached and a transfer touched gets both.
     let at = std::time::Instant::now();
-    let mut changes: revm::state::EvmState = Default::default();
-    changes.reserve(index_of_len + 1);
-    let mut beneficiary_delta = U256::ZERO;
-    for bundle in &bundles {
-        for (address, account) in &bundle.state {
-            let BundleAccount { info, original_info, .. } = account;
-            let (new_balance, new_nonce) = match info {
-                Some(info) => (info.balance, info.nonce),
-                None => continue,
-            };
-            let (old_balance, old_nonce) = match original_info {
-                Some(orig) => (orig.balance, orig.nonce),
-                None => (U256::ZERO, 0),
-            };
-            if *address == beneficiary {
-                beneficiary_delta = beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
-                continue;
-            }
-            // The main state's view, loaded so the transition records the
-            // parent's original.
-            let current = state.basic(*address).map_err(|e| BlockExecutionError::other(std::io::Error::other(e.to_string())))?;
-            let existed = current.is_some();
-            let mut merged = current.unwrap_or_default();
-            merged.balance = if new_balance >= old_balance {
-                merged.balance.saturating_add(new_balance - old_balance)
-            } else {
-                merged.balance.saturating_sub(old_balance - new_balance)
-            };
-            if new_nonce != old_nonce {
-                merged.nonce = merged.nonce + (new_nonce - old_nonce);
-            }
-            let mut acc = Account::from(merged);
-            acc.status = AccountStatus::Touched;
-            if !existed && original_info.is_none() {
-                acc.status |= AccountStatus::Created;
-            }
-            changes.insert(*address, acc);
-        }
-    }
+    let (mut changes, beneficiary_delta) = fold_bundles(&mut state, &bundles, beneficiary)
+        .map_err(|e| BlockExecutionError::other(std::io::Error::other(e.to_string())))?;
     if !beneficiary_delta.is_zero() {
         let current = state.basic(beneficiary).map_err(|e| BlockExecutionError::other(std::io::Error::other(e.to_string())))?;
         let existed = current.is_some();
@@ -534,7 +766,8 @@ mod tests {
         let run = execute_for_build(&evm_env, &envs, &|| Some(db.clone())).expect("a block of transfers");
         assert!(run.skipped.is_empty(), "{:?}", run.skipped);
         assert_eq!(run.executed.len(), envs.len());
-        assert!(run.phases.groups >= 1);
+        assert_eq!(run.phases.groups, 8, "one group per sender");
+        assert!(run.phases.batches >= 1);
 
         let beneficiary = evm_env.block_env.beneficiary;
         let base_fee = evm_env.block_env.basefee;
@@ -543,22 +776,24 @@ mod tests {
         let mut fees = U256::ZERO;
         let mut gas = 0u64;
         for built in &run.executed {
-            assert!(!built.result.state.contains_key(&beneficiary), "beneficiary stripped");
             let tip = txs[built.index].effective_tip_per_gas(base_fee).unwrap_or_default();
             fees += U256::from(tip) * U256::from(built.gas_used);
             gas += built.gas_used;
-            state.commit(built.result.state.clone());
         }
+        let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+        assert_eq!(graft.beneficiary_delta, fees, "the batches credited the beneficiary the summed tips");
+        assert_eq!(graft.committed, 0, "nothing was in the block's cache yet");
+        assert!(!state.cache.accounts.contains_key(&beneficiary), "beneficiary left out");
+        let mut changes = revm::state::EvmState::default();
         let current = state.basic(beneficiary).unwrap();
         let existed = current.is_some();
         let mut info = current.unwrap_or_default();
-        info.balance += fees;
+        info.balance += graft.beneficiary_delta;
         let mut account = Account::from(info);
         account.status = AccountStatus::Touched;
         if !existed {
             account.status |= AccountStatus::Created;
         }
-        let mut changes = revm::state::EvmState::default();
         changes.insert(beneficiary, account);
         state.commit(changes);
         // The block executor pays the withdrawal at finish; the builder's
@@ -573,13 +808,110 @@ mod tests {
             state.commit(changes);
         }
         state.merge_transitions(BundleRetention::Reverts);
-        let bundle = state.take_bundle();
+        let mut bundle = state.take_bundle();
+        append_reverts(&mut bundle, graft.reverts);
 
         assert_eq!(gas, serial.result.gas_used, "gas used");
         assert_eq!(bundle.state.len(), serial.state.state.len(), "accounts in the bundle");
         for (address, theirs) in &serial.state.state {
             let ours = bundle.state.get(address).unwrap_or_else(|| panic!("account {address} missing"));
             assert_eq!(ours.info, theirs.info, "info {address}");
+            assert_eq!(ours.original_info, theirs.original_info, "original {address}");
+            assert_eq!(ours.status, theirs.status, "status {address}");
+        }
+        // The reverts: one set for the block, the same entry per account.
+        assert_eq!(bundle.reverts.len(), 1);
+        assert_eq!(serial.state.reverts.len(), 1);
+        let ours: std::collections::BTreeMap<_, _> = bundle.reverts[0].iter().cloned().collect();
+        let theirs: std::collections::BTreeMap<_, _> = serial.state.reverts[0].iter().cloned().collect();
+        assert_eq!(ours.len(), theirs.len(), "reverts");
+        for (address, revert) in &theirs {
+            assert_eq!(ours.get(address), Some(revert), "revert {address}");
+        }
+    }
+
+    /// A full bench-tier block (163,000 transfers, 6,000 senders, recipients
+    /// drawn from two million) through the serial transfer path and through
+    /// `execute_for_build`, timed. `cargo test -p n42-engine-types --release
+    /// bench_build_run -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_build_run() {
+        let senders = 6_000u64;
+        let per = 27u64;
+        let mut db = CacheDB::new(EmptyDB::default());
+        let beneficiary = addr(1);
+        db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+        let mut envs = Vec::new();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for s in 0..senders {
+            let sender = addr(100 + s);
+            db.insert_account_info(sender, AccountInfo { balance: U256::from(10u128.pow(21)), nonce: 0, ..Default::default() });
+            for k in 0..per {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                let to = addr(1_000_000 + seed % 2_000_000);
+                let mut env = TxEnv::default();
+                env.caller = sender;
+                env.kind = TxKind::Call(to);
+                env.value = U256::from(1_000 + k);
+                env.gas_limit = 21_000;
+                env.gas_price = 10_000_000_000;
+                env.gas_priority_fee = Some(1_000_000_000);
+                env.nonce = k;
+                env.tx_type = 2;
+                env.chain_id = Some(1);
+                envs.push(env);
+            }
+        }
+        // Interleave senders as the queue does.
+        let mut order: Vec<TxEnv> = Vec::with_capacity(envs.len());
+        for k in 0..per as usize {
+            for s in 0..senders as usize {
+                order.push(envs[s * per as usize + k].clone());
+            }
+        }
+        let envs = order;
+        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(&header).expect("env");
+        for round in 0..3 {
+            let at = std::time::Instant::now();
+            let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+            let mut in_transfer = std::time::Duration::ZERO;
+            let mut in_commit = std::time::Duration::ZERO;
+            {
+                let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+                for env in &envs {
+                    let t = std::time::Instant::now();
+                    let out = evm.transfer(env).unwrap().expect("a transfer");
+                    in_transfer += t.elapsed();
+                    let t = std::time::Instant::now();
+                    evm.db_mut().commit(out.state);
+                    in_commit += t.elapsed();
+                }
+            }
+            let serial = at.elapsed();
+            let at = std::time::Instant::now();
+            state.merge_transitions(BundleRetention::PlainState);
+            let bundle = state.take_bundle();
+            let merge = at.elapsed();
+            eprintln!("serial: transfer {in_transfer:?} commit {in_commit:?} merge {merge:?} ({} accounts)", bundle.state.len());
+            let at = std::time::Instant::now();
+            let run = execute_for_build(&evm_env, &envs, &|| Some(db.clone())).expect("a block of transfers");
+            let groups = at.elapsed();
+            let at = std::time::Instant::now();
+            let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+            let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+            let grafted = at.elapsed();
+            let at = std::time::Instant::now();
+            state.merge_transitions(BundleRetention::Reverts);
+            let mut bundle = state.take_bundle();
+            append_reverts(&mut bundle, graft.reverts);
+            let merge = at.elapsed();
+            eprintln!(
+                "round {round}: serial {serial:?}; parallel {groups:?} (partition {} ms, {} groups in {} batches, exec {} ms, skipped {}) + graft {grafted:?} ({} accounts, {} committed) + merge {merge:?} ({} accounts, {} reverts)",
+                run.phases.partition_ms, run.phases.groups, run.phases.batches, run.phases.groups_ms, run.skipped.len(), graft.accounts, graft.committed, bundle.state.len(), bundle.reverts[0].len()
+            );
         }
     }
 
