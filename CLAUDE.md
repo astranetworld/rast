@@ -109,7 +109,7 @@ block's cycle goes — run at the END of a round and compare whole rounds only)
 and `scripts/fleet7-profile.sh` (perf between windows; `--alloc` for jemalloc
 heap profiles, the instrument a CPU profile cannot replace).
 
-**Record (2026-09-05, round 39): 365,399 / 343,885 TPS** (win1/win2 of loop53Q300a at pacing 300,
+**Record (2026-09-07, round 41, Ed25519 0x50 transactions): 396,601 / 342,288 TPS** (loop65C2, every block full at a 0.411 s cycle; 385,742 on loop65C3; the record configuration below plus `F7_FLOOD_ALG=ed25519 N42_ALTSIG_SENDER_CACHE=4194304 N42_ED25519_BATCH=128`, see `docs/NATIVE_FLEET7.md` rounds 40-41). Previous secp256k1 record (2026-09-05, round 39): 365,399 / 343,885 TPS (win1/win2 of loop53Q300a at pacing 300,
 0.423 s cycle; pacing 350 reads 357k twice, 400 reads 349-353k; the same legs without huge pages for
 the heap 310k / 293k) with the round-39 configuration plus `N42_TX_INGEST_RECOVER_PARALLEL=20
 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always N42_FOLLOWER_PARALLEL=1 TOKIO_WORKER_THREADS=8

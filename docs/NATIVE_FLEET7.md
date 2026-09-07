@@ -123,6 +123,34 @@ timed out waiting for it. It did not recur in B2 or B3; a watchdog now
 dumps every thread's state and a perf sample if a chain stalls for 20 s
 during a round.
 
+## Round 41: the sender cache at 2^22 -- 396,601 and 385,742 (2026-09-07)
+
+loop65, the loop64 configuration with `N42_ALTSIG_SENDER_CACHE=4194304`
+(C legs) and, in C2, `N42_ED25519_BATCH=128`; A3 the secp256k1 bookend,
+B4 the Ed25519 baseline with the 2^20 cache:
+
+    leg  configuration              win1     cycle    occ   win2     win3
+    C1   ed25519, cache 2^22        265,085  0.612 s  100%  233,513  331,350   (first leg after the rebuild: warm-up)
+    A3   secp                       354,604  0.345 s  75%   338,484  321,031
+    C2   ed25519, cache 2^22, b128  396,601  0.411 s  100%  342,288  244,492 (52%: the 48M flood ran out)
+    C3   ed25519, cache 2^22        385,742  0.423 s  100%  -- halted at block 222, as B1 --
+    B4   ed25519, cache 2^20        353,153  0.462 s  100%  298,568  226,739
+
+**396,601 and 385,742 on window 1, every block full**, against the
+365,399 record: the larger cache takes the follower's senders phase from
+107 ms to 33-34 ms (141k of 163k senders cached, 87%) and the full-block
+direct import to 220-222 ms, under the secp256k1 legs' 251. The batch of
+128 is not distinguishable from 64 at this spread. The flood delivered
+its 48M transactions in 148 s, so window 3 of a 400k round is starved;
+loop66 runs pertx 10000.
+
+Where it binds now is the chain's cycle at 0.41 s with 163k a block
+(~397k/s), the phase-2 question. C3 halted the way B1 did -- node0, the
+next leader, stuck after executing block 222 with every thread of its
+execution layer in futex wait and no log line -- so the halt is real and
+recurring (2 of 7 Ed25519 legs), and the node now publishes the stage of
+its import and its build for a watchdog to log when it happens again.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
