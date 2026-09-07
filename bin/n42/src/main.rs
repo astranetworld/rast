@@ -294,6 +294,34 @@ fn main() {
                 }
             }
 
+            // A watchdog for the direct import: a block that has been importing
+            // for six seconds is a stuck node, and the stages of the import and
+            // of any build running beside it are the first thing to know.
+            std::thread::Builder::new().name("n42-watchdog".into()).spawn(|| {
+                let mut last = (0u64, std::time::Instant::now());
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let import = n42::follower_import::IMPORT_STAGE.load(std::sync::atomic::Ordering::Relaxed);
+                    if import != last.0 {
+                        last = (import, std::time::Instant::now());
+                        continue;
+                    }
+                    if import == 0 || last.1.elapsed() < std::time::Duration::from_secs(6) {
+                        continue;
+                    }
+                    let build = n42_engine_types::BUILD_STAGE.load(std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "n42.watchdog",
+                        stuck_secs = last.1.elapsed().as_secs(),
+                        import_block = import >> 8,
+                        import_stage = n42::follower_import::IMPORT_STAGES[(import & 0xff) as usize % 8],
+                        build_parent = build >> 8,
+                        build_stage = n42_engine_types::BUILD_STAGES[(build & 0xff) as usize % 8],
+                        "direct import has not progressed",
+                    );
+                    last.1 = std::time::Instant::now();
+                }
+            }).ok();
             // The builder-side transaction queue, beside the pool. See
             // n42_tx_queue. Fed by the ingest, drained by the builder, pruned
             // here by every canonical block on every node.

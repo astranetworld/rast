@@ -311,6 +311,29 @@ where
     }
 }
 
+/// Where the builder is, for the watchdog: `parent_number << 8 | stage`, 0
+/// when no build is running. Stages: 1 setup, 2 selecting, 3 executing,
+/// 4 finishing, 5 sealing, 6 remembering, 7 payload.
+pub static BUILD_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Names the stages of [`BUILD_STAGE`].
+pub const BUILD_STAGES: [&str; 8] = ["idle", "setup", "selecting", "executing", "finishing", "sealing", "remembering", "payload"];
+
+struct BuildStage(u64);
+
+impl BuildStage {
+    fn at(&self, stage: u64) {
+        BUILD_STAGE.store((self.0 << 8) | stage, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for BuildStage {
+    fn drop(&mut self) {
+        BUILD_STAGE.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+
 /// Constructs an Ethereum transaction payload using the best transactions from the pool.
 ///
 /// Given build arguments including an Ethereum client, transaction pool,
@@ -443,6 +466,8 @@ where
             out: qmdb_root.clone(),
         });
     }
+    let build_stage = BuildStage(parent_header.number);
+    build_stage.at(1);
     let mut builder: reth_evm::execute::BasicBlockBuilder<'_, EvmConfig::BlockExecutorFactory, _, _, EthPrimitives> = reth_evm::execute::BasicBlockBuilder {
         executor: evm_config.create_executor(evm, block_ctx.clone()),
         ctx: block_ctx,
@@ -462,6 +487,7 @@ where
     let mut exec_ns: u128 = 0;
     let mut tail_ns: u128 = 0;
     let setup_took = build_started.elapsed();
+    build_stage.at(2);
     let mut stale_txs: u64 = 0;
     // Transactions taken from the pool ahead of execution so that the
     // accounts they touch can be read in parallel first (`N42_BUILDER_PREFETCH`).
@@ -640,6 +666,7 @@ where
         let pulled_at = ticks();
         pool_ticks += pulled_at.wrapping_sub(pool_at);
         tx_count += 1;
+        if tx_count == 0 { build_stage.at(3); }
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
@@ -782,6 +809,7 @@ where
     // returns itself.
     drop(pulled.take());
     let loop_done = build_started.elapsed();
+    build_stage.at(4);
     // Ticks to nanoseconds, against the wall clock of the loop just run.
     {
         let elapsed_ticks = ticks().wrapping_sub(ticks_at_start).max(1);
@@ -920,6 +948,7 @@ where
     let block_number = header.number;
 
     // seal
+    build_stage.at(5);
     cons.seal(&mut header)
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
@@ -939,6 +968,7 @@ where
 
     let recovered: Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>> =
         Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
+    build_stage.at(6);
     crate::built_executions::remember(
         block_hash,
         crate::built_executions::BuiltExecution {
@@ -990,6 +1020,7 @@ where
             "payload build phases"
         );
     }
+    build_stage.at(7);
     let payload = EthBuiltPayload::new(recovered, total_fees, requests, block_access_list)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);

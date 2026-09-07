@@ -37,7 +37,7 @@ mod network;
 pub use consensus::{is_hotstuff_chain, N42Consensus, N42ConsensusBuilder, N42FullConsensus};
 pub use engine_validator::{header_profile_for, N42EngineValidator, N42EngineValidatorBuilder};
 pub use hotstuff_consensus::{gov5_receipt_root_bloom, HotStuffConsensus};
-pub use payload::N42PayloadServiceBuilder;
+pub use payload::{N42PayloadServiceBuilder, BUILD_STAGE, BUILD_STAGES};
 pub use engine_types::{N42BuiltPayload, N42EngineTypes};
 pub use n42_evm::{N42EvmConfig, N42ReceiptBuilder};
 pub use pool::{N42PooledTransaction, N42TransactionPool};

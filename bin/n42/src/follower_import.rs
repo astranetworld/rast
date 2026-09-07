@@ -37,6 +37,29 @@ use std::sync::Mutex;
 /// is the state of. What reth's payload builder does with its `pre_cached`.
 pub type CarriedReads = Mutex<Option<(B256, CachedReads)>>;
 
+/// Where a direct import is, for the watchdog: `block_number << 8 | stage`,
+/// 0 when none is running. Stages: 1 header, 2 senders, 3 execution,
+/// 4 post-execution checks, 5 carry, 6 QMDB root, 7 hashed state.
+pub static IMPORT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Names the stages of [`IMPORT_STAGE`].
+pub const IMPORT_STAGES: [&str; 8] = ["idle", "header", "senders", "execution", "checks", "carry", "qmdb-root", "hashed-state"];
+
+struct ImportStage(u64);
+
+impl ImportStage {
+    fn at(&self, stage: u64) {
+        IMPORT_STAGE.store((self.0 << 8) | stage, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for ImportStage {
+    fn drop(&mut self) {
+        IMPORT_STAGE.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+
 /// Above this many cached accounts the carry starts again from the block's
 /// own post-state: a follower sees every block, and the reads would grow
 /// without bound.
@@ -67,6 +90,8 @@ where
 {
     let qmdb = qmdb.ok_or("no QMDB state: the direct import needs the chain's root")?;
     let started = std::time::Instant::now();
+    let stage = ImportStage(sealed.number);
+    stage.at(1);
     let parent_hash = sealed.parent_hash;
     let number = sealed.number;
     let block_hash = sealed.hash();
@@ -87,6 +112,7 @@ where
         .map_err(|err| format!("body: {err}"))?;
     let header_ms = started.elapsed().as_millis() as u64;
     let senders_at = std::time::Instant::now();
+    stage.at(2);
 
     // Senders: the recovery cache the ingest fills (what the engine's own
     // path reads), the rest recovered on the worker pool. 0x50 transactions
@@ -141,6 +167,7 @@ where
     // against the header.
     let state = provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}"))?;
     let executed_at = std::time::Instant::now();
+    stage.at(3);
     let mut cached = match carry.lock().unwrap_or_else(|p| p.into_inner()).take() {
         Some((of, cached)) if of == parent_hash => cached,
         _ => CachedReads::default(),
@@ -184,6 +211,7 @@ where
     };
     let exec_ms = executed_at.elapsed().as_millis() as u64;
     let checks_at = std::time::Instant::now();
+    stage.at(4);
     consensus
         .validate_block_post_execution(&recovered, &output.result, None, None)
         .map_err(|err| format!("post-execution: {err}"))?;
@@ -201,12 +229,14 @@ where
                 }
             }
         }
+        stage.at(5);
         *carry.lock().unwrap_or_else(|p| p.into_inner()) = Some((block_hash, cached));
     }
 
     // The QMDB root against the header's, which also files the block's tree
     // under its hash for the engine and the next block.
     let root_at = std::time::Instant::now();
+    stage.at(6);
     let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
     let changes = n42_qmdb_reth::changes_from_execution(&output.state, prague);
     qmdb.validate_block(parent_hash, block_hash, number, &changes, recovered.state_root)
@@ -214,6 +244,7 @@ where
     let root_ms = root_at.elapsed().as_millis() as u64;
 
     let hashed_at = std::time::Instant::now();
+    stage.at(7);
     let hashed_state = state.hashed_post_state(&output.state).map_err(|err| format!("hashed state: {err}"))?;
     let hashed_ms = hashed_at.elapsed().as_millis() as u64;
 
