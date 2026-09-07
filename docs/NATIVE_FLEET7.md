@@ -151,6 +151,43 @@ execution layer in futex wait and no log line -- so the halt is real and
 recurring (2 of 7 Ed25519 legs), and the node now publishes the stage of
 its import and its build for a watchdog to log when it happens again.
 
+## Round 42: phase-2 levers at full 0x50 blocks (2026-09-07)
+
+loop66, the round-41 configuration (Ed25519, cache 2^22, batch 128) with
+pertx 10000 so the flood outlasts the windows, and the phase-2 levers one
+at a time. Every block full in every leg:
+
+    leg  change                         win1     cycle    win2     cycle    win3     cycle
+    D1   (first leg after the rebuild)  358,253  0.455 s  282,430  0.577 s  304,252  0.400 s
+    D2   gas ceiling 5.13B (245k/block) 407,485  0.600 s  325,844  0.750 s  309,342  0.790 s
+    D3   pacing 250                     402,028  0.405 s  336,041  0.484 s  233,624  0.370 s (53%)
+    D4   baseline (163k, pacing 300)    396,619  0.411 s  342,283  0.476 s  249,924  0.345 s (53%)
+    D5   gas ceiling 5.13B              423,775  0.577 s  334,133  0.732 s  228,067  1.072 s
+
+- The baseline reproduces round 41 to four digits (D4 396,619 / 342,283
+  against C2 396,601 / 342,288).
+- **Pacing 250 is null** (402k against 397k, inside the spread): the gate
+  is not what holds the cycle at 0.41 s; the work per full block is.
+- **Bigger blocks buy 3-7% on window 1 and lose the round**: 245k a block
+  reads 407k and 424k on window 1 at a 0.58-0.60 s cycle, then 0.73-0.79 s
+  on window 2 and 1.07 s on window 3 in D5 -- 34 MB bodies and 382 ms
+  follower imports (convert 90, senders 75, exec 117, root 21) degrade
+  faster than they gain. 163k stays.
+- Window 3 at 53% occupancy in D3/D4 is the flood: its closed loop slows
+  from 390k/s to 250k/s as the pool sits at its high-water mark, not the
+  chain (cycle 0.35-0.37 s there).
+- No halt in five legs; the watchdog stayed silent.
+
+Where a full 163k block's 0.41 s goes, from the C2/D4 logs: the leader's
+build is 292-313 ms (execution 202-244 ms serial through the transfer
+path, finish 55, assemble 8) and its own import by header ~50 ms; a
+follower's direct import is 220-222 ms (convert 50-56, exec 72 in 44
+groups with a 38 ms merge, senders 33, root 15, header/checks/hashed
+~15) plus 17 ms to decode the body; publish to receive is 30 ms and vote
+to decide 10-13 ms. The leader path is the long pole -- the same as the
+roadmap's 3A: the builder executes serially where the follower already
+runs 44 groups in parallel.
+
 ## What the chain is
 
 `crates/chainspec/res/genesis/n42_fleet7.json`: seven validators whose BLS keys
