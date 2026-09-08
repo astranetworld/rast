@@ -936,6 +936,35 @@ pub enum QmdbUndoError {
     },
 }
 
+
+/// The key -> slot index. Keys are already 32-byte hashes (keccak of an
+/// address or an address and a slot), so the map hashes them by their first
+/// eight bytes instead of running SipHash over 32: a full block is ~150,000
+/// inserts and as many lookups, twice (builder and follower).
+type KeyIndex = HashMap<Hash, u64, std::hash::BuildHasherDefault<KeyPrefixHasher>>;
+
+/// Hashes a [`Hash`] key by its leading eight bytes. Only ever fed 32-byte
+/// keys through `write`; anything else falls back to folding the bytes in.
+#[derive(Default)]
+pub struct KeyPrefixHasher(u64);
+
+impl std::hash::Hasher for KeyPrefixHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() >= 8 {
+            self.0 ^= u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
+        } else {
+            for b in bytes {
+                self.0 = self.0.rotate_left(8) ^ u64::from(*b);
+            }
+        }
+    }
+}
+
 /// A correctness-first QMDB tree for cross-client bootstrap and vectors.
 ///
 /// It deliberately rebuilds the small upper tree on root reads. gov5's
@@ -944,7 +973,7 @@ pub enum QmdbUndoError {
 #[derive(Clone)]
 pub struct QmdbCompatTree {
     entries: Vec<Entry>,
-    index: HashMap<Hash, u64>,
+    index: KeyIndex,
     twigs: Vec<Twig>,
     next_slot: u64,
     /// The record being captured, between `start_undo_recording` and
@@ -975,7 +1004,7 @@ impl QmdbCompatTree {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            index: HashMap::new(),
+            index: KeyIndex::default(),
             twigs: Vec::new(),
             next_slot: 0,
             recording: None,
@@ -1223,6 +1252,11 @@ impl QmdbCompatTree {
         // and root. The tree these produce is the tree `set`/`delete` produce,
         // and a test says so operation for operation.
         let leaves = leaf_hashes(&operations);
+        // Room for the block's appends up front: a rehash of a multi-million
+        // entry index in the middle of the block was part of the 75 ms the
+        // structural writes took at 147,000 operations.
+        self.index.reserve(operations.len());
+        self.entries.reserve(operations.len());
         let mut dirty: Vec<u8> = Vec::with_capacity(self.twigs.len() + operations.len() / TWIG_SIZE + 2);
         for (operation, leaf) in operations.into_iter().zip(leaves) {
             match (operation.value, leaf) {

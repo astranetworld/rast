@@ -329,9 +329,25 @@ pub fn graft_bundles<DB: Database>(
     bundles: Vec<BundleState>,
     beneficiary: Address,
 ) -> Result<Graft, <State<DB> as Database>::Error> {
+    graft_bundles_with(state, bundles, beneficiary, true)
+}
+
+/// [`graft_bundles`] with a say over the state's cache: a follower's block
+/// state is read again only for the beneficiary's credit and discarded once
+/// its bundle is taken, so it can skip the cache insert per account
+/// (`keep_cache = false`); a builder, whose serial loop and post-execution
+/// changes may read the grafted accounts, keeps it.
+pub fn graft_bundles_with<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+) -> Result<Graft, <State<DB> as Database>::Error> {
     let mut graft = Graft::default();
     let total: usize = bundles.iter().map(|b| b.state.len()).sum();
-    state.cache.accounts.reserve(total);
+    if keep_cache {
+        state.cache.accounts.reserve(total);
+    }
     state.bundle_state.state.reserve(total);
     graft.reverts.reserve(total);
     let mut slow: revm::state::EvmState = Default::default();
@@ -393,13 +409,15 @@ pub fn graft_bundles<DB: Database>(
                 slow.insert(address, acc);
                 continue;
             }
-            state.cache.accounts.insert(
-                address,
-                CacheAccount {
-                    account: Some(PlainAccount { info: info.clone(), storage: Default::default() }),
-                    status: account.status,
-                },
-            );
+            if keep_cache {
+                state.cache.accounts.insert(
+                    address,
+                    CacheAccount {
+                        account: Some(PlainAccount { info: info.clone(), storage: Default::default() }),
+                        status: account.status,
+                    },
+                );
+            }
             state.bundle_state.state_size += account.size_hint();
             state.bundle_state.state.insert(address, account);
             graft.accounts += 1;
@@ -694,7 +712,7 @@ where
     let at = std::time::Instant::now();
     let err = |e: &dyn std::fmt::Display| BlockExecutionError::other(std::io::Error::other(e.to_string()));
     let (mut changes, beneficiary_delta, grafted) = if graft {
-        let grafted = graft_bundles(&mut state, bundles, beneficiary).map_err(|e| err(&e))?;
+        let grafted = graft_bundles_with(&mut state, bundles, beneficiary, false).map_err(|e| err(&e))?;
         (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
     } else {
         let (changes, delta) = fold_bundles(&mut state, &bundles, beneficiary).map_err(|e| err(&e))?;
