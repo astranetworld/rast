@@ -31,12 +31,14 @@ shape a real chain would produce, and record what the ceiling is made of.
   legs in six read a 0.652-0.667 s cycle either way: at 450 ms pacing the
   floor is the pacing plus the ~200 ms that does not overlap it. The next
   gain is a tighter pacing, not a faster import -- loop101 sweeps it.
-- **Where the cycle goes.** `cycle ~= publish->recv 30 + import barrier 530 +
-  vote->decide 20 + decide->publish 80 ms`. The barrier -- a validator's wait
-  for its execution layer's answer -- is the pole. Inside it, at 163,000
-  transfers on a fast leg: execution 162-182 (partition 30-41, groups 55-62,
-  merge 59-75), QMDB root 100, conversion 54, hashed state 39-43, senders 36,
-  engine 35, checks 5; total 470-482 ms.
+- **Where the cycle goes.** `cycle ~= publish->recv 30 + import barrier +
+  vote->decide 20 + decide->publish 80 ms`, and the pacing (450 ms) sets a
+  floor under all of it. The barrier is a validator's wait for its execution
+  layer's answer; inside it, at 163,000 transfers with the round-43 cuts in:
+  execution 180-192 (partition 30, groups 55-62, merge 59), QMDB root 63-65,
+  conversion 48-50, hashed state 26, senders 35, engine 39, checks 5; total
+  429-446 ms. Without the cuts each of root, hashed and conversion is
+  ~1.6x larger and the total is 506.
 - **A follower's CPU** (loop94 profile): 61% tokio threads doing the ingest
   (Ed25519 batch verification ~36% of all samples, keccak ~5%), 14% rayon
   threads doing the import, 6% persistence. Every validator verifies every
@@ -66,10 +68,15 @@ shape a real chain would produce, and record what the ceiling is made of.
    is invisible. Bookend everything (S-B-S or S-B-R-S-B-R).
 2. **Never read a first leg.** Since loop98 the bench runs
    `scripts/dropcache.py` (evicts stale file pages, no root) and
-   `scripts/hugeprep.py 60` (MADV_COLLAPSE in 256 MB chunks: an ~80 GB
-   huge-page pool in 5 s) before every leg, and prints a `memory :` header
-   line. A leg whose order-9 pool was under ~30 GB at the start is not
-   comparable. `F7_DROP_CACHE=0` / `F7_HUGEPREP=0` turn them off.
+   `scripts/hugeprep.py 30 2 <target> 4` before every leg, and prints a
+   `memory :` header line. hugeprep writes every page of a 30 GB working set
+   -- which also evicts a neighbour's page cache, and which the earlier
+   sparse version did not do at all -- collapses it with `MADV_COLLAPSE` in
+   256 MB chunks, frees it, and repeats until the free huge-page pool reaches
+   `F7_HUGEPREP` GB (default 40; ~2 s a round once the pool is healthy, and
+   ~42 GB is this box's ceiling while the tmpfs holds 21 GB). A leg whose
+   pool was under ~30 GB at the start is not comparable.
+   `F7_DROP_CACHE=0` / `F7_HUGEPREP=0` turn them off.
 3. **A leg is void** if `datc`, a gov5 fleet, or a foreign flood was on the
    box. The launcher gates on `pgrep -fc 'n4[2] node'`, `n42-dat[c]` and
    `txfloo[d]` being zero, three times 30 s apart, then claims the box per
