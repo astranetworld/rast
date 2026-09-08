@@ -505,6 +505,40 @@ ms: 2 x workers batches of ~2,000 transfers on a contended pool instead of
 staying off; the follower's execution phase wants a different cut (the
 graft's 72-75 ms and the groups' wall time, not the partition).
 
+**loop92 (2026-09-08 10:00): the stragglers' grace, with progress votes.**
+A quorum is 2f+1, so a leader keeps proposing on the five fastest votes
+while the two slowest importers fall a block behind per view, and the next
+handover stalls. `--straggler-grace-ms` (F7_STRAGGLER_GRACE_MS; ed417f695,
+858f31994, b713b113d) makes the leader wait, after a view is decided,
+until every validator's Round 1 vote for it has arrived or the grace has
+passed; a follower that imports a block after its view moved on sends a
+*progress vote* (a Vote signed over a separate message, never a QC
+contribution) so the ledger fills. Two earlier legs without progress votes,
+and one without the leader's own vote in the ledger, read 125k at a 1.25 s
+cycle: the grace ran its full length on every block. With both fixed, on
+the same degraded box as loop91 (post-datc), interleaved:
+
+    leg     pacing  grace   win1     win2     win3     total    gaps > 4 s
+    G300a   300 ms  600 ms  162,764  151,949  157,385  14.18M   0
+    P450a   450 ms  -       139,476   90,930      331   6.91M   8 (two heights committed twice)
+    G300b   300 ms  600 ms  195,540  156,946  162,937  15.49M   0
+    P450b   450 ms  -       184,360  152,070  152,083  14.67M   0
+    G450a   450 ms  600 ms  244,413  168,353  157,528  17.12M   0
+    G450b   450 ms  600 ms  244,404  168,357  152,057  16.95M   0
+
+No grace leg stalled; the two with 450 ms pacing read loop87's best
+window 1 (244k at 0.667 s) on a box where the plain 450 ms legs read 139k
+and 184k, and the two best totals of the day. **Adopted: the bench runs
+`F7_STRAGGLER_GRACE_MS=600` with 450 ms pacing.** At 300 ms the grace
+paces the chain to the slowest follower (1.0 and 0.83 s cycles here) --
+correct, and slower than the fixed 450 on this box.
+
+The collapse in P450a exposed one more loss: the leader took its own
+block's transactions out of the queue at import, and a block consensus
+never committed carried them away for good (40,000 nonce refusals a block
+for the rest of the leg). The queue now holds an own block's transactions
+until the chain settles its height (7c6b8ce11; loop93 validates it).
+
 What would actually remove the storm is less to reclaim: the tmpfs
 (27-34 GB of other drivers' leftovers under /tmp), the seven heaps'
 huge-page appetite (a 4 KB heap on the followers only, keeping the

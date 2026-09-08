@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-08 08:30)
+# Fleet7 status (living note; last updated 2026-09-08 10:20)
 
 The one-page state of the native seven-node fleet work: what is true now, what
 is in flight, what is decided and what is not. The measurements behind it are
@@ -23,6 +23,17 @@ in `docs/NATIVE_FLEET7.md` (rounds 40-43 and the loop82-87 sections),
   of them, must catch up and the views time out). 450 ms pacing removes it in
   practice; memory pressure (thp:always heaps vs page cache) widens it.
 
+## Decided since 08:30
+
+- **Stragglers' grace adopted** (loop92): `F7_STRAGGLER_GRACE_MS=600` with 450 ms
+  pacing -- 244k on window 1, no stall in four grace legs, best totals of the
+  day (17.1M); it needs the progress votes and the leader's own vote in the
+  ledger (b713b113d). At 300 ms it paces to the slowest follower (slower here).
+- **Follower sender grouping is null** (loop91): stays off.
+- **Own-block transactions are held until the height settles** (7c6b8ce11):
+  a block consensus never committed used to lose them and leave every
+  affected sender's lane above the chain's nonce (P450a). loop93 validates.
+
 ## Defaults and knobs (record environment)
 
 `N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1` (off by default, in the record
@@ -36,7 +47,10 @@ perfectly steady.
 
 ## In flight (launchers in `~/.claude/jobs/2127e0ae/tmp/`, chained by ALLDONE)
 
-1. **loop89** -- follower grouping by sender (`N42_FOLLOWER_SENDER_GROUPS=1`,
+1. (done) **loop89/91** -- follower grouping by sender: null.
+1. (done) **loop92** -- grace: adopted.
+1. **loop93** -- the held own-block ledger under 300 ms pacing (stalls on purpose), with and without the grace.
+1. (old) **loop89** -- follower grouping by sender (`N42_FOLLOWER_SENDER_GROUPS=1`,
    7dbb2cc21) vs connected components, S-B-S-B. Ran under a 17-31 GB `datc`
    neighbour (flood starved: 13 s replies); its numbers are suspect.
 2. **loop90** -- the stragglers' grace *with progress votes* (ed417f695 +
