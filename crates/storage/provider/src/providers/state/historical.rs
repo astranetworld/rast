@@ -647,7 +647,7 @@ where
         bundle_state: &revm::database::BundleState,
     ) -> ProviderResult<HashedPostState> {
         let mut hashed_state =
-            HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state());
+            super::latest::hashed_post_state_from_bundle(bundle_state.state());
         if !bundle_state
             .state()
             .values()
