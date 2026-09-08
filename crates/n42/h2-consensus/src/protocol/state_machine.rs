@@ -1073,6 +1073,11 @@ impl ConsensusEngine {
                     return Ok(());
                 }
             }
+            // A late or progress vote for a view this node led: not for the
+            // protocol, but for the voters ledger (the stragglers' grace).
+            if let ConsensusMessage::Vote(ref vote) = msg {
+                self.note_late_vote(vote);
+            }
             tracing::trace!(target: "n42::cl::engine", current_view, msg_view = view, "discarding stale consensus message");
             return Ok(());
         }
@@ -2919,6 +2924,48 @@ mod tests {
     fn test_engine_pacemaker_accessible() {
         let (engine, _, _, _rx) = make_engine(1, 0);
         assert!(!engine.pacemaker().is_timed_out());
+    }
+
+    /// The voters ledger behind the stragglers' grace: the leader's own vote,
+    /// the followers' on-time votes, and a progress vote that arrives after
+    /// the view has moved on -- verified over the progress message, never
+    /// the vote message -- all count; an unsigned one does not.
+    #[test]
+    fn voters_seen_counts_self_on_time_and_late_progress_votes() {
+        use crate::protocol::quorum::signing_message;
+
+        let (mut engine, sks, _vs, mut rx) = make_engine(4, 1);
+        let block_hash = B256::repeat_byte(0xF7);
+        let view = 1u64;
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .expect("block ready");
+        assert_eq!(engine.voters_seen(view), 1, "the leader's own vote");
+        while rx.try_recv().is_ok() {}
+
+        for i in [0u32, 2] {
+            let msg = signing_message(view, &block_hash);
+            let vote = Vote { view, block_hash, voter: i, signature: sks[i as usize].sign(&msg) };
+            engine.process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote))).expect("vote");
+        }
+        assert_eq!(engine.voters_seen(view), 3, "two followers on time");
+        while rx.try_recv().is_ok() {}
+
+        // The view moves on; validator 3 imports late and sends a progress vote.
+        engine.advance_to_view(2).expect("advance");
+        assert_eq!(engine.current_view(), 2);
+        let progress = engine.signing_profile.progress_vote_message(view, block_hash);
+        let late = Vote { view, block_hash, voter: 3, signature: sks[3].sign(&progress) };
+        // Whatever the protocol makes of a vote for a past view (it is not
+        // counted towards any QC), the ledger notes the voter.
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Vote(late)));
+        assert_eq!(engine.voters_seen(view), 4, "the progress vote was noted");
+        assert!(engine.vote_collector.is_none(), "no collector for the past view");
+
+        // A forged late vote (wrong key) is not.
+        let forged = Vote { view, block_hash, voter: 0, signature: sks[2].sign(&progress) };
+        let _ = engine.process_event(ConsensusEvent::Message(ConsensusMessage::Vote(forged)));
+        assert_eq!(engine.voters_seen(view), 4);
     }
 
     #[test]

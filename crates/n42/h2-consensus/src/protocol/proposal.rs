@@ -244,6 +244,10 @@ impl ConsensusEngine {
         if let Some(ref mut collector) = self.vote_collector {
             collector.add_verified_vote(self.my_index, leader_vote_sig)?;
         }
+        // The leader's own vote counts towards "every validator has voted"
+        // (loop90: without it the ledger topped out one short and the
+        // stragglers' grace ran its full length on every block).
+        self.note_voter(view, self.my_index);
 
         self.view_timing.proposal_sent = Some(std::time::Instant::now());
         self.emit(EngineOutput::BroadcastMessage(ConsensusMessage::Proposal(
