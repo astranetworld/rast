@@ -150,10 +150,25 @@ logical CPUs (every parallel phase ran 1.5-2x faster at 32 offline).
    not, the barrier is not the import's own latency and the next thing to
    instrument is what the validator does between the answer and its vote.
 2. **The graft's 42 ms** is 129,000 `BundleAccount`s inserted into one
-   `HashMap` on one thread. No grouping avoids it (component and sender
-   groups are within 5 ms at this shape); it needs a different bundle
-   representation -- a sharded or pre-sized map the batches write into
-   directly.
+   `HashMap` on one thread -- 28 MB moved through one core at ~330 ns an
+   account, which is two cache misses per insert and nothing else. No
+   grouping avoids it (component and sender groups are within 5 ms at this
+   shape). Two ways out, in order of appetite:
+   - **Overlap it.** The merged `BundleState` is needed by three consumers:
+     `sorted_operations_from_execution` (the QMDB leaves), the provider's
+     `hashed_post_state`, and the engine's executed insert. The first two can
+     take the batch bundles *separately* -- both already work per account on
+     rayon, and their outputs merge as sorted vectors, which is cheap. Only
+     the engine's insert needs one map, and it is not read until the answer
+     is given. So: compute the operations and the hashed state from the
+     batch bundles while a worker thread builds the merged map, and join
+     before the insert. That hides 42 ms behind the 63 ms root instead of
+     spending it in series.
+   - **Shard it.** `BundleState.state` is revm's `AddressMap`; the batches
+     cannot write it concurrently. Owning a sharded bundle type in
+     `n42-engine-types` and converting once at the boundary trades the
+     conversion for parallelism, and is only worth it if the overlap above
+     is not enough.
 3. **The supply side**, once the chain passes ~330k: the ingest is ~400k/s
    per node and every node verifies every transaction (7x redundant). The
    cheap half is fewer verifications per node; the expensive half is a
