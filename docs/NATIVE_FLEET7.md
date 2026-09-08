@@ -738,6 +738,42 @@ offline against 162-182 on the fleet (the fleet's is under load), and its
 next cut is the graft's inserts, which needs a different bundle
 representation -- not a knob.
 
+**Offline, after loop98 (continued): the root, the conversion, the hashed
+state.** Three more ignored benches at the bench's shape, release builds:
+
+- *Root* (`where_apply_sorted_ops_goes`, twig-core, a 3,000,000-entry tree,
+  133,000 updates + 14,000 new keys a block): 52 ms, of which 45 was the
+  serial structural loop -- per operation a random probe of the index, a
+  random write to the retired slot's entry and twig, the undo entry's clone,
+  the append, and a second random probe to insert the new slot. Now: the
+  index is 256 shards by the key's first byte, and the block's inserts
+  (sorted, hence one contiguous run per shard) go in per shard on the pool;
+  the retired slots are cleared through a bitmap every entry and every twig
+  checks for itself; the undo entries are built on the pool in chunks (the
+  first, per-item version took 21 ms -- an unindexed `flatten().collect()`
+  on a 256-thread pool); an already-sorted input pays a check, not a second
+  sort (12 ms). 52 -> 22-28 ms on the default pool, 15-18 ms with
+  `RAYON_NUM_THREADS=32`; `forest.compute_operations` 64 -> 44 (35 at 32
+  threads), `sorted_operations_from_execution` 15 -> 7 at 32 threads.
+- *Conversion* (`bench_convert_payload`, 163,000 transfers, 18.5 MB): 40 ms,
+  of which the `rayon::join` of the transactions root and the decodes was
+  33 -- against 11 for the same join in the bench. The decodes were
+  collected straight into a `Result<Vec>`, which takes rayon's
+  short-circuiting path (a linked list of pieces, concatenated after);
+  collected into a `Vec<Result>` in place and checked after, the join is
+  15 ms and the conversion 26-27. The follower's sender lookups collected
+  the same way and are changed the same way (its `senders` phase, 36 ms on
+  the fleet, is the next thing to read).
+- *Hashed state*: the chunked keccaks were folded with a rayon `reduce`,
+  which merges the chunk maps pairwise -- every entry moved through
+  log2(chunks) maps; now one fold into a map sized for all of it.
+
+The box has 256 logical CPUs and the node's global rayon pool is sized to
+them; every parallel phase above ran 1.5-2x faster at 32 threads offline
+(loop63 had read +3% for 16 threads, inside the band, before the import was
+this parallel). loop99 bookends the build (S-B-R: old binary, new binary,
+new binary with `RAYON_NUM_THREADS=32`).
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

@@ -91,4 +91,5 @@ metrics.workspace = true
 
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 alloy-eip7928.workspace = true

@@ -853,6 +853,135 @@ fn leaf_hashes(operations: &[QmdbOperation]) -> Vec<Option<Hash>> {
     }
 }
 
+/// The slot each operation's key currently occupies, if any.
+fn held_slots(index: &KeyIndex, operations: &[QmdbOperation]) -> Vec<Option<u64>> {
+    let held = |operation: &QmdbOperation| index.get(&operation.key).copied();
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        operations.par_iter().map(held).collect()
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        operations.iter().map(held).collect()
+    }
+}
+
+/// Retires every slot `held` names: the entries' active flags and the twigs'
+/// bits, each entry and each twig checking a bitmap of the slots on the
+/// worker pool; the twigs touched are marked for a bit-set rehash.
+fn retire_slots(entries: &mut [Entry], twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[Option<u64>]) {
+    const WORDS_PER_TWIG: usize = TWIG_SIZE / 64;
+    // The index only ever names active slots (`set` retires the old slot as
+    // it inserts the new one, `delete` removes the key, an undo revives and
+    // re-indexes together), so no entry needs reading here: reading 133,000
+    // of them at random was the cost this pass exists to avoid.
+    let mut bits = vec![0u64; entries.len().div_ceil(64)];
+    let mut any = false;
+    for slot in held.iter().flatten() {
+        let slot = *slot as usize;
+        debug_assert!(entries[slot].active, "the index named an inactive slot");
+        bits[slot / 64] |= 1 << (slot % 64);
+        any = true;
+    }
+    if !any {
+        return;
+    }
+    if dirty.len() < twigs.len() {
+        dirty.resize(twigs.len(), 0);
+    }
+    let clear_entries = |(chunk, word): (&mut [Entry], &u64)| {
+        if *word != 0 {
+            for (i, entry) in chunk.iter_mut().enumerate() {
+                if (*word >> i) & 1 == 1 {
+                    entry.active = false;
+                }
+            }
+        }
+    };
+    let clear_twig = |(twig_id, (twig, mark)): (usize, (&mut Twig, &mut u8))| {
+        let from = (twig_id * WORDS_PER_TWIG).min(bits.len());
+        let to = ((twig_id + 1) * WORDS_PER_TWIG).min(bits.len());
+        let mut touched = false;
+        for (wi, word) in bits[from..to].iter().enumerate() {
+            if *word == 0 {
+                continue;
+            }
+            touched = true;
+            for b in 0..64 {
+                if (*word >> b) & 1 == 1 {
+                    let local = wi * 64 + b;
+                    twig.bits[local / 8] &= !(1 << (local % 8));
+                }
+            }
+        }
+        if touched {
+            *mark = (*mark).max(DIRTY_BITS);
+        }
+    };
+    let n = twigs.len();
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        entries.par_chunks_mut(64).zip(bits.par_iter()).for_each(clear_entries);
+        twigs.par_iter_mut().zip(dirty[..n].par_iter_mut()).enumerate().for_each(clear_twig);
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        entries.chunks_mut(64).zip(bits.iter()).for_each(clear_entries);
+        twigs.iter_mut().zip(dirty[..n].iter_mut()).enumerate().for_each(clear_twig);
+    }
+}
+
+/// The undo entries for the slots `held` names: what each holds now.
+fn undo_entries(entries: &[Entry], held: &[Option<u64>]) -> Vec<UndoEntry> {
+    let entry = |slot: &u64| {
+        let e = &entries[*slot as usize];
+        UndoEntry { slot: *slot, key: e.key, value: e.value.clone() }
+    };
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        // In chunks: an unindexed `flatten().collect()` assembles the result
+        // through a linked list of pieces, and per-item work this small is
+        // dominated by scheduling on a wide pool.
+        let pieces: Vec<Vec<UndoEntry>> =
+            held.par_chunks(2048).map(|chunk| chunk.iter().flatten().map(entry).collect()).collect();
+        let mut out = Vec::with_capacity(pieces.iter().map(Vec::len).sum());
+        for piece in pieces {
+            out.extend(piece);
+        }
+        out
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        held.iter().flatten().map(entry).collect()
+    }
+}
+
+/// Where [`QmdbCompatTree::apply_sorted_ops_phased`] spent its time, in
+/// microseconds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyPhases {
+    /// Operations applied.
+    pub ops: usize,
+    /// Collecting, the sortedness check or sort, and the duplicate check.
+    pub sort_us: u64,
+    /// Leaf hashes and the current-slot lookups, on the worker pool.
+    pub leaves_us: u64,
+    /// The undo record's entries, on the worker pool.
+    pub undo_us: u64,
+    /// `undo_us` plus the retirement of the slots the block replaces, on the
+    /// worker pool.
+    pub retire_us: u64,
+    /// The serial structural writes: appending entries and leaves.
+    pub writes_us: u64,
+    /// The appends' index inserts, per shard on the worker pool.
+    pub index_us: u64,
+    /// Rehashing the touched twigs, in parallel.
+    pub rehash_us: u64,
+}
+
 /// Rehashes every twig marked in `dirty`, each independently of the others.
 fn rehash_dirty(twigs: &mut [Twig], dirty: &[u8]) {
     let work = |(twig_id, twig): (usize, &mut Twig)| match dirty.get(twig_id).copied().unwrap_or(0) {
@@ -941,7 +1070,78 @@ pub enum QmdbUndoError {
 /// address or an address and a slot), so the map hashes them by their first
 /// eight bytes instead of running SipHash over 32: a full block is ~150,000
 /// inserts and as many lookups, twice (builder and follower).
-type KeyIndex = HashMap<Hash, u64, std::hash::BuildHasherDefault<KeyPrefixHasher>>;
+type ShardMap = HashMap<Hash, u64, std::hash::BuildHasherDefault<KeyPrefixHasher>>;
+
+/// The index in 256 shards by the key's first byte, so that a block's
+/// appends -- sorted by key, hence contiguous per shard -- can be inserted
+/// on the worker pool (round 43: the serial index inserts were the largest
+/// part of a 147,000-operation block's 45 ms of structural writes on a
+/// 3,000,000-entry tree).
+#[derive(Clone)]
+struct KeyIndex {
+    shards: Vec<ShardMap>,
+}
+
+impl Default for KeyIndex {
+    fn default() -> Self {
+        Self { shards: (0..256).map(|_| ShardMap::default()).collect() }
+    }
+}
+
+impl KeyIndex {
+    #[inline]
+    fn get(&self, key: &Hash) -> Option<&u64> {
+        self.shards[key[0] as usize].get(key)
+    }
+    #[inline]
+    fn insert(&mut self, key: Hash, slot: u64) -> Option<u64> {
+        self.shards[key[0] as usize].insert(key, slot)
+    }
+    #[inline]
+    fn remove(&mut self, key: &Hash) -> Option<u64> {
+        self.shards[key[0] as usize].remove(key)
+    }
+    fn len(&self) -> usize {
+        self.shards.iter().map(HashMap::len).sum()
+    }
+    fn is_empty(&self) -> bool {
+        self.shards.iter().all(HashMap::is_empty)
+    }
+    fn reserve(&mut self, additional: usize) {
+        let per = additional / 256 + 1;
+        for shard in &mut self.shards {
+            shard.reserve(per);
+        }
+    }
+    /// Inserts `(key, slot)` pairs sorted by key, one shard at a time on the
+    /// worker pool (every shard's pairs are one contiguous run).
+    fn insert_sorted(&mut self, pairs: &[(Hash, u64)]) {
+        let mut starts = [0usize; 257];
+        let mut at = 0usize;
+        for shard in 0..256usize {
+            starts[shard] = at;
+            while at < pairs.len() && pairs[at].0[0] as usize == shard {
+                at += 1;
+            }
+        }
+        starts[256] = pairs.len();
+        debug_assert_eq!(at, pairs.len(), "pairs sorted by key");
+        let work = |(shard, map): (usize, &mut ShardMap)| {
+            for (key, slot) in &pairs[starts[shard]..starts[shard + 1]] {
+                map.insert(*key, *slot);
+            }
+        };
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            self.shards.par_iter_mut().enumerate().for_each(work);
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            self.shards.iter_mut().enumerate().for_each(work);
+        }
+    }
+}
 
 /// Hashes a [`Hash`] key by its leading eight bytes. Only ever fed 32-byte
 /// keys through `write`; anything else falls back to folding the bytes in.
@@ -1123,9 +1323,17 @@ impl QmdbCompatTree {
         &mut self,
         operations: impl IntoIterator<Item = QmdbOperation>,
     ) -> Result<(Hash, BlockUndo), QmdbOperationError> {
+        self.apply_sorted_ops_recorded_phased(operations).map(|(root, undo, _)| (root, undo))
+    }
+
+    /// [`Self::apply_sorted_ops_recorded`], reporting where the time went.
+    pub fn apply_sorted_ops_recorded_phased(
+        &mut self,
+        operations: impl IntoIterator<Item = QmdbOperation>,
+    ) -> Result<(Hash, BlockUndo, ApplyPhases), QmdbOperationError> {
         self.start_undo_recording();
-        let root = match self.apply_sorted_ops(operations) {
-            Ok(root) => root,
+        let (root, phases) = match self.apply_sorted_ops_phased(operations) {
+            Ok(done) => done,
             Err(error) => {
                 // A refused batch mutates nothing, so there is nothing to undo.
                 self.recording = None;
@@ -1133,7 +1341,7 @@ impl QmdbCompatTree {
             }
         };
         let undo = self.recording.take().unwrap_or_default();
-        Ok((root, undo))
+        Ok((root, undo, phases))
     }
 
     /// Rolls the tree back across one block, using that block's undo record.
@@ -1231,13 +1439,29 @@ impl QmdbCompatTree {
         &mut self,
         operations: impl IntoIterator<Item = QmdbOperation>,
     ) -> Result<Hash, QmdbOperationError> {
+        self.apply_sorted_ops_phased(operations).map(|(root, _)| root)
+    }
+
+    /// [`Self::apply_sorted_ops`], reporting where the time went.
+    pub fn apply_sorted_ops_phased(
+        &mut self,
+        operations: impl IntoIterator<Item = QmdbOperation>,
+    ) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
+        let mut phases = ApplyPhases::default();
+        let at = std::time::Instant::now();
         let mut operations = operations.into_iter().collect::<Vec<_>>();
-        operations.sort_unstable_by_key(|operation| operation.key);
+        // Callers that sort (`sorted_operations_from_execution`) pay the
+        // check, not a second sort: 12 ms of a 147,000-operation block.
+        if !operations.is_sorted_by_key(|operation| operation.key) {
+            operations.sort_unstable_by_key(|operation| operation.key);
+        }
         for pair in operations.windows(2) {
             if pair[0].key == pair[1].key {
                 return Err(QmdbOperationError::DuplicateKey(pair[0].key));
             }
         }
+        phases.ops = operations.len();
+        phases.sort_us = at.elapsed().as_micros() as u64;
         // The same mutations as `set`/`delete` one after another, with the
         // hashing taken out of the sequence. Per operation those hash a leaf,
         // walk eleven nodes to the twig root, rehash the twig's whole bit set,
@@ -1251,31 +1475,66 @@ impl QmdbCompatTree {
         // eleven per leaf), a twig that only retired slots gets its bit set
         // and root. The tree these produce is the tree `set`/`delete` produce,
         // and a test says so operation for operation.
+        let at = std::time::Instant::now();
         let leaves = leaf_hashes(&operations);
+        // The slot each key holds now, looked up on the worker pool: the
+        // block's keys are distinct, so no lookup depends on an earlier write
+        // of the same block, and the lookups are the random reads of a
+        // multi-million-entry index that the serial loop was waiting on.
+        let held = held_slots(&self.index, &operations);
+        phases.leaves_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        // The undo record's entries -- what every retired slot held -- built
+        // on the worker pool rather than cloned one at a time in the loop.
+        if self.recording.is_some() {
+            let retired = undo_entries(&self.entries, &held);
+            if let Some(record) = self.recording.as_mut() {
+                record.entries.extend(retired);
+            }
+        }
+        phases.undo_us = at.elapsed().as_micros() as u64;
         // Room for the block's appends up front: a rehash of a multi-million
         // entry index in the middle of the block was part of the 75 ms the
         // structural writes took at 147,000 operations.
         self.index.reserve(operations.len());
         self.entries.reserve(operations.len());
         let mut dirty: Vec<u8> = Vec::with_capacity(self.twigs.len() + operations.len() / TWIG_SIZE + 2);
-        for (operation, leaf) in operations.into_iter().zip(leaves) {
+        // The slots the block retires, cleared on the worker pool: every
+        // entry and every twig checks its own against a bitmap, instead of
+        // 133,000 random writes in sequence.
+        retire_slots(&mut self.entries, &mut self.twigs, &mut dirty, &held);
+        phases.retire_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        // The appends' index entries, inserted per shard afterwards; the
+        // block's keys are distinct, so no operation reads one.
+        let mut appended: Vec<(Hash, u64)> = Vec::with_capacity(operations.len());
+        for ((operation, leaf), old_slot) in operations.into_iter().zip(leaves).zip(held) {
             match (operation.value, leaf) {
-                (Some(value), Some(leaf)) => self.set_deferred(operation.key, value, leaf, &mut dirty),
+                (Some(value), Some(leaf)) => {
+                    let slot = self.append_deferred(operation.key, value, leaf, &mut dirty);
+                    appended.push((operation.key, slot));
+                }
                 _ => {
-                    self.delete_deferred(&operation.key, &mut dirty);
+                    if old_slot.is_some() {
+                        self.index.remove(&operation.key);
+                    }
                 }
             }
         }
+        phases.writes_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        self.index.insert_sorted(&appended);
+        phases.index_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
         rehash_dirty(&mut self.twigs, &dirty);
-        Ok(self.root())
+        phases.rehash_us = at.elapsed().as_micros() as u64;
+        Ok((self.root(), phases))
     }
 
-    /// `set`, with the twig's hashing left to [`rehash_dirty`].
-    fn set_deferred(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, dirty: &mut Vec<u8>) {
-        if let Some(old_slot) = self.index.get(&key).copied() {
-            self.record_deactivation(old_slot);
-            self.deactivate_deferred(old_slot, dirty);
-        }
+    /// `set` for the block apply: the slot the key held already retired and
+    /// recorded, the twig's hashing left to [`rehash_dirty`], the index
+    /// insert left to the caller. Returns the slot appended.
+    fn append_deferred(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, dirty: &mut Vec<u8>) -> u64 {
         if let Some(record) = self.recording.as_mut() {
             record.appended_keys.push(key);
         }
@@ -1293,30 +1552,7 @@ impl QmdbCompatTree {
             value,
             active: true,
         });
-        self.index.insert(key, slot);
-    }
-
-    /// `delete`, with the twig's hashing left to [`rehash_dirty`].
-    fn delete_deferred(&mut self, key: &Hash, dirty: &mut Vec<u8>) -> bool {
-        let Some(slot) = self.index.remove(key) else {
-            return false;
-        };
-        self.record_deactivation(slot);
-        self.deactivate_deferred(slot, dirty);
-        true
-    }
-
-    /// `deactivate`, with the twig's hashing left to [`rehash_dirty`].
-    fn deactivate_deferred(&mut self, slot: u64, dirty: &mut Vec<u8>) {
-        let entry = &mut self.entries[slot as usize];
-        if !entry.active {
-            return;
-        }
-        entry.active = false;
-        let twig_id = (slot as usize) / TWIG_SIZE;
-        let local = (slot as usize) % TWIG_SIZE;
-        self.twigs[twig_id].bits[local / 8] &= !(1 << (local % 8));
-        mark_dirty(dirty, twig_id, DIRTY_BITS);
+        slot
     }
 
     pub fn root(&self) -> Hash {
@@ -1451,6 +1687,55 @@ impl QmdbCompatTree {
 
 #[cfg(test)]
 mod tests {
+    /// Where a block's `apply_sorted_ops_recorded` goes on a tree the size
+    /// of the bench's (3,000,000 entries; 133,000 updates and 14,000 new keys
+    /// a block). `cargo test --release -p n42-twig-core --features rayon
+    /// --lib where_apply_sorted_ops_goes -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn where_apply_sorted_ops_goes() {
+        use super::*;
+        fn key(i: u64) -> Hash {
+            let mut h = [0u8; 32];
+            let x = (i.wrapping_mul(0x9e3779b97f4a7c15)).to_be_bytes();
+            h[..8].copy_from_slice(&x);
+            h[24..].copy_from_slice(&i.to_be_bytes());
+            h
+        }
+        fn ops(keys: impl Iterator<Item = u64>, round: u8) -> Vec<QmdbOperation> {
+            let mut ops: Vec<QmdbOperation> = keys.map(|i| QmdbOperation { key: key(i), value: Some(vec![round; 80]) }).collect();
+            ops.sort_unstable_by_key(|o| o.key);
+            ops
+        }
+        let mut tree = QmdbCompatTree::new();
+        let mut next = 0u64;
+        for _ in 0..20 {
+            tree.apply_sorted_ops(ops(next..next + 150_000, 0)).unwrap();
+            next += 150_000;
+        }
+        for round in 1..=4u8 {
+            let mut block = ops((1_000..134_000).map(|i| i * 7 % 3_000_000), round);
+            block.extend(ops(next..next + 14_000, round));
+            block.sort_unstable_by_key(|o| o.key);
+            next += 14_000;
+            let at = std::time::Instant::now();
+            let (_, undo, p) = tree.apply_sorted_ops_recorded_phased(block).unwrap();
+            println!(
+                "round {round}: {} ops in {} ms: sort {} leaves+lookups {} undo {} retire {} writes {} index {} rehash {} us; undo {} entries",
+                p.ops,
+                at.elapsed().as_millis(),
+                p.sort_us,
+                p.leaves_us,
+                p.undo_us,
+                p.retire_us,
+                p.writes_us,
+                p.index_us,
+                p.rehash_us,
+                undo.entries.len()
+            );
+        }
+    }
+
     use super::*;
 
     /// The batched apply is `set`/`delete` in order: same root, same undo

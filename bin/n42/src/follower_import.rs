@@ -123,7 +123,12 @@ where
     let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
     let mut senders: Vec<Option<Address>> = {
         use rayon::prelude::*;
-        txs.par_iter()
+        // Collected into a `Vec<Result>` (written in place) and checked after:
+        // a parallel collect straight into `Result<Vec>` takes rayon's
+        // short-circuiting path, three times the cost at 163,000 items
+        // (round 43, `bench_convert_payload`).
+        let looked_up: Vec<Result<Option<Address>, String>> = txs
+            .par_iter()
             .map(|tx| match tx {
                 TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
                     cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -136,7 +141,8 @@ where
                     tx.recover_signer().map(Some).map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
                 }
             })
-            .collect::<Result<Vec<_>, String>>()?
+            .collect();
+        looked_up.into_iter().collect::<Result<Vec<_>, String>>()?
     };
     let misses: Vec<usize> = senders.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i).collect();
     if !misses.is_empty() {

@@ -263,13 +263,19 @@ pub fn hashed_post_state_from_bundle(bundle_state: &revm::database::BundleState)
     }
     use rayon::prelude::*;
     let entries: Vec<(&Address, &revm::database::BundleAccount)> = state.iter().collect();
-    entries
+    // Hashed in chunks on the worker pool, then folded once into a map sized
+    // for all of it: a rayon `reduce` merged the chunk maps pairwise, moving
+    // every entry through log2(chunks) maps (round 43: 147,000 accounts were
+    // ~40 ms of a follower's import in this function).
+    let chunks: Vec<HashedPostState> = entries
         .par_chunks(4096)
         .map(|chunk| HashedPostState::from_bundle_state::<KeccakKeyHasher>(chunk.iter().copied()))
-        .reduce(HashedPostState::default, |mut a, b| {
-            a.extend(b);
-            a
-        })
+        .collect();
+    let mut hashed = HashedPostState::with_capacity(state.len());
+    for chunk in chunks {
+        hashed.extend(chunk);
+    }
+    hashed
 }
 
 impl<Provider: DBProvider> HashedPostStateProvider for LatestStateProviderRef<'_, Provider> {

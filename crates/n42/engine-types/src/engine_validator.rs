@@ -122,6 +122,11 @@ where
             || crate::assembler::parallel_ordered_trie_root(&raw_transactions),
             || {
                 use rayon::prelude::*;
+                // Into a `Vec<Result>`, which rayon writes in place; collecting
+                // a parallel iterator straight into a `Result<Vec>` goes through
+                // its short-circuiting path -- a linked list of pieces
+                // concatenated afterwards -- and cost 33 ms against 11 for the
+                // same 163,000 decodes (round 43, `bench_convert_payload`).
                 raw_transactions
                     .par_iter()
                     .map(|tx| {
@@ -129,10 +134,11 @@ where
                             .map_err(alloy_rlp::Error::from)
                             .map_err(PayloadError::from)
                     })
-                    .collect::<Result<Vec<_>, _>>()
+                    .collect::<Vec<Result<_, _>>>()
             },
         );
-        let decoded_transactions = decoded_transactions?;
+        let joined = started.elapsed();
+        let decoded_transactions = decoded_transactions.into_iter().collect::<Result<Vec<_>, _>>()?;
         let raw_block = payload
             .payload
             .clone()
@@ -145,6 +151,7 @@ where
                 withdrawals: raw_block.body.withdrawals,
             },
         };
+        let raw_built = started.elapsed();
         let ethereum_shaped = SealedBlock::seal_slow(ethereum_shaped);
         let decoded = started.elapsed();
 
@@ -182,6 +189,9 @@ where
                 number = sealed.number,
                 txs = tx_count,
                 decode_ms = decoded.as_millis() as u64,
+                join_ms = joined.as_millis() as u64,
+                raw_block_ms = raw_built.saturating_sub(joined).as_millis() as u64,
+                seal_ms = decoded.saturating_sub(raw_built).as_millis() as u64,
                 checks_ms = checked.saturating_sub(decoded).as_millis() as u64,
                 reconstruct_ms = started.elapsed().saturating_sub(checked).as_millis() as u64,
                 "payload converted"
@@ -309,6 +319,110 @@ mod tests {
         <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
             validator, payload,
         )
+    }
+
+    /// Where a full block's conversion goes: 163,000 transfers through
+    /// `convert_payload_to_block`. `cargo test --release -p n42-engine-types
+    /// --lib bench_convert_payload -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_convert_payload() {
+        use alloy_consensus::{Signed, TxEip1559, TxEnvelope};
+        use alloy_primitives::{Address, Signature, TxKind};
+        let n: u64 = std::env::var("BENCH_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(163_000);
+        let txs: Vec<TxEnvelope> = (0..n)
+            .map(|i| {
+                let inner = TxEip1559 {
+                    chain_id: 1,
+                    nonce: i % 400,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: 10_000_000_000,
+                    max_priority_fee_per_gas: 1_000_000_000,
+                    to: TxKind::Call(Address::from_slice(&[[0u8; 12].as_slice(), &(i * 7919).to_be_bytes()].concat())),
+                    value: U256::from(1_000 + i),
+                    ..Default::default()
+                };
+                TxEnvelope::Eip1559(Signed::new_unchecked(inner, Signature::test_signature(), B256::random()))
+            })
+            .collect();
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        header.gas_limit = 10_000_000_000;
+        header.gas_used = 21_000 * n;
+        header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&txs);
+        let block = block_for_header(header, txs);
+        let payload = execution_data_for_block(block.header.hash_slow(), &block);
+        let bytes: usize = payload.payload.as_v1().transactions.iter().map(|t| t.len()).sum();
+        println!("payload: {n} transactions, {:.1} MB", bytes as f64 / 1e6);
+        let _ = tracing_subscriber::fmt().with_env_filter("n42::engine_validator=info").without_time().try_init();
+        let v = validator(N42HeaderProfile::Gov5H2);
+        for round in 0..3 {
+            let at = std::time::Instant::now();
+            let sealed = convert(&v, payload.clone()).expect("converts");
+            println!("round {round}: {} ms (hash {})", at.elapsed().as_millis(), sealed.hash());
+        }
+        // The pieces, each alone.
+        for _ in 0..2 {
+            let raw = payload.payload.as_v1().transactions.clone();
+            let at = std::time::Instant::now();
+            let root = crate::assembler::parallel_ordered_trie_root(&raw);
+            let t_root = at.elapsed();
+            let at = std::time::Instant::now();
+            let (_root2, decoded2) = rayon::join(
+                || crate::assembler::parallel_ordered_trie_root(&raw),
+                || {
+                    use rayon::prelude::*;
+                    raw.par_iter()
+                        .map(|tx| <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(tx.as_ref()).unwrap())
+                        .collect::<Vec<_>>()
+                },
+            );
+            let t_join = at.elapsed();
+            let at = std::time::Instant::now();
+            drop(decoded2);
+            let t_drop2 = at.elapsed();
+            let at = std::time::Instant::now();
+            let decoded: Vec<TransactionSigned> = {
+                use rayon::prelude::*;
+                raw.par_iter()
+                    .map(|tx| <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(tx.as_ref()).unwrap())
+                    .collect()
+            };
+            let t_decode = at.elapsed();
+            let at = std::time::Instant::now();
+            let decoded_serial: Vec<TransactionSigned> = raw
+                .iter()
+                .map(|tx| <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(tx.as_ref()).unwrap())
+                .collect();
+            let t_decode_serial = at.elapsed();
+            let at = std::time::Instant::now();
+            let raw_block = payload
+                .payload
+                .clone()
+                .into_block_with_sidecar_raw_with_transactions_root(&payload.sidecar, root)
+                .unwrap();
+            let t_raw_block = at.elapsed();
+            let at = std::time::Instant::now();
+            let sealed = SealedBlock::seal_slow(alloy_consensus::Block {
+                header: raw_block.header,
+                body: alloy_consensus::BlockBody { transactions: decoded, ommers: raw_block.body.ommers, withdrawals: raw_block.body.withdrawals },
+            });
+            let t_seal = at.elapsed();
+            let at = std::time::Instant::now();
+            drop(sealed);
+            drop(decoded_serial);
+            let t_drop = at.elapsed();
+            println!(
+                "pieces: join(root, decode) {} ms (drop of its decodes {} ms); root {} ms, decode par {} ms (serial {} ms), raw block {} ms, seal {} ms, drop {} ms",
+                t_join.as_millis(),
+                t_drop2.as_millis(),
+                t_root.as_millis(),
+                t_decode.as_millis(),
+                t_decode_serial.as_millis(),
+                t_raw_block.as_millis(),
+                t_seal.as_millis(),
+                t_drop.as_millis()
+            );
+        }
     }
 
     /// An Amsterdam block as the raw payload path seals it -- the header's
