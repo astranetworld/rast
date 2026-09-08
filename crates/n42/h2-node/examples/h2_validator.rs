@@ -111,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node_key: Option<String> = None;
     let mut worker_threads: Option<usize> = None;
     let mut block_interval_ms: Option<u64> = None;
+    let mut straggler_grace_ms: u64 = 0;
     let mut direct_push = false;
     let mut body_port_offset: u16 = 1000;
     let mut base_timeout_ms: Option<u64> = None;
@@ -151,6 +152,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--block-interval-ms" => {
                 block_interval_ms =
                     Some(args.next().ok_or("--block-interval-ms needs a value")?.parse()?)
+            }
+            "--straggler-grace-ms" => {
+                straggler_grace_ms = args.next().ok_or("--straggler-grace-ms needs a value")?.parse()?
             }
             "--worker-threads" => {
                 worker_threads =
@@ -472,6 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // that poll quantises the block interval, so it has to be sized
             // from the pacing rather than left at its production default.
             service = service.with_block_pacing(Duration::from_millis(period_ms));
+            service = service.with_straggler_grace(Duration::from_millis(straggler_grace_ms));
             service = service.with_direct_block_push(direct_push);
             // The plain TCP body channel, on every member's libp2p port plus
             // the offset; 0 leaves bodies to libp2p alone.
@@ -757,6 +762,9 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --direct-block-push       hand each block body straight to every member as
                             well as publishing it; the topic stays the fallback
   --block-interval-ms <n>   pace in milliseconds, overriding the chain's period.
+  --straggler-grace-ms <n>  as leader, wait up to n ms after a view is decided for the
+                            votes of the validators outside the quorum before proposing
+                            the next block (0: do not wait).
                             Below 1000 the chain's clock leaves real time; see
                             block_attributes. Benchmarks only.
   --worker-threads <n>      tokio worker threads (default: min(cores, 4))

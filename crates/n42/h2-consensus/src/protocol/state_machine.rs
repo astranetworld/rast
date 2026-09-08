@@ -19,6 +19,9 @@ use crate::validator::{EpochManager, LeaderSelector, ValidatorSet};
 use crate::vote_log::{NoopVoteLog, VoteLogWriter};
 
 /// Per-view timing tracker for diagnosing consensus commit latency.
+/// How many recent views `ConsensusEngine::voters_seen` remembers.
+pub const VOTERS_SEEN_WINDOW: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct ViewTiming {
     /// When this view started (advance_to_view or engine creation).
@@ -306,6 +309,13 @@ pub struct ConsensusEngine {
     pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
+    /// Which validators' Round 1 votes this node, as leader, has verified,
+    /// per recent view -- including votes that arrive after the view's QC
+    /// formed and after the view advanced, which the protocol otherwise
+    /// discards. A leader reads it to see whether the followers outside the
+    /// quorum are keeping up (see `voters_seen`); nothing in the protocol's
+    /// safety depends on it.
+    pub(super) voters_seen: HashMap<ViewNumber, HashSet<u32>>,
     /// Per-view timing for commit latency diagnosis.
     pub(super) view_timing: ViewTiming,
     /// Timing from the last committed view (preserved across advance_to_view).
@@ -403,6 +413,7 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
+            voters_seen: HashMap::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
@@ -512,6 +523,7 @@ impl ConsensusEngine {
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
+            voters_seen: HashMap::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
@@ -827,6 +839,23 @@ impl ConsensusEngine {
     /// Returns the timing from the last committed view.
     pub fn last_committed_view_timing(&self) -> Option<&ViewTiming> {
         self.last_committed_timing.as_ref()
+    }
+
+    /// How many validators' Round 1 votes this node has verified for `view`,
+    /// late ones included (see `voters_seen`). Zero for a view this node did
+    /// not lead or that has left the window.
+    pub fn voters_seen(&self, view: ViewNumber) -> usize {
+        self.voters_seen.get(&view).map_or(0, HashSet::len)
+    }
+
+    /// Records a verified Round 1 vote in `voters_seen`, keeping the last
+    /// [`VOTERS_SEEN_WINDOW`] views.
+    pub(super) fn note_voter(&mut self, view: ViewNumber, voter: u32) {
+        self.voters_seen.entry(view).or_default().insert(voter);
+        if self.voters_seen.len() > VOTERS_SEEN_WINDOW {
+            let oldest = view.saturating_sub(VOTERS_SEEN_WINDOW as u64);
+            self.voters_seen.retain(|v, _| *v > oldest);
+        }
     }
 
     pub fn is_current_leader(&self) -> bool {

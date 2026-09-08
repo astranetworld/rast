@@ -514,6 +514,10 @@ f7_validator_args() {
   # second the chain's timestamps leave the wall clock; that is a benchmark
   # property and never a fleet one.
   [[ -n ${F7_BLOCK_INTERVAL_MS:-} ]] && F7_V_ARGS+=(--block-interval-ms "$F7_BLOCK_INTERVAL_MS")
+  # F7_STRAGGLER_GRACE_MS: a leader waits up to this long, after a view is decided,
+  # for the votes of the validators outside the quorum (round 43: the followers
+  # outside the quorum fall behind at a fast pacing and every tenure handover stalls).
+  [[ -n ${F7_STRAGGLER_GRACE_MS:-} ]] && F7_V_ARGS+=(--straggler-grace-ms "$F7_STRAGGLER_GRACE_MS")
   # The view timeout has to move with the pacing. gov5's chains pair a 3,000 ms
   # period with a 6,000 ms baseTimeout -- twice the interval. Overriding the
   # pacing to 250 ms and leaving the timeout at the genesis value makes it

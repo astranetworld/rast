@@ -194,6 +194,10 @@ pub struct H2Service<E> {
     payload_attributes: Option<Box<PayloadAttributesBuilder>>,
     /// How long to wait before asking the builder again; see [`PROPOSE_RETRY`].
     propose_retry: Duration,
+    /// How long a leader waits, after the previous view was decided, for the
+    /// Round 1 votes of the validators outside the quorum before proposing
+    /// the next block (see [`Self::with_straggler_grace`]). `None`: not at all.
+    straggler_grace: Option<Duration>,
     /// The last transport drain's split: poll ms, handle ms, slowest handle
     /// ms and its event kind (see `drain_transport`).
     last_drain: (u64, u64, u64, &'static str),
@@ -573,6 +577,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             outbox: Vec::new(),
             payload_attributes: None,
             propose_retry: PROPOSE_RETRY,
+            straggler_grace: None,
             last_drain: (0, 0, 0, ""),
             proposed_view: None,
             meshed: false,
@@ -729,6 +734,20 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub fn with_block_pacing(mut self, pacing: Duration) -> Self {
         self.propose_retry = (pacing / PROPOSE_RETRY_FRACTION)
             .clamp(PROPOSE_RETRY_FLOOR, PROPOSE_RETRY);
+        self
+    }
+
+    /// Lets the followers outside the quorum keep up. A quorum is 2f+1 of the
+    /// set, so a leader whose blocks import faster on 2f+1 members than on
+    /// the rest keeps proposing on their votes while the rest fall behind by
+    /// one block per view -- and the next leader, if it is one of them,
+    /// cannot propose until it has caught up: round 43 measured 10-40 s
+    /// stalls at every tenure handover at 300 ms pacing against a 410-470 ms
+    /// import. With a grace the leader, before proposing view v+1, waits
+    /// until every validator's Round 1 vote for v has arrived or `grace` has
+    /// passed since v was decided. Local policy: the protocol is untouched.
+    pub fn with_straggler_grace(mut self, grace: Duration) -> Self {
+        self.straggler_grace = (!grace.is_zero()).then_some(grace);
         self
     }
 
@@ -1639,6 +1658,25 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.proposal_deferred = false;
             self.defer_reason = None;
             return;
+        }
+        // The stragglers' grace: see `with_straggler_grace`.
+        if let Some(grace) = self.straggler_grace {
+            if view > 1 {
+                let previous = view - 1;
+                let seen = self.engine.voters_seen(previous);
+                let all = self.engine.validator_count() as usize;
+                let decided_at = self.engine.last_committed_view_timing().and_then(|t| t.commit_qc_formed);
+                if seen > 0 && seen < all {
+                    if let Some(at) = decided_at {
+                        if at.elapsed() < grace {
+                            self.proposal_deferred = true;
+                            self.defer_reason = Some("waiting for the stragglers' votes");
+                            return;
+                        }
+                        debug!(target: "n42.h2.node", view, seen, all, "stragglers' grace ran out; proposing without them");
+                    }
+                }
+            }
         }
         // The parent is the block the highest QC certifies, not whatever the
         // execution layer imported last: a proposal has to extend its justify

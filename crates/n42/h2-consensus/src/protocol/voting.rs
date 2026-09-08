@@ -38,6 +38,22 @@ impl ConsensusEngine {
         let view = self.round_state.current_view();
 
         if vote.view != view {
+            // A vote for a view this node led recently and has left: no
+            // longer part of the protocol, but a leader wants to know that the
+            // voter is keeping up (see `voters_seen`). Verified before it is
+            // noted, so a peer cannot vouch for another's progress.
+            if vote.view < view
+                && view - vote.view <= super::state_machine::VOTERS_SEEN_WINDOW as u64
+                && self.is_leader_for_view(vote.view)
+            {
+                let view_set = self.validator_set_for_view(vote.view);
+                if let Ok(pk) = view_set.get_public_key(vote.voter) {
+                    let msg = self.signing_profile.vote_message(vote.view, vote.block_hash);
+                    if self.signing_profile.verify_single(pk, &msg, &vote.signature) {
+                        self.note_voter(vote.view, vote.voter);
+                    }
+                }
+            }
             return Err(ConsensusError::ViewMismatch {
                 current: view,
                 received: vote.view,
@@ -97,6 +113,7 @@ impl ConsensusEngine {
                 "ignoring verified vote for non-proposed block after equivocation tracking");
             return Ok(());
         }
+        self.note_voter(view, vote.voter);
 
         let collector = match self.vote_collector.as_mut() {
             Some(c) => c,
