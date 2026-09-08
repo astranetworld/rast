@@ -286,10 +286,12 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
 # of the campaign (17.1-18.2M), from any starting state. Both are defaults
 # since loop98. The header line records the state either way, so a leg can be
 # judged afterwards.
-if [ "${F7_DROP_CACHE:-1}" = 1 ]; then
+F7_DROP_CACHE=${F7_DROP_CACHE:-1}
+F7_HUGEPREP=${F7_HUGEPREP:-60}
+if [ "$F7_DROP_CACHE" = 1 ]; then
   python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" 2>&1 | tail -1
 fi
-if [ "${F7_HUGEPREP:-60}" != 0 ]; then
+if [ "$F7_HUGEPREP" != 0 ]; then
   python3 "$HERE/hugeprep.py" "$F7_HUGEPREP" 3 2>&1 | tail -3
 fi
 echo "memory       : $(awk '/^MemFree|^Cached:|^Shmem:/{printf "%s %.1fG  ", $1, $2/1e6}' /proc/meminfo)huge-page pool $(awk '$4=="Normal"{o9=0; for(i=14;i<=NF;i++) o9+=$i; printf "order9+ %d order10 %d", o9, $NF}' /proc/buddyinfo)"
