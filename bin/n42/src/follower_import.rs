@@ -79,7 +79,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 7]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 8]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
     Evm: ConfigureEvm<
@@ -171,7 +171,9 @@ where
 
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header.
+    let state_at = std::time::Instant::now();
     let state = provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}"))?;
+    let state_ms = state_at.elapsed().as_millis() as u64;
     let executed_at = std::time::Instant::now();
     stage.at(3);
     let mut cached = match carry.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -273,7 +275,7 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         }),
-        [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits],
+        [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits, state_ms],
     ))
 }
 

@@ -829,6 +829,16 @@ the leader's own build) are ~200: the cycle is floored at ~0.65 s and the
 barrier, now 475-490, no longer touches it. **The import stopped being the
 pole somewhere between loop98 and here.**
 
+One more column, from `viewcycle.txt` (the validators' own view timing):
+the **tail** moved where the median did not. p90 of the view cycle reads
+3,781 ms (S1) and 2,935 (S2) against 1,439 (B1) and 1,854 (R2), with the
+medians 1,391 / 1,296 against 1,154 / 1,128. So the cuts do not shorten a
+good view -- the pacing and the leader's turnaround set that -- but they
+make a bad view far less bad, which is what the round totals feel and what
+window 1 mostly hides. Note also that S2 read a 0.653 s cycle with the
+round's *worst* barrier (577 ms), which is the direct evidence that the
+median cycle is not barrier-bound at this pacing.
+
 Adopted: the cuts (already in `main`'s path, no knob) and
 `RAYON_NUM_THREADS=32` in the record environment -- the two highest legs of
 the round, and every parallel phase reads 1.5-2x faster at 32 threads offline.

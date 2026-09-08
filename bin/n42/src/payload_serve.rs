@@ -158,11 +158,13 @@ pub struct OwnBlockReuse {
 
 /// Executes and checks another node's block; see [`OwnBlockReuse::import_foreign`].
 /// Returns the executed block for the engine and the phase timings in
-/// milliseconds: senders, execution, checks, state root, hashed state.
+/// milliseconds: header checks, senders, execution, post-execution checks,
+/// state root, hashed state, then the senders served from the cache and the
+/// parent-state lookup.
 pub type ForeignImport = dyn Fn(
         SealedBlock<n42_tx_types::Block>,
     ) -> Result<
-        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 7]),
+        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 8]),
         String,
     > + Send
     + Sync;
@@ -637,7 +639,7 @@ where
                     // Another node's block: executed here and handed to the
                     // engine as executed, when configured. Any failure logs
                     // and leaves the block to the engine's own path.
-                    let mut direct_ms: Option<[u64; 9]> = None;
+                    let mut direct_ms: Option<[u64; 12]> = None;
                     // The block's transaction hashes, known once the direct
                     // import converted the payload: the prune below then
                     // needs no keccak over the raw bytes.
@@ -670,6 +672,7 @@ where
                         .and_then(|r| r);
                         match handed {
                             Ok((executed, phases, converted)) => {
+                                let handed_at = std::time::Instant::now();
                                 // The block's transactions leave the queue now, not
                                 // when the canonical pruner gets to them: a build
                                 // ahead starts the moment this import returns and
@@ -691,6 +694,12 @@ where
                                         queue.hold_own_block(number, hash, removed);
                                     });
                                 }
+                                // The mined-transaction bookkeeping above walks the
+                                // block twice; time it and the engine's acknowledgement
+                                // apart, because together they were most of the ~78 ms
+                                // of a 438 ms import that no phase accounted for.
+                                let mined_ms = handed_at.elapsed().as_millis() as u64;
+                                let insert_at = std::time::Instant::now();
                                 let (done, handed) = tokio::sync::oneshot::channel();
                                 let sent = inserts
                                     .send(reth_node_builder::executed_inserts::ExecutedInsert { block: executed, done })
@@ -698,7 +707,20 @@ where
                                 let landed = sent
                                     && matches!(tokio::time::timeout(std::time::Duration::from_secs(2), handed).await, Ok(Ok(true)));
                                 if landed {
-                                    direct_ms = Some([converted, phases[0], phases[1], phases[2], phases[3], phases[4], phases[5], started.elapsed().as_millis() as u64, phases[6]]);
+                                    direct_ms = Some([
+                                        converted,
+                                        phases[0],
+                                        phases[1],
+                                        phases[2],
+                                        phases[3],
+                                        phases[4],
+                                        phases[5],
+                                        started.elapsed().as_millis() as u64,
+                                        phases[6],
+                                        phases[7],
+                                        mined_ms,
+                                        insert_at.elapsed().as_millis() as u64,
+                                    ]);
                                 } else {
                                     warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
                                 }
@@ -740,6 +762,9 @@ where
                                 hashed_ms = ms[6],
                                 total_ms = ms[7],
                                 senders_cached = ms[8],
+                                state_ms = ms[9],
+                                mined_ms = ms[10],
+                                insert_ms = ms[11],
                                 answered_ms = answered,
                                 "direct import: answered before the engine's own pass"
                             );
@@ -864,6 +889,9 @@ where
                                     hashed_ms = ms[6],
                                     total_ms = ms[7],
                                     senders_cached = ms[8],
+                                    state_ms = ms[9],
+                                    mined_ms = ms[10],
+                                    insert_ms = ms[11],
                                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
                                     status = ?status.status,
                                     "direct import: executed here, handed to the engine as executed"
