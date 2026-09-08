@@ -647,7 +647,7 @@ where
         bundle_state: &revm::database::BundleState,
     ) -> ProviderResult<HashedPostState> {
         let mut hashed_state =
-            super::latest::hashed_post_state_from_bundle(bundle_state.state());
+            super::latest::hashed_post_state_from_bundle(bundle_state);
         if !bundle_state
             .state()
             .values()

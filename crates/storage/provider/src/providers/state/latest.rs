@@ -255,10 +255,9 @@ impl<Provider: DBProvider + StorageSettingsCache> StateProofProvider
 /// large: a keccak per account and per slot, serial in reth, was 72 ms of a
 /// 147,000-account block on both the builder's `finish` and the follower's
 /// import (N42, round 43); chunked it is 28-40 ms. Small bundles stay serial.
-pub fn hashed_post_state_from_bundle(
-    state: &revm::primitives::HashMap<Address, revm::database::BundleAccount>,
-) -> HashedPostState {
+pub fn hashed_post_state_from_bundle(bundle_state: &revm::database::BundleState) -> HashedPostState {
     const PARALLEL_FROM: usize = 8192;
+    let state = bundle_state.state();
     if state.len() < PARALLEL_FROM {
         return HashedPostState::from_bundle_state::<KeccakKeyHasher>(state);
     }
@@ -278,7 +277,7 @@ impl<Provider: DBProvider> HashedPostStateProvider for LatestStateProviderRef<'_
         &self,
         bundle_state: &revm::database::BundleState,
     ) -> ProviderResult<HashedPostState> {
-        let mut hashed_state = hashed_post_state_from_bundle(bundle_state.state());
+        let mut hashed_state = hashed_post_state_from_bundle(bundle_state);
         zero_destroyed_account_storage(
             &reth_trie_db::DatabaseHashedCursorFactory::new(self.tx()),
             bundle_state.state(),

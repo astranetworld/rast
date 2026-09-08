@@ -665,8 +665,19 @@ where
                     // The batches' changes, grafted onto the block's state;
                     // the beneficiary, whom every batch credited from the
                     // same starting balance, once, through a commit.
+                    // The state's cache is written only if something after
+                    // the graft may read a grafted account: the serial loop
+                    // (which runs only if the block has gas left) or a
+                    // withdrawal to one of them. `N42_BUILD_GRAFT_NO_CACHE=1`
+                    // turns the skip on; the cache insert per account was
+                    // ~a third of a 70 ms graft.
+                    let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
+                    let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| {
+                        ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address)))
+                    });
+                    let keep_cache = !(build_graft_no_cache() && block_full && withdrawals_clear);
                     let db = builder.evm_mut().db_mut();
-                    let graft = crate::parallel_transfer::graft_bundles(db, run.bundles, beneficiary)
+                    let graft = crate::parallel_transfer::graft_bundles_with(db, run.bundles, beneficiary, keep_cache)
                         .map_err(PayloadBuilderError::other)?;
                     let fees = graft.beneficiary_delta;
                     par_committed = graft.committed;
@@ -1306,6 +1317,12 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
 /// skip stale transactions early: `N42_BUILDER_STALE_CHECK=1`; off by
 /// default (see the loop).
 /// `N42_PARALLEL_BUILD`, read once: the block's transfers built in parallel groups.
+/// Whether `N42_BUILD_GRAFT_NO_CACHE=1` is set (see the graft in the parallel step).
+fn build_graft_no_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_GRAFT_NO_CACHE").is_ok_and(|v| v == "1"))
+}
+
 fn parallel_build() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_PARALLEL_BUILD").is_ok())
