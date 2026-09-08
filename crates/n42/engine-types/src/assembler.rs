@@ -233,8 +233,13 @@ where
                     || {
                         if let Some(job) = &self.qmdb {
                             let at = std::time::Instant::now();
-                            let changes = n42_qmdb_reth::changes_from_execution(bundle, job.prague);
-                            let prepared = job.state.compute(job.parent, &changes).map_err(|e| e.to_string());
+                            let prepared = if parallel_state_commit() {
+                                let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle, job.prague);
+                                job.state.compute_operations(job.parent, ops).map_err(|e| e.to_string())
+                            } else {
+                                let changes = n42_qmdb_reth::changes_from_execution(bundle, job.prague);
+                                job.state.compute(job.parent, &changes).map_err(|e| e.to_string())
+                            };
                             *job.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(prepared);
                             qmdb_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -368,4 +373,12 @@ mod trie_bench {
             eprintln!("round {round}: parallel {:?} sequential {:?} keys {:?} +sort {:?} (rayon threads {})", par, sq, keys, sorted - keys, rayon::current_num_threads());
         }
     }
+}
+
+/// Whether `N42_PARALLEL_STATE_COMMIT=1` is set (see the follower import):
+/// the builder's QMDB root job then keys, encodes and sorts the leaves on
+/// the worker pool instead of through the change set.
+pub fn parallel_state_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").is_ok_and(|v| v == "1"))
 }

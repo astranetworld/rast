@@ -28,6 +28,7 @@
 use alloy_primitives::{address, Address, B256, U256};
 use n42_qmdb_state::{AccountState, BlockChanges};
 use revm_database::BundleState;
+use n42_twig_core::qmdb_compat::QmdbOperation;
 
 /// The leaves a block writes, from the bundle its execution left behind.
 pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
@@ -85,6 +86,50 @@ pub fn changes_from_execution(bundle: &BundleState, prague_active: bool) -> Bloc
         with_prague_system_caller(&mut changes);
     }
     changes
+}
+
+/// The leaf operations of [`changes_from_execution`], built in parallel
+/// straight from the bundle and sorted by key: the same operations
+/// `changes_from_execution(bundle, prague).operations()` yields (a test
+/// says so), without the change set in between. On a 147,000-account block
+/// the change set (48 ms, two `BTreeMap`s) and its `operations()` (27 ms,
+/// a keccak and an encoding per leaf, serial) were 75 ms of the follower's
+/// 190 ms root phase; here the leaves are keyed and encoded on the worker
+/// pool and sorted there too.
+pub fn sorted_operations_from_execution(bundle: &BundleState, prague_active: bool) -> Vec<QmdbOperation> {
+    use n42_twig_core::qmdb_compat::{encode_gov5_account_value, gov5_account_key, gov5_storage_key};
+    use rayon::prelude::*;
+    let accounts: Vec<(&Address, &revm_database::BundleAccount)> = bundle.state.iter().collect();
+    let mut ops: Vec<QmdbOperation> = accounts
+        .par_iter()
+        .flat_map_iter(|(address, account)| {
+            // The system caller's leaf is written below, as gov5 writes it,
+            // over whatever the execution left for that address.
+            let skip = prague_active && **address == PRAGUE_SYSTEM_CALLER;
+            let account_op = (!skip).then(|| QmdbOperation {
+                key: gov5_account_key(&address.0 .0),
+                // A bundle account is a state object gov5 would hold, live
+                // even when empty (`set_account_initialised`); a missing info
+                // deletes the leaf.
+                value: account.info.as_ref().map(|info| {
+                    encode_gov5_account_value(info.nonce, &info.balance.to_be_bytes::<32>(), &info.code_hash.0)
+                }),
+            });
+            let storage_ops = account.storage.iter().map(move |(slot, value)| QmdbOperation {
+                key: gov5_storage_key(&address.0 .0, &B256::from(slot.to_be_bytes::<32>()).0),
+                value: (!value.present_value.is_zero()).then(|| value.present_value.to_be_bytes::<32>().to_vec()),
+            });
+            account_op.into_iter().chain(storage_ops)
+        })
+        .collect();
+    if prague_active {
+        ops.push(QmdbOperation {
+            key: gov5_account_key(&PRAGUE_SYSTEM_CALLER.0 .0),
+            value: Some(encode_gov5_account_value(0, &U256::ZERO.to_be_bytes::<32>(), &alloy_primitives::KECCAK256_EMPTY.0)),
+        });
+    }
+    ops.par_sort_unstable_by_key(|op| op.key);
+    ops
 }
 
 /// `SYSTEM_ADDRESS` (EIP-4788): the caller of every system call.
@@ -255,5 +300,121 @@ mod tests {
         assert_eq!(bob.nonce, 0);
         assert_eq!(bob.code_hash, KECCAK_EMPTY, "no code means the empty-code hash");
         assert!(!changes.storage.contains_key(&BOB));
+    }
+}
+
+#[cfg(test)]
+mod state_commit_bench {
+    //! `cargo test -p n42-qmdb-reth --release state_commit_bench -- --ignored --nocapture`:
+    //! where the follower's QMDB root phase goes for a bench-tier block
+    //! (147,000 accounts touched: 14,000 created, 133,000 updated) on a tree
+    //! that already holds a few million accounts.
+    use super::*;
+    use alloy_primitives::{Address, B256, U256};
+    use n42_qmdb_state::QmdbForest;
+    use revm_state::AccountInfo;
+    use revm_database::{BundleAccount, BundleState};
+
+    fn addr(i: u64) -> Address {
+        let mut a = [0u8; 20];
+        a[..8].copy_from_slice(&(i.wrapping_mul(0x9e3779b97f4a7c15)).to_be_bytes());
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(a)
+    }
+
+    fn bundle(ids: impl Iterator<Item = u64>, existed: bool) -> BundleState {
+        let mut b = BundleState::default();
+        for i in ids {
+            let info = AccountInfo { balance: U256::from(1_000_000u64 + i), nonce: i % 7, ..Default::default() };
+            let original = existed.then(|| AccountInfo { balance: U256::from(i), nonce: i % 7, ..Default::default() });
+            b.state.insert(addr(i), BundleAccount::new(original, Some(info), Default::default(), revm_database::AccountStatus::Changed));
+        }
+        b
+    }
+
+    #[test]
+    fn sorted_operations_are_the_change_sets_operations() {
+        // Updated accounts, new accounts, a deleted one, an empty-but-live
+        // one, storage with a zero (deleting) slot, and the system caller
+        // both present in the bundle and absent.
+        let mut b = bundle(0..500, true);
+        for (a, acc) in bundle(10_000..10_200, false).state {
+            b.state.insert(a, acc);
+        }
+        b.state.insert(addr(77), BundleAccount::new(Some(AccountInfo::default()), None, Default::default(), revm_database::AccountStatus::Destroyed));
+        b.state.insert(addr(78), BundleAccount::new(None, Some(AccountInfo::default()), Default::default(), revm_database::AccountStatus::InMemoryChange));
+        let mut storage = std::collections::HashMap::default();
+        storage.insert(U256::from(1), revm_database::states::StorageSlot::new_changed(U256::ZERO, U256::from(9)));
+        storage.insert(U256::from(2), revm_database::states::StorageSlot::new_changed(U256::from(5), U256::ZERO));
+        b.state.insert(addr(79), BundleAccount::new(Some(AccountInfo::default()), Some(AccountInfo::default()), storage, revm_database::AccountStatus::Changed));
+        for prague in [false, true] {
+            let mut with_caller = b.clone();
+            with_caller.state.insert(PRAGUE_SYSTEM_CALLER, BundleAccount::new(None, Some(AccountInfo { nonce: 3, ..Default::default() }), Default::default(), revm_database::AccountStatus::Changed));
+            for bundle in [&b, &with_caller] {
+                let mut expected = changes_from_execution(bundle, prague).operations();
+                expected.sort_unstable_by_key(|op| op.key);
+                let got = sorted_operations_from_execution(bundle, prague);
+                assert_eq!(got.len(), expected.len(), "count (prague {prague})");
+                for (g, e) in got.iter().zip(&expected) {
+                    assert_eq!(g.key, e.key, "key (prague {prague})");
+                    assert_eq!(g.value, e.value, "value (prague {prague})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing"]
+    fn where_the_root_phase_goes() {
+        // A tree with 3,000,000 accounts, in blocks of 147,000.
+        let genesis = changes_from_bundle(&bundle(0..1000, false));
+        let mut forest = QmdbForest::genesis(B256::ZERO, &genesis).expect("genesis");
+        let mut parent = B256::ZERO;
+        let mut next = 1000u64;
+        for n in 1..=20u64 {
+            let changes = changes_from_bundle(&bundle(next..next + 147_000, false));
+            let hash = B256::from(U256::from(n));
+            forest.apply(parent, hash, n, &changes).expect("apply");
+            forest.set_canonical(hash).expect("canonical");
+            parent = hash;
+            next += 147_000;
+        }
+        // The block under test: 133,000 updates of existing accounts, 14,000 new.
+        let mut b = bundle(1000..134_000, true);
+        for (a, acc) in bundle(next..next + 14_000, false).state {
+            b.state.insert(a, acc);
+        }
+        for round in 0..3 {
+            let at = std::time::Instant::now();
+            let changes = changes_from_execution(&b, true);
+            let t_changes = at.elapsed();
+            let at = std::time::Instant::now();
+            let ops = changes.operations();
+            let t_ops = at.elapsed();
+            let at = std::time::Instant::now();
+            let mut sorted = ops.clone();
+            sorted.sort_unstable_by_key(|o| o.key);
+            let t_sort = at.elapsed();
+            let at = std::time::Instant::now();
+            let sorted_ops = sorted_operations_from_execution(&b, true);
+            let t_sorted = at.elapsed();
+            let at = std::time::Instant::now();
+            let prepared = if round % 2 == 0 {
+                forest.compute(parent, &changes).expect("compute")
+            } else {
+                forest.compute_operations(parent, sorted_ops).expect("compute_operations")
+            };
+            let t_compute = at.elapsed();
+            let at = std::time::Instant::now();
+            let hash = B256::from(U256::from(100 + round));
+            forest.insert(hash, 21 + round as u64, prepared).expect("insert");
+            forest.set_canonical(hash).expect("canonical");
+            let t_insert = at.elapsed();
+            parent = hash;
+            eprintln!(
+                "round {round}: changes_from_execution {t_changes:?} | operations() {t_ops:?} ({} ops) | sort alone {t_sort:?} | sorted_operations_from_execution {t_sorted:?} | {} {t_compute:?} | insert+canonical {t_insert:?}",
+                ops.len(), if round % 2 == 0 { "forest.compute(changes)" } else { "forest.compute_operations(sorted)" }
+            );
+        }
     }
 }

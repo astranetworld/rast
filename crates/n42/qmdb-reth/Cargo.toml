@@ -13,6 +13,7 @@ description = "Installs the QMDB state commitment into reth's block production a
 n42-h2-consensus.workspace = true
 n42-h2-primitives.workspace = true
 n42-qmdb-state.workspace = true
+rayon.workspace = true
 n42-twig-core.workspace = true
 alloy-consensus.workspace = true
 alloy-genesis.workspace = true

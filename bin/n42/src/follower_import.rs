@@ -238,14 +238,27 @@ where
     let root_at = std::time::Instant::now();
     stage.at(6);
     let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
-    let changes = n42_qmdb_reth::changes_from_execution(&output.state, prague);
-    qmdb.validate_block(parent_hash, block_hash, number, &changes, recovered.state_root)
-        .map_err(|err| format!("state root: {err}"))?;
+    if parallel_state_commit() {
+        // The leaf operations keyed, encoded and sorted on the worker pool,
+        // straight from the bundle (the change set and its serial
+        // `operations()` were 75 ms of this phase at 147,000 accounts).
+        let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague);
+        qmdb.validate_block_operations(parent_hash, block_hash, number, ops, recovered.state_root)
+            .map_err(|err| format!("state root: {err}"))?;
+    } else {
+        let changes = n42_qmdb_reth::changes_from_execution(&output.state, prague);
+        qmdb.validate_block(parent_hash, block_hash, number, &changes, recovered.state_root)
+            .map_err(|err| format!("state root: {err}"))?;
+    }
     let root_ms = root_at.elapsed().as_millis() as u64;
 
     let hashed_at = std::time::Instant::now();
     stage.at(7);
-    let hashed_state = state.hashed_post_state(&output.state).map_err(|err| format!("hashed state: {err}"))?;
+    let hashed_state = if parallel_state_commit() {
+        hashed_post_state_parallel(&output.state)
+    } else {
+        state.hashed_post_state(&output.state).map_err(|err| format!("hashed state: {err}"))?
+    };
     let hashed_ms = hashed_at.elapsed().as_millis() as u64;
 
     Ok((
@@ -263,4 +276,26 @@ where
 fn follower_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARALLEL").is_ok_and(|v| v == "1"))
+}
+
+/// Whether `N42_PARALLEL_STATE_COMMIT=1` is set: the QMDB leaf operations and
+/// the hashed post-state are built on the worker pool instead of serially
+/// (round 43: 190 + 75 ms of a follower's 622 ms import at 147,000 accounts).
+pub fn parallel_state_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").is_ok_and(|v| v == "1"))
+}
+
+/// reth's `HashedPostState::from_bundle_state` (a keccak per account and per
+/// slot, serial: 72 ms at 147,000 accounts) over rayon chunks: 28-40 ms.
+pub fn hashed_post_state_parallel(bundle: &reth_revm::db::BundleState) -> reth_trie::HashedPostState {
+    use rayon::prelude::*;
+    let entries: Vec<(&alloy_primitives::Address, &reth_revm::db::BundleAccount)> = bundle.state.iter().collect();
+    entries
+        .par_chunks(4096)
+        .map(|chunk| reth_trie::HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(chunk.iter().copied()))
+        .reduce(reth_trie::HashedPostState::default, |mut a, b| {
+            a.extend(b);
+            a
+        })
 }

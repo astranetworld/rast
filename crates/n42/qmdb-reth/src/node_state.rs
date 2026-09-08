@@ -40,6 +40,7 @@
 //! runs ahead of the head a restarted node finds, and the blocks past it arrive
 //! again through the engine.
 
+use n42_twig_core::qmdb_compat::QmdbOperation;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -412,6 +413,40 @@ impl QmdbNodeState {
     /// will learn the block's hash only after sealing the root into it.
     pub fn compute(&self, parent: B256, changes: &BlockChanges) -> Result<PreparedBlock, NodeStateError> {
         self.with_forest(|forest| forest.compute(parent, changes))
+    }
+
+    /// [`Self::compute`] from leaf operations already built
+    /// (`sorted_operations_from_execution`).
+    pub fn compute_operations(&self, parent: B256, ops: Vec<QmdbOperation>) -> Result<PreparedBlock, NodeStateError> {
+        self.with_forest(|forest| forest.compute_operations(parent, ops))
+    }
+
+    /// [`Self::validate_block`] from leaf operations already built.
+    pub fn validate_block_operations(
+        &self,
+        parent: B256,
+        block_hash: B256,
+        number: u64,
+        ops: Vec<QmdbOperation>,
+        header_root: B256,
+    ) -> Result<B256, NodeStateError> {
+        self.with_forest(|forest| {
+            if let Some(root) = forest.root_of(&block_hash) {
+                return Ok(root);
+            }
+            let prepared = forest.compute_operations(parent, ops)?;
+            let root = prepared.root;
+            if root == header_root {
+                forest.insert(block_hash, number, prepared)?;
+            } else {
+                warn!(
+                    target: "n42.qmdb",
+                    %block_hash, number, computed = %root, header = %header_root,
+                    "block's state root does not match its QMDB root",
+                );
+            }
+            Ok(root)
+        })
     }
 
     /// Files a producer's computed tree under the block it turned out to be.

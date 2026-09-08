@@ -385,6 +385,24 @@ impl QmdbForest {
         })
     }
 
+    /// [`Self::compute`] for a caller that already holds the block's leaf
+    /// operations (`BlockChanges::operations`, or
+    /// `n42_qmdb_reth::sorted_operations_from_execution`, built in parallel
+    /// straight from the execution's bundle -- the change set and its
+    /// operations were 75 ms of a 190 ms root phase on a 147,000-account
+    /// block). The operations need not be sorted; the tree sorts them.
+    pub fn compute_operations(&mut self, parent: B256, ops: Vec<QmdbOperation>) -> Result<PreparedBlock, StateError> {
+        self.move_to(parent)?;
+        let (root, undo) = self.tree.apply_sorted_ops_recorded(ops.clone())?;
+        self.note_move(&undo);
+        self.pending = Some((parent, undo));
+        Ok(PreparedBlock {
+            root: B256::from(root),
+            parent,
+            ops,
+        })
+    }
+
     /// Files a computed block under the hash it turned out to have.
     ///
     /// Idempotent: a block already held is left as it is. The same block reaches
