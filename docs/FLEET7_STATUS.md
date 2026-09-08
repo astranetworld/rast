@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-08 12:00)
+# Fleet7 status (living note; last updated 2026-09-08 12:50)
 
 The one-page state of the native seven-node fleet work: what is true now, what
 is in flight, what is decided and what is not. The measurements behind it are
@@ -17,6 +17,21 @@ in `docs/NATIVE_FLEET7.md` (rounds 40-43 and the loop82-87 sections),
 - **Where the cycle goes.** Leader build 362-387 ms (no longer the pole);
   follower import 410-470 ms (execution ~190: partition 39, groups 62, graft
   73; root 86-104; convert 50; hashed 29-38; senders 36; engine 31).
+- **Window 1 is bimodal by the box's memory state, not the code** (loop86-96):
+  239-247k when the leg starts a minute after another leg's fleet was killed,
+  177-196k after a build, a profile, a datc run, a 33 GB file read or five
+  minutes of idling. The seven `thp:always` heaps take every free order-9
+  block in the flood's first seconds; a heap that got 2 MB pages then is
+  fast, one that fell back to 4 KB pages is the slow mode (the 4 KB-heap
+  legs read the same 184k), and from the first fallback `defrag=defer` has
+  kswapd evicting 7-11 GB/5 s of page cache -- the fleet's MDBX pages --
+  for the rest of the leg. loop94's 179k and loop95's first leg were this.
+  **Never read a first leg; compare legs that follow legs.** Every
+  round.txt now has a `memory :` header line (free, cached, order-9 pool).
+  `scripts/dropcache.py` (stale file pages, no root) is necessary, not
+  sufficient; `scripts/hugeprep.py` (MADV_COLLAPSE pre-compaction of a
+  60 GB pool) is the remedy under test in loop97.
+- **Ed25519 batch width is null** (loop95: 128 vs 256, 240-243k either way).
 - **The stall** at blocks ~190-225 is the leader outrunning the followers
   outside the quorum (5 of 7 votes make a QC; followers vote after importing,
   so two slow importers fall a block behind per view; the next leader, if one
@@ -81,8 +96,11 @@ latency; the ingest by cores.
 
 ## Next after these
 
-Follower import 470 -> ~300 ms: graft sharding, convert (50 ms) profile,
-twig structural writes sharded; then the supply side (ingest ~400k/s per
+Written, uncompiled until the box is free (bookend loop98): the follower's
+vote no longer waits for the 66 ms pool prune; `TxEnv`s built on the worker
+pool; the graft takes the largest bundle as the block's bundle instead of
+re-inserting its 140,000 accounts; reverts sorted in parallel. Then convert
+(50-63 ms), root (~100 ms), hashed state (49 ms); then the supply side (ingest ~400k/s per
 node, 7x redundant verification) once the chain passes ~330k. 1,000k needs a
 sharded state commit and de-duplicated ingest -- a separate design.
 

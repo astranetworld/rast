@@ -572,6 +572,83 @@ huge-page appetite (a 4 KB heap on the followers only, keeping the
 leader's speed, is untried), or a box with the memory to hold seven
 execution layers' files.
 
+**loop95 (11:58-12:22): the Ed25519 batch width is null.** `N42_ED25519_BATCH`
+128 against 256 (the knob caps at 256, so the 512 legs are 256 again), G450
+environment, interleaved: E128a 177,474 (void, see below), E256a 239,020,
+E512a 242,637, E128b 241,607, E256b 239,056, E512b 239,303. The ingest's
+27 us a transaction is ~16 us of curve arithmetic, ~2 us of keccak and
+~9 us of decode and cache work; the batch width moves the curve part by
+1 us at most (sigbench: 13.0 -> 10.2 us a signature from 64 to 256) and
+the fleet cannot see it. Left at the default.
+
+**loop96 (12:27-12:43): the bimodal window 1, and what decides it.** Every
+leg of loop86-95 at the record configuration read either 239-247k (cycle
+0.667 s) or 177-196k (0.83-0.91 s), nothing between, and the mode was
+predictable from the memory state when the leg started -- a first leg
+after a build, a profile or a datc run, or after minutes of idling, was
+slow; a leg that started a minute after another leg's fleet was killed
+was fast. loop94's 179k and loop95's E128a were first legs, not
+regressions. A controlled round, same binary, `F7_STRAGGLER_GRACE_MS=600`,
+450 ms pacing:
+
+    leg   before the leg                                  Cached at start  win1     cycle    total
+    C1    5 min idle after loop95, then dropcache          20.7 GB          195,486  0.834 s  14.83M
+    D1    33 GB of target/profiling read into the cache    59.5 GB          179,157  0.910 s  14.67M
+    C2    dropcache, one minute after D1's fleet was killed 20.6 GB          240,391  0.667 s  17.32M
+    D2    33 GB read into the cache                        61.4 GB          187,949  0.857 s  14.93M
+
+So the stale page cache is not the cause (C1 had none and was slow), and
+`scripts/dropcache.py` (fadvise DONTNEED over the build tree, the cargo
+home and the bench root; no root needed) is not the cure by itself. A
+5-second sampler of `/proc/vmstat` and `/proc/buddyinfo` during the legs
+(`~/.claude/jobs/2127e0ae/tmp/vmsample.sh`) shows the mechanism:
+
+- The execution layers' jemalloc heaps run `thp:always`. When the flood
+  starts, the seven heaps grow from 9 to 40 GB in ~15 s and take every free
+  order-9/10 block on the box (order9+ 7,000-9,000 blocks, ~20-28 GB, to
+  under 50 in five seconds).
+- From the first huge-page fault that falls back, `defrag=defer` wakes
+  kswapd and kcompactd, and for the rest of the leg kswapd reclaims 7-11 GB
+  of page cache every 5 seconds (`pgsteal_kswapd` 1.7-2.9M pages a sample)
+  while `free` shows 30-60 GB. The file cache is held at zero beyond the
+  tmpfs, and the fleet's own MDBX pages are what is being evicted: the
+  seven `n42` processes take 40-50k major faults each per 5 s (system
+  `pgmajfault` 340-590k a sample; 250 MB/s of 4 KB reads through
+  `mdbx_get` on the engine thread).
+- In the fast legs the same storm starts too, only ~20 s later: C2's heaps
+  reached 40 GB of `AnonHugePages` before the pool ran dry, D1's and D2's
+  24-25 GB. What differs between the modes is how much of each heap ended
+  up on 2 MB pages -- what was allocated hot at the start (the pool,
+  QMDB, the sender caches) -- and a heap that got 4 KB pages then stays
+  on them. The 4 KB-heap legs of loop86 (K1, K2: 184,726 at 0.882 s) read
+  exactly the slow mode, which is the same statement from the other side.
+- A leg that follows another leg is fast because the killed fleet's 40 GB
+  of huge pages are freed as order-9 blocks and the deleted datadir's
+  cache coalesces into more of them; a build's or datc's file pages (or a
+  read of 33 GB) fragment that free space, and five minutes of idling let
+  nothing rebuild it (kcompactd is woken by fallbacks, not by time).
+
+The kernel counters that name this: `thp_fault_fallback` 10-17k per 5 s
+against `thp_fault_alloc` 5-9k throughout a slow leg; `compact_stall`
+spikes of 1-3k per sample; `/proc/buddyinfo` Normal order9+ at 0.
+
+loop96b (12:48-12:58) added the build's aftermath: `cargo build --release
+-p n42` (the legs ran the untouched profiling binary), then P1 with nothing
+dropped -- 184,653 at 0.883 s, pool order9+ 8,365 / order10 1,913 (~24 GB)
+at the flood's start, heaps peaking at 27.7 GB huge -- then dropcache and
+P2: 241,242 at 0.667 s, pool 12,679 / 2,258 (~34 GB), heaps past 36 GB
+huge. Across loop96-96b the pool at the flood's start predicts the mode:
+34 GB (P2) and 28 GB (C2) fast, 24 (P1), 22 (D1) and 19 GB (D2) slow; the
+line is somewhere near 25-28 GB, which is why a state that leaves the pool
+near it (C1: five minutes idle, then dropcache) can fall on either side.
+
+The remedy under test (loop97): `scripts/hugeprep.py` maps 60 GB, touches
+it and asks for `MADV_COLLAPSE` (synchronous compaction whatever
+`defrag` says), then exits and leaves the huge pages as the pool the
+fleet takes at the flood's start. Alternatives if it does not hold: the
+warm-up leg (what the host rule always was), a 4 KB heap for the
+followers only, or root: `defrag=always` for the fleet's own faults.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

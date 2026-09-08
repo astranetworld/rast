@@ -272,6 +272,25 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
 }
 
+# The memory state at the start decides the leg (round 43, loop86-97): the
+# execution layers' thp:always heaps take every free order-9 block in the
+# flood's first seconds, and a leg whose heaps then sit mostly on 2 MB pages
+# reads 239-247k on window 1 where one that fell back to 4 KB pages reads
+# 177-196k -- the first leg after a build, a datc run, a profile or minutes of
+# idling is the slow kind, a leg started right after another leg's fleet was
+# killed the fast kind. `F7_DROP_CACHE=1` evicts stale file pages first
+# (scripts/dropcache.py, no root; necessary, not sufficient) and
+# `F7_HUGEPREP=<GB>` pre-compacts that much memory into huge pages
+# (scripts/hugeprep.py, MADV_COLLAPSE) for the fleet to take. The header line
+# records the state either way, so a leg can be judged afterwards.
+if [ "${F7_DROP_CACHE:-0}" = 1 ]; then
+  python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" 2>&1 | tail -1
+fi
+if [ -n "${F7_HUGEPREP:-}" ] && [ "$F7_HUGEPREP" != 0 ]; then
+  python3 "$HERE/hugeprep.py" "$F7_HUGEPREP" 3 2>&1 | tail -3
+fi
+echo "memory       : $(awk '/^MemFree|^Cached:|^Shmem:/{printf "%s %.1fG  ", $1, $2/1e6}' /proc/meminfo)huge-page pool $(awk '$4=="Normal"{o9=0; for(i=14;i<=NF;i++) o9+=$i; printf "order9+ %d order10 %d", o9, $NF}' /proc/buddyinfo)"
+
 "$HERE/fleet7.sh" up --fresh 9>&-
 
 # Empty blocks until the base fee has actually decayed, rather than for a fixed
