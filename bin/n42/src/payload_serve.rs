@@ -647,6 +647,7 @@ where
                         let validator = reuse.validator.clone();
                         let inserts = reuse.inserts.clone();
                         let payload = data.clone();
+                        let fast = direct_fast_answer();
                         let started = std::time::Instant::now();
                         let handed = tokio::task::spawn_blocking(move || {
                             let sealed = <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
@@ -654,7 +655,13 @@ where
                             let converted = started.elapsed().as_millis() as u64;
                             // The engine's newPayload, next, converts the same
                             // payload: let it take this block instead.
-                            n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
+                            // The engine's own conversion of the same payload takes
+                            // this instead of decoding 163,000 transactions again.
+                            // With the fast answer that conversion is off the vote
+                            // path, and the clone of the whole block with it.
+                            if !fast {
+                                n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
+                            }
                             let (executed, phases) = import(sealed)?;
                             Ok::<_, String>((executed, phases, converted))
                         })
@@ -698,6 +705,80 @@ where
                             }
                             Err(err) => warn!(target: "n42.payload_serve", number, %err, "direct import failed; importing the ordinary way"),
                         }
+                    }
+                    // The fast answer (`N42_DIRECT_FAST_ANSWER=1`): this node
+                    // executed the block and the engine holds it as executed, so
+                    // the validator's vote does not wait for the engine's own
+                    // pass. Everything the pass would check has been checked here
+                    // -- the header against its parent, the transactions root, the
+                    // receipts root, the gas, and the QMDB state root -- so it is
+                    // bookkeeping; it runs below, after the answer is on the wire,
+                    // and a verdict other than VALID is logged loudly.
+                    if direct_ms.is_some() && direct_fast_answer() {
+                        let hash = data.payload.block_hash();
+                        let status = alloy_rpc_types_engine::PayloadStatus::from_status(
+                            alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                        )
+                        .with_latest_valid_hash(hash);
+                        let encoded = raw_engine::encode_payload_status(&status);
+                        out.push(1);
+                        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                        out.extend_from_slice(&encoded);
+                        stream.write_all(&out).await?;
+                        let answered = started.elapsed().saturating_sub(decoded).as_millis() as u64;
+                        if let Some(ms) = direct_ms {
+                            info!(
+                                target: "n42.payload_serve",
+                                number,
+                                txs,
+                                convert_ms = ms[0],
+                                header_ms = ms[1],
+                                senders_ms = ms[2],
+                                exec_ms = ms[3],
+                                checks_ms = ms[4],
+                                root_ms = ms[5],
+                                hashed_ms = ms[6],
+                                total_ms = ms[7],
+                                senders_cached = ms[8],
+                                answered_ms = answered,
+                                "direct import: answered before the engine's own pass"
+                            );
+                        }
+                        let engine_at = std::time::Instant::now();
+                        match engine.new_payload(data).await {
+                            Ok(status) if !status.status.is_valid() => warn!(
+                                target: "n42.payload_serve", number, status = ?status.status,
+                                "the engine disagreed with a block this node executed and answered VALID for"
+                            ),
+                            Err(err) => warn!(target: "n42.payload_serve", number, %err, "the engine's own pass failed after the fast answer"),
+                            _ => {}
+                        }
+                        if let (Some(prune), Some(hashes)) = (reuse.as_ref().and_then(|r| r.prune_pool.clone()), mined_hashes.take()) {
+                            let count = hashes.len();
+                            let pruned_at = std::time::Instant::now();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                prune(hashes);
+                                if count > 10_000 {
+                                    info!(
+                                        target: "n42.payload_serve",
+                                        number,
+                                        count,
+                                        prune_ms = pruned_at.elapsed().as_millis() as u64,
+                                        "imported block's transactions taken out of the pool"
+                                    );
+                                }
+                            });
+                        }
+                        if txs > 10_000 {
+                            info!(
+                                target: "n42.payload_serve",
+                                number,
+                                txs,
+                                engine_after_ms = engine_at.elapsed().as_millis() as u64,
+                                "the engine's own pass, behind the answer"
+                            );
+                        }
+                        continue;
                     }
                     match engine.new_payload(data).await {
                         Ok(status) => {
@@ -905,6 +986,17 @@ mod tests {
         let sealed = SealedBlock::seal_slow(block);
         assert_eq!(encode_block_parallel(&sealed), alloy_rlp::encode(&sealed));
     }
+}
+
+/// Whether a block the direct import executed is answered VALID at once, with
+/// the engine's own `newPayload` run behind the answer (`N42_DIRECT_FAST_ANSWER=1`,
+/// off by default). The block was validated here; the engine's pass is
+/// bookkeeping. Round 43: the engine's pass was 35 ms of a 533 ms import
+/// barrier, and remembering the sealed block for it cost a deep clone of the
+/// block's 163,000 transactions on the same path.
+fn direct_fast_answer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_DIRECT_FAST_ANSWER").is_ok_and(|v| v == "1"))
 }
 
 /// Whether an imported block's pool prune runs off the payload answer's path
