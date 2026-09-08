@@ -678,21 +678,61 @@ where
                                 // ahead starts the moment this import returns and
                                 // would otherwise take them again (87,800 stale
                                 // transactions in one build, round 38).
+                                // `N42_QUEUE_WORK_OFFLOAD=1`: the queue's and the
+                                // pool's bookkeeping goes to a worker thread holding
+                                // the block, because the two walks of a 163,000-
+                                // transaction block (one for the mined senders and
+                                // nonces, one for the hashes) sit on the vote's path
+                                // and nothing reads their result before the answer.
+                                // Off by default: it also delays the queue's removal
+                                // by those walks, and a build ahead that starts before
+                                // the removal takes the mined transactions again
+                                // (87,800 stale ones in one build, round 38).
+                                let queue_offloaded = queue_work_offload();
                                 if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
-                                    let mined: Vec<(alloy_primitives::Address, u64)> = executed
-                                        .recovered_block
-                                        .transactions_with_sender()
-                                        .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
-                                        .collect();
-                                    let (number, hash) = (executed.recovered_block.number(), executed.recovered_block.hash());
-                                    mined_hashes = Some(
-                                        executed.recovered_block.body().transactions().map(|tx| *tx.tx_hash()).collect(),
-                                    );
-                                    // Held until the chain settles the height (round 43).
-                                    tokio::task::spawn_blocking(move || {
-                                        let removed = queue.remove_mined_batch_collecting(mined);
-                                        queue.hold_own_block(number, hash, removed);
-                                    });
+                                    if queue_offloaded {
+                                        let block = std::sync::Arc::clone(&executed.recovered_block);
+                                        let prune = reuse.prune_pool.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let at = std::time::Instant::now();
+                                            let mined: Vec<(alloy_primitives::Address, u64)> = block
+                                                .transactions_with_sender()
+                                                .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+                                                .collect();
+                                            let (number, hash) = (block.number(), block.hash());
+                                            let removed = queue.remove_mined_batch_collecting(mined);
+                                            // Held until the chain settles the height (round 43).
+                                            queue.hold_own_block(number, hash, removed);
+                                            let count = block.body().transactions().count();
+                                            if let Some(prune) = prune {
+                                                prune(block.body().transactions().map(|tx| *tx.tx_hash()).collect());
+                                            }
+                                            if count > 10_000 {
+                                                info!(
+                                                    target: "n42.payload_serve",
+                                                    number,
+                                                    count,
+                                                    queue_ms = at.elapsed().as_millis() as u64,
+                                                    "imported block's transactions taken out of the queue and the pool"
+                                                );
+                                            }
+                                        });
+                                    } else {
+                                        let mined: Vec<(alloy_primitives::Address, u64)> = executed
+                                            .recovered_block
+                                            .transactions_with_sender()
+                                            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+                                            .collect();
+                                        let (number, hash) =
+                                            (executed.recovered_block.number(), executed.recovered_block.hash());
+                                        mined_hashes = Some(
+                                            executed.recovered_block.body().transactions().map(|tx| *tx.tx_hash()).collect(),
+                                        );
+                                        tokio::task::spawn_blocking(move || {
+                                            let removed = queue.remove_mined_batch_collecting(mined);
+                                            queue.hold_own_block(number, hash, removed);
+                                        });
+                                    }
                                 }
                                 // The mined-transaction bookkeeping above walks the
                                 // block twice; time it and the engine's acknowledgement
@@ -778,6 +818,8 @@ where
                             Err(err) => warn!(target: "n42.payload_serve", number, %err, "the engine's own pass failed after the fast answer"),
                             _ => {}
                         }
+                        // Only when the walks stayed on this path; the worker thread
+                        // above prunes for itself otherwise.
                         if let (Some(prune), Some(hashes)) = (reuse.as_ref().and_then(|r| r.prune_pool.clone()), mined_hashes.take()) {
                             let count = hashes.len();
                             let pruned_at = std::time::Instant::now();
@@ -842,6 +884,7 @@ where
                             // supply for the length of one node's maintenance.
                             if status.status == alloy_rpc_types_engine::PayloadStatusEnum::Valid
                                 && !reused
+                                && (mined_hashes.is_some() || direct_ms.is_none())
                                 && let Some(prune) = reuse.as_ref().and_then(|r| r.prune_pool.clone())
                             {
                                 let pruned_at = std::time::Instant::now();
@@ -1014,6 +1057,18 @@ mod tests {
         let sealed = SealedBlock::seal_slow(block);
         assert_eq!(encode_block_parallel(&sealed), alloy_rlp::encode(&sealed));
     }
+}
+
+/// Whether the queue's and the pool's bookkeeping for an imported block runs
+/// on a worker thread (`N42_QUEUE_WORK_OFFLOAD=1`) instead of on this path.
+/// Inline it walks the block twice -- once for the mined senders and nonces,
+/// once for the hashes -- while the validator waits for the answer. Off until
+/// a round shows the walks cost more than the delayed queue removal does
+/// (round 38: a build ahead that starts first takes the mined transactions
+/// again).
+fn queue_work_offload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QUEUE_WORK_OFFLOAD").is_ok_and(|v| v == "1"))
 }
 
 /// Whether a block the direct import executed is answered VALID at once, with
