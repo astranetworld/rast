@@ -403,6 +403,35 @@ loop81 tried the two obvious knobs, bookended by the thp:always baseline
   window 2 at 2.1 s cycles). Not adopted on that evidence; the storm is
   not a purging-cadence problem.
 
+**loop82: the state commit on the worker pool (`N42_PARALLEL_STATE_COMMIT`,
+ca16d8d22).** The follower's root phase at 147,000 accounts was 190 ms:
+46 ms building the change set (two `BTreeMap`s), 27 ms keying and
+encoding its leaves serially, then the tree; the hashed post-state another
+72-78 ms of serial keccak. `sorted_operations_from_execution` keys,
+encodes and sorts the leaves straight from the bundle on rayon and the
+forest takes them without the change set (microbenchmark 155 -> 95 ms,
+the same operations byte for byte); the hashed post-state is built over
+rayon chunks (72 -> 28-40 ms). PS-B-PS-B-PS after a warm-up, parallel
+builder and follower graft on, thp:always heap:
+
+    leg   state commit  win1     win2     win3     total   follower import (root / hashed)   leader qmdb  fleet majflt
+    PS1   parallel      195,487  157,473  162,926  15.49M  562 ms (108 / 41)                 144 ms       9.7M (storm)
+    B1    serial        201,025  156,927   31,732  10.74M  605 ms (195 / 77)                 161 ms       2.4M
+    PS2   parallel      227,968  173,782  132,941  16.05M  488 ms (104 / 36)                 139 ms       5.3M
+    B2    serial        188,814  127,076  146,646  13.88M  690 ms (232 / 78)                 222 ms       3.8M
+    PS3   parallel      222,757  173,817  156,414  16.59M  503 ms (104 / 38)                 136 ms       7.6M
+
+The root phase halves (195-232 -> 104-108 ms) and the hashed state halves
+(77 -> 36-41) on every parallel leg; window 1 reads 223-228k at a
+0.71-0.73 s cycle on the two legs without a fault storm (PS1's 195k sat
+under 9.7M major faults) against 189-201k serial, and every parallel leg
+beats both serial legs on the total. **Adopted as the default**
+(`N42_PARALLEL_STATE_COMMIT=0` is the serial path). Where the fleet stands
+at 163,000 scattered transfers a block: **223-228k TPS at 0.71-0.73 s**
+with the parallel builder, the grafted follower and the parallel state
+commit; the follower's import is now ~490-500 ms (execution ~200,
+root 104, convert 55, hashed 37, senders 37).
+
 What would actually remove the storm is less to reclaim: the tmpfs
 (27-34 GB of other drivers' leftovers under /tmp), the seven heaps'
 huge-page appetite (a 4 KB heap on the followers only, keeping the

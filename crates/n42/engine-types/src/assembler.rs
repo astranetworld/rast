@@ -375,10 +375,13 @@ mod trie_bench {
     }
 }
 
-/// Whether `N42_PARALLEL_STATE_COMMIT=1` is set (see the follower import):
+/// Whether the parallel state commit is on (default; `=0` turns it off; see the follower import):
 /// the builder's QMDB root job then keys, encodes and sorts the leaves on
 /// the worker pool instead of through the change set.
 pub fn parallel_state_commit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").is_ok_and(|v| v == "1"))
+    // On by default since round 43's loop82 (223-228k against 189-201k on
+    // window 1 at 147,000 accounts a block, the follower's import 488-562 ms
+    // against 605-690); `N42_PARALLEL_STATE_COMMIT=0` is the serial path.
+    *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").map_or(true, |v| v != "0"))
 }
