@@ -65,6 +65,16 @@ struct Inner<T: PoolTransaction> {
     /// Holes a build ran into: (sender, the account's next nonce, the lowest
     /// queued nonce above it). The feed fills them from the pool.
     gaps: Vec<(Address, u64, u64)>,
+    /// Transactions this node's own built blocks took out of the queue before
+    /// the chain committed them: (block number, block hash, the
+    /// transactions). A block that consensus never commits -- its view timed
+    /// out, another leader's block took its height -- would otherwise have
+    /// carried them away for good, and every affected sender's lane would
+    /// start above the chain's nonce (round 43: whole legs of 40,000
+    /// nonce refusals a block after a stall). Settled by the canonical
+    /// pruner: the same hash drops them, another hash at the height gives
+    /// back the ones it does not carry. Bounded to the last few blocks.
+    held: VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
     /// The sender a build is taking a run from, and how much of the run is
     /// left. See [`run_length`].
     current: Option<(Address, usize)>,
@@ -136,6 +146,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 len: 0,
                 last_build: None,
                 gaps: Vec::new(),
+                held: VecDeque::new(),
                 current: None,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
@@ -232,6 +243,82 @@ impl<T: PoolTransaction> TxQueue<T> {
                 taken.retain(|t| highest.get(&t.sender()).is_none_or(|mined| t.nonce() > *mined));
             }
         }
+    }
+
+    /// [`Self::remove_mined_batch`], returning what it removed from the
+    /// lanes and from the build's taken list, for [`Self::hold_own_block`].
+    pub fn remove_mined_batch_collecting(
+        &self,
+        mined: impl IntoIterator<Item = (Address, u64)>,
+    ) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        let mut inner = self.inner.lock();
+        self.drain_inbox(&mut inner);
+        let mut highest: AddressHashMap<u64> = AddressHashMap::default();
+        for (sender, nonce) in mined {
+            let entry = highest.entry(sender).or_insert(nonce);
+            *entry = (*entry).max(nonce);
+        }
+        let mut removed = Vec::new();
+        for (sender, nonce) in &highest {
+            if let Some(lane) = inner.lanes.get_mut(sender) {
+                let keep = lane.by_nonce.split_off(&(nonce + 1));
+                let gone = std::mem::replace(&mut lane.by_nonce, keep);
+                inner.len -= gone.len();
+                removed.extend(gone.into_values());
+            }
+        }
+        if let Some((_, taken)) = inner.last_build.as_mut() {
+            if !taken.is_empty() {
+                let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
+                    .into_iter()
+                    .partition(|t| highest.get(&t.sender()).is_some_and(|m| t.nonce() <= *m));
+                *taken = kept;
+                removed.extend(mined);
+            }
+        }
+        removed
+    }
+
+    /// Keeps the transactions an own block took out of the queue until the
+    /// chain settles that height; see `Inner::held`.
+    pub fn hold_own_block(&self, number: u64, hash: B256, transactions: Vec<Arc<ValidPoolTransaction<T>>>) {
+        const HELD_BLOCKS: usize = 16;
+        if transactions.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        while inner.held.len() >= HELD_BLOCKS {
+            inner.held.pop_front();
+        }
+        inner.held.push_back((number, hash, transactions));
+    }
+
+    /// The chain committed `hash` at `number`: an own block held at that
+    /// height is settled -- dropped if it is that block, otherwise its
+    /// transactions that the committed block does not carry (`carried`
+    /// says which (sender, nonce) it does) go back to the lanes. Returns how
+    /// many went back. Heights the chain has passed are dropped too.
+    pub fn settle_own_block(&self, number: u64, hash: B256, carried: impl Fn(&Address, u64) -> bool) -> usize {
+        let mut inner = self.inner.lock();
+        if inner.held.is_empty() {
+            return 0;
+        }
+        let mut back = Vec::new();
+        let mut kept = VecDeque::with_capacity(inner.held.len());
+        for (held_number, held_hash, transactions) in std::mem::take(&mut inner.held) {
+            if held_number == number && held_hash != hash {
+                back.extend(transactions.into_iter().filter(|t| !carried(&t.sender(), t.nonce())));
+            } else if held_number > number {
+                kept.push_back((held_number, held_hash, transactions));
+            }
+            // The same hash, or a height already behind the chain: dropped.
+        }
+        inner.held = kept;
+        let count = back.len();
+        if count > 0 {
+            inner.give_back(back);
+        }
+        count
     }
 
     /// Forgets the transactions the build on `parent` took that a block has
@@ -675,6 +762,42 @@ mod tests {
         let mut again: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
         again.sort();
         assert_eq!(again, vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn an_own_block_that_never_commits_gives_its_transactions_back() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(1, 2), tx(1, 3), tx(2, 0)]);
+        let parent = B256::repeat_byte(3);
+        let mut best = queue.best_for_build(parent);
+        let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+        assert_eq!(taken.len(), 5);
+        drop(best);
+        // Our block at height 10 carries all five; imported here, they leave the queue.
+        let dropped = queue.forget_mined(parent, [(Address::repeat_byte(1), 3), (Address::repeat_byte(2), 0)]);
+        assert_eq!(dropped.len(), 5);
+        queue.hold_own_block(10, B256::repeat_byte(0xA), dropped);
+        assert!(queue.is_empty());
+        // Consensus commits another block at 10 that carries only (1,0) and (1,1).
+        let carried = |sender: &Address, nonce: u64| *sender == Address::repeat_byte(1) && nonce <= 1;
+        let back = queue.settle_own_block(10, B256::repeat_byte(0xB), carried);
+        assert_eq!(back, 3, "(1,2), (1,3) and (2,0) come back");
+        let mut best = queue.best_for_build(B256::repeat_byte(0xB));
+        let mut again: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        again.sort();
+        assert_eq!(again, vec![(1, 2), (1, 3), (2, 0)]);
+        drop(best);
+        // The same block committed: nothing comes back and the hold is gone.
+        queue.push([tx(3, 0)]);
+        let mut best = queue.best_for_build(B256::repeat_byte(0xB));
+        let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+        drop(best);
+        let dropped = queue.remove_mined_batch_collecting([(Address::repeat_byte(3), 0), (Address::repeat_byte(1), 3), (Address::repeat_byte(2), 0)]);
+        assert_eq!(dropped.len(), taken.len());
+        queue.hold_own_block(11, B256::repeat_byte(0xC), dropped);
+        assert_eq!(queue.settle_own_block(11, B256::repeat_byte(0xC), |_, _| false), 0);
+        assert_eq!(queue.settle_own_block(12, B256::repeat_byte(0xD), |_, _| false), 0);
+        assert!(queue.is_empty());
     }
 
     #[test]

@@ -435,6 +435,15 @@ fn main() {
                                         .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
                                         .collect();
                                     mined += pairs.len();
+                                    // An own block held at this height: the same
+                                    // hash is settled, another hash gives back what
+                                    // this block does not carry (then pruned below
+                                    // where this block mined a higher nonce).
+                                    let carried: std::collections::HashSet<(alloy_primitives::Address, u64)> = pairs.iter().copied().collect();
+                                    let back = queue.settle_own_block(block.number(), block.hash(), |sender, nonce| carried.contains(&(*sender, nonce)));
+                                    if back > 0 {
+                                        warn!(target: "n42.tx_queue", number = block.number(), back, "an own block at this height was not the one committed; its transactions are offered again");
+                                    }
                                     queue.remove_mined_batch(pairs);
                                 }
                                 if mined > 10_000 {

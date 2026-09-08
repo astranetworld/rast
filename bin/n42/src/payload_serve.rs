@@ -310,7 +310,9 @@ where
             .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
         let dropped = queue.forget_mined(executed.recovered_block.header().parent_hash, mined);
         debug!(target: "n42.payload_serve", forgotten = dropped.len(), "own block's transactions forgotten by the queue");
-        tokio::task::spawn_blocking(move || drop(dropped));
+        // Held, not dropped, until the chain settles this height: a block
+        // consensus never commits gives them back (round 43).
+        queue.hold_own_block(executed.recovered_block.number(), executed.recovered_block.hash(), dropped);
         at.elapsed().as_millis() as u64
     });
     let (done, handed) = tokio::sync::oneshot::channel();
@@ -668,7 +670,12 @@ where
                                         .transactions_with_sender()
                                         .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
                                         .collect();
-                                    tokio::task::spawn_blocking(move || queue.remove_mined_batch(mined));
+                                    let (number, hash) = (executed.recovered_block.number(), executed.recovered_block.hash());
+                                    // Held until the chain settles the height (round 43).
+                                    tokio::task::spawn_blocking(move || {
+                                        let removed = queue.remove_mined_batch_collecting(mined);
+                                        queue.hold_own_block(number, hash, removed);
+                                    });
                                 }
                                 let (done, handed) = tokio::sync::oneshot::channel();
                                 let sent = inserts
