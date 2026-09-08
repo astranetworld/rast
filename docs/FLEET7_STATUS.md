@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-08 12:50)
+# Fleet7 status (living note; last updated 2026-09-08 14:05)
 
 The one-page state of the native seven-node fleet work: what is true now, what
 is in flight, what is decided and what is not. The measurements behind it are
@@ -28,9 +28,11 @@ in `docs/NATIVE_FLEET7.md` (rounds 40-43 and the loop82-87 sections),
   for the rest of the leg. loop94's 179k and loop95's first leg were this.
   **Never read a first leg; compare legs that follow legs.** Every
   round.txt now has a `memory :` header line (free, cached, order-9 pool).
-  `scripts/dropcache.py` (stale file pages, no root) is necessary, not
-  sufficient; `scripts/hugeprep.py` (MADV_COLLAPSE pre-compaction of a
-  60 GB pool) is the remedy under test in loop97.
+  **Adopted (loop97-98): `fleet7-bench.sh` runs `scripts/dropcache.py`
+  (stale file pages, no root) and `scripts/hugeprep.py 60` (MADV_COLLAPSE,
+  an ~80 GB pool in 5 s) before every leg; from any starting state the legs
+  read 243-253k, and loop98 S1's 18.17M is the campaign's best total.** A
+  leg whose pool was under ~30 GB at the start is not comparable.
 - **Ed25519 batch width is null** (loop95: 128 vs 256, 240-243k either way).
 - **The stall** at blocks ~190-225 is the leader outrunning the followers
   outside the quorum (5 of 7 votes make a QC; followers vote after importing,
@@ -96,11 +98,20 @@ latency; the ingest by cores.
 
 ## Next after these
 
-Written, uncompiled until the box is free (bookend loop98): the follower's
-vote no longer waits for the 66 ms pool prune; `TxEnv`s built on the worker
-pool; the graft takes the largest bundle as the block's bundle instead of
-re-inserting its 140,000 accounts; reverts sorted in parallel. Then convert
-(50-63 ms), root (~100 ms), hashed state (49 ms); then the supply side (ingest ~400k/s per
+loop98 (S-B-S: old binary against the first follower cuts -- `TxEnv`s on the
+worker pool, the graft taking the largest bundle as the block's bundle,
+reverts sorted in parallel; the "66 ms prune" was the canonical pruner's
+log line, not the vote path, and `prune_pool` is unset in the queue
+configuration) read null on the fleet: the import fell 482 -> 470 ms on the
+same node in the same mode (partition 41 -> 30, merge 75 -> 59) and the
+import barrier did not move (535 / 528 ms), so the cycle did not either
+(S1 252.5k, B1 244.9k, S2 244.5k). The barrier is the cycle's largest part
+(cycle ~= publish->recv 30 + barrier 530 + vote->decide 20 + decide->publish
+80 ms), so the import is still the pole, but it needs a cut of 100 ms, not
+12. Next: measure offline (`bench_follower_import`, ignored test) and take
+groups (55-62 ms, the giant component executing serially), merge (59: graft
+/ take / reverts now timed apart), root (100), convert (54), hashed (40),
+senders (36); then the supply side (ingest ~400k/s per
 node, 7x redundant verification) once the chain passes ~330k. 1,000k needs a
 sharded state commit and de-duplicated ingest -- a separate design.
 

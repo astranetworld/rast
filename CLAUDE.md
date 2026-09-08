@@ -139,8 +139,15 @@ instead of 90-130).
 `MALLOC_CONF=thp:always` gives the execution layer's jemalloc heap 2 MB pages under the host's THP
 `madvise` (the builder's execution is 194-207 ms with them, 225-241 without); the third window is
 lost to direct compaction until the host runs `defrag=defer`. Host rules that matter: THP `madvise`
-(not `always`: with it the fleet's reads faulted by the million), swap empty, one warm-up leg before
-any leg is read, and `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md` for sharing the box.
+(not `always`: with it the fleet's reads faulted by the million), swap empty, and
+`/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md` for sharing the box. **The old "one warm-up leg"
+rule was the huge-page pool** (round 43, loop86-98): the seven `thp:always` heaps take every free
+order-9 block in the flood's first seconds, and a leg whose heaps then sit on 2 MB pages reads
+239-253k on window 1 where one that fell back to 4 KB pages reads 177-196k -- the first leg after a
+build, a profile, a datc run or minutes of idling was the slow kind. `fleet7-bench.sh` now runs
+`scripts/dropcache.py` (stale file pages, no root) and `scripts/hugeprep.py 60` (MADV_COLLAPSE, a
+~80 GB pool in 5 s) before every leg (`F7_DROP_CACHE=0` / `F7_HUGEPREP=0` turn them off) and prints
+a `memory :` header line; a leg whose pool was under ~30 GB is not comparable.
 `docs/NATIVE_FLEET7.md` "Where it stands today".
 **Transaction type 0x50 (Ed25519, `docs/spec/N42_TX_0x50.md`)** is implemented in `crates/n42/tx-types`
 (`N42TxEnvelope` = reth's envelope + `AltSig`; the node runs on `N42Primitives`, `N42EvmConfig`,

@@ -53,6 +53,12 @@ pub struct Phases {
     pub groups_ms: u64,
     /// Folding the groups' changes into the block's state.
     pub merge_ms: u64,
+    /// Of `merge_ms`: the graft (or fold) of the batches' bundles.
+    pub graft_ms: u64,
+    /// Of `merge_ms`: the state's own transition merge and the bundle take.
+    pub take_ms: u64,
+    /// Of `merge_ms`: appending and sorting the grafted reverts.
+    pub reverts_ms: u64,
     /// Pre- and post-execution changes and the bundle.
     pub finish_ms: u64,
     /// How many groups there were.
@@ -367,6 +373,48 @@ pub fn graft_bundles_with<DB: Database>(
     keep_cache: bool,
 ) -> Result<Graft, <State<DB> as Database>::Error> {
     let mut graft = Graft::default();
+    let mut bundles = bundles;
+    // The largest bundle becomes the block's bundle instead of being copied
+    // into an empty one, when nothing stands in its way: the follower's
+    // partition by connected component puts most of a block of random
+    // transfers into one giant group (round 43: 317 groups, one of them
+    // nearly the whole block), and re-inserting its 140,000 accounts was the
+    // bulk of an 84 ms merge. Only when the cache is not kept (the builder's
+    // state needs the cache entries), the block's bundle is still empty and
+    // no account of it is one the block's state already holds or the
+    // beneficiary -- those go through the delta paths below.
+    if !keep_cache && state.bundle_state.state.is_empty() && graft_base_swap() {
+        if let Some(largest) = (0..bundles.len()).max_by_key(|&i| bundles[i].state.len()) {
+            let clear = {
+                let base = &bundles[largest];
+                !base.state.is_empty()
+                    && !base
+                        .state
+                        .keys()
+                        .any(|address| *address != beneficiary && state.cache.accounts.contains_key(address))
+            };
+            if clear {
+                let base = bundles.swap_remove(largest);
+                let BundleState { state: mut accounts, contracts, mut reverts, mut state_size, .. } = base;
+                // The beneficiary -- every transfer's fee lands on it, so
+                // every bundle holds it -- goes as a delta like everywhere
+                // else in this function, and its revert is dropped with it.
+                if let Some(account) = accounts.remove(&beneficiary) {
+                    state_size -= account.size_hint();
+                    let new_balance = account.info.as_ref().map(|i| i.balance).unwrap_or_default();
+                    let old_balance = account.original_info.as_ref().map(|i| i.balance).unwrap_or_default();
+                    graft.beneficiary_delta = graft.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+                }
+                graft.accounts += accounts.len();
+                state.bundle_state.state = accounts;
+                state.bundle_state.state_size = state_size;
+                state.bundle_state.contracts.extend(contracts);
+                graft.reverts.extend(
+                    std::mem::take(&mut *reverts).into_iter().flatten().filter(|(address, _)| *address != beneficiary),
+                );
+            }
+        }
+    }
     let total: usize = bundles.iter().map(|b| b.state.len()).sum();
     if keep_cache {
         state.cache.accounts.reserve(total);
@@ -482,7 +530,15 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
         merged.retain(|(address, _)| !grafted.contains(address));
     }
     merged.extend(reverts);
-    merged.sort_unstable_by_key(|(address, _)| *address);
+    // Sorted by address as revm's own merge leaves them; on the worker pool,
+    // a block's 147,000 reverts being too many for one thread on the
+    // follower's critical path.
+    if merged.len() >= 4096 {
+        use rayon::prelude::*;
+        merged.par_sort_unstable_by_key(|(address, _)| *address);
+    } else {
+        merged.sort_unstable_by_key(|(address, _)| *address);
+    }
     bundle.reverts_size = bundle.reverts.iter().map(Vec::len).sum();
 }
 
@@ -625,6 +681,14 @@ pub fn follower_sender_groups() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FOLLOWER_SENDER_GROUPS").is_ok_and(|v| v == "1"))
 }
 
+/// Whether the graft takes the largest bundle as the block's bundle (default;
+/// `N42_GRAFT_BASE_SWAP=0` re-inserts every bundle, the behaviour before round
+/// 43's loop98).
+fn graft_base_swap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_GRAFT_BASE_SWAP").map_or(true, |v| v != "0"))
+}
+
 /// Whether `N42_FOLLOWER_GRAFT=1` is set: the follower folds the groups'
 /// bundles into the block's state with [`graft_bundles`] instead of one
 /// commit of the folded changes (round 43: the commit and its transition
@@ -659,7 +723,13 @@ where
 
     // The transactions' environments, and the partition.
     let at = std::time::Instant::now();
-    let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+    // The environments on the worker pool: serially they were a third of a
+    // 163,000-transfer block's 50 ms partition phase (round 43, loop94).
+    let txs: Vec<TxEnv> = {
+        use rayon::prelude::*;
+        let recovered: Vec<_> = block.transactions_recovered().collect();
+        recovered.par_iter().map(|tx| evm_config.tx_env(*tx)).collect()
+    };
     // Address-keyed with the fixed-bytes hasher: the default hasher was
     // ~29 ms of a 163,000-transfer block's partition.
     let groups: Vec<Vec<usize>> = if sender_groups {
@@ -763,6 +833,7 @@ where
         let (changes, delta) = fold_bundles(&mut state, &bundles, beneficiary).map_err(|e| err(&e))?;
         (changes, delta, None)
     };
+    phases.graft_ms = at.elapsed().as_millis() as u64;
     if !beneficiary_delta.is_zero() {
         let current = state.basic(beneficiary).map_err(|e| err(&e))?;
         let existed = current.is_some();
@@ -780,10 +851,13 @@ where
     }
     state.merge_transitions(BundleRetention::Reverts);
     let mut bundle = state.take_bundle();
+    let taken = at.elapsed().as_millis() as u64;
+    phases.take_ms = taken - phases.graft_ms;
     if let Some(reverts) = grafted {
         append_reverts(&mut bundle, reverts);
     }
     phases.merge_ms = at.elapsed().as_millis() as u64;
+    phases.reverts_ms = phases.merge_ms - taken;
 
     // Receipts in block order, gas cumulated.
     let mut cumulative = 0u64;
@@ -925,6 +999,42 @@ mod tests {
     }
 
 
+    /// With the cache not kept and the block's bundle still empty, the
+    /// largest bundle is taken whole as the block's bundle and the others
+    /// are grafted onto it: an account both hold is added as a delta and
+    /// keeps the base's revert.
+    #[test]
+    fn the_largest_bundle_becomes_the_base_and_the_rest_are_grafted_onto_it() {
+        let info = |balance: u64, nonce: u64| AccountInfo { balance: U256::from(balance), nonce, ..Default::default() };
+        // (address, balance and nonce after, balance and nonce before or None for a fresh account)
+        let bundle = |accounts: &[(Address, u64, u64, Option<(u64, u64)>)]| {
+            let mut b = BundleState::builder(0..=0);
+            for (address, balance, nonce, original) in accounts {
+                b = b.state_present_account_info(*address, info(*balance, *nonce));
+                b = match original {
+                    Some((ob, on)) => b
+                        .state_original_account_info(*address, info(*ob, *on))
+                        .revert_account_info(0, *address, Some(Some(info(*ob, *on)))),
+                    None => b.revert_account_info(0, *address, Some(None)),
+                };
+            }
+            b.build()
+        };
+        let big = bundle(&[(addr(1), 90, 1, Some((100, 0))), (addr(2), 10, 0, None), (addr(3), 5, 0, None)]);
+        let small = bundle(&[(addr(2), 5, 0, None), (addr(4), 7, 0, None)]);
+        let mut state = State::builder().with_database(CacheDB::new(EmptyDB::default())).with_bundle_update().build();
+        let graft = graft_bundles_with(&mut state, vec![small, big], addr(9), false).expect("graft");
+        assert_eq!(graft.accounts, 4, "three from the base, one grafted; the shared one is a delta");
+        assert_eq!(graft.committed, 0);
+        assert_eq!(state.bundle_state.state.len(), 4);
+        let shared = state.bundle_state.state.get(&addr(2)).and_then(|a| a.info.as_ref()).expect("shared account");
+        assert_eq!(shared.balance, U256::from(15), "the small bundle's credit added onto the base's");
+        assert_eq!(state.bundle_state.state.get(&addr(1)).and_then(|a| a.info.as_ref()).map(|i| i.nonce), Some(1));
+        let mut reverted: Vec<Address> = graft.reverts.iter().map(|(a, _)| *a).collect();
+        reverted.sort();
+        assert_eq!(reverted, vec![addr(1), addr(2), addr(3), addr(4)], "one revert per account, the shared one the base's");
+    }
+
     /// The build-mode run, committed in its order with the beneficiary
     /// credited once, ends in the same state as the serial executor.
     #[test]
@@ -1050,6 +1160,125 @@ mod tests {
     /// A full bench-tier block (163,000 transfers, 6,000 senders, recipients
     /// drawn from two million) through the serial transfer path and through
     /// `execute_for_build`, timed. `cargo test -p n42-engine-types --release
+    /// A block of `senders x per` transfers to recipients drawn at random
+    /// from `space` accounts (the bench's shape: 6,000 x 27 over 2,000,000
+    /// gives ~147,000 distinct accounts), the senders interleaved as the
+    /// queue lays them out.
+    fn random_fixture(senders: u64, per: u64, space: u64, run: usize) -> (RecoveredBlock<Block>, CacheDB<EmptyDB>) {
+        let mut db = CacheDB::new(EmptyDB::default());
+        let beneficiary = addr(1);
+        db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
+        let mut by_sender: Vec<Vec<(n42_tx_types::N42TxEnvelope, Address)>> = Vec::with_capacity(senders as usize);
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for s in 0..senders {
+            let sender = addr(100 + s);
+            db.insert_account_info(sender, AccountInfo { balance: U256::from(10u128.pow(21)), nonce: 0, ..Default::default() });
+            let mut lane = Vec::with_capacity(per as usize);
+            for k in 0..per {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                // `space` 0: each sender draws from its own range of 2 x per
+                // addresses (repeats only within a sender, as the fleet's
+                // flood mostly produces: ~210 components a block); otherwise a
+                // shared space, where a few thousand repeats join every sender
+                // into one component.
+                let to = if space == 0 { addr(1_000_000 + s * per * 2 + seed % (per * 2)) } else { addr(1_000_000 + seed % space) };
+                let inner = TxEip1559 {
+                    chain_id: 1,
+                    nonce: k,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: 10_000_000_000,
+                    max_priority_fee_per_gas: 1_000_000_000,
+                    to: TxKind::Call(to),
+                    value: U256::from(1_000 + k),
+                    input: Bytes::new(),
+                    ..Default::default()
+                };
+                let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+                lane.push((n42_tx_types::N42TxEnvelope::from(TransactionSigned::from(signed)), sender));
+            }
+            by_sender.push(lane);
+        }
+        // Interleaved as the queue lays them out: `run` transactions of a
+        // sender, then the next sender's.
+        let mut txs = Vec::with_capacity((senders * per) as usize);
+        let mut recovered = Vec::with_capacity((senders * per) as usize);
+        let mut k = 0usize;
+        while k < per as usize {
+            for lane in &by_sender {
+                for (tx, sender) in &lane[k..(k + run).min(per as usize)] {
+                    txs.push(tx.clone());
+                    recovered.push(*sender);
+                }
+            }
+            k += run;
+        }
+        let header = Header {
+            number: 20_000_000,
+            beneficiary,
+            gas_limit: 10_000_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            timestamp: 1_800_000_000,
+            parent_beacon_block_root: Some(B256::ZERO),
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            ..Default::default()
+        };
+        let body = n42_tx_types::BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
+        let block = SealedBlock::seal_slow(Block { header, body });
+        (RecoveredBlock::new_sealed(block, recovered), db)
+    }
+
+    /// Where the follower's parallel execution of a bench-shaped block goes,
+    /// by component groups (the follower's default) and by sender groups,
+    /// with the graft. `cargo test --release -p n42-engine-types --lib
+    /// bench_follower_import -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_follower_import() {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        // Defaults: the fleet's block shape (~380 senders in runs of 64 -- the
+        // queue's `N42_TX_QUEUE_RUN` -- over 2M recipients: ~147k accounts).
+        let (senders, per, space, run) = (env("BENCH_SENDERS", 380), env("BENCH_PER", 429), env("BENCH_SPACE", 0), env("BENCH_RUN", 64));
+        let (block, db) = random_fixture(senders, per, space, run as usize);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let mut distinct: std::collections::HashSet<Address> = Default::default();
+        for (sender, tx) in block.transactions_with_sender() {
+            distinct.insert(*sender);
+            if let alloy_primitives::TxKind::Call(to) = alloy_consensus::Transaction::kind(tx) {
+                distinct.insert(to);
+            }
+        }
+        println!("block: {} transfers, {} distinct accounts", block.transaction_count(), distinct.len());
+        for (label, graft, sender_groups) in [("components+graft", true, false), ("senders+graft", true, true), ("components+fold", false, false)] {
+            for round in 0..3 {
+                let at = std::time::Instant::now();
+                let (out, phases) =
+                    execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft, sender_groups)
+                        .expect("no execution error")
+                        .expect("the block qualifies");
+                println!(
+                    "{label} #{round}: total {} ms  partition {} groups {} ({} groups, {} batches) merge {} [graft {} take {} reverts {}] finish {}  -> {} accounts, {} reverts",
+                    at.elapsed().as_millis(),
+                    phases.partition_ms,
+                    phases.groups_ms,
+                    phases.groups,
+                    phases.batches,
+                    phases.merge_ms,
+                    phases.graft_ms,
+                    phases.take_ms,
+                    phases.reverts_ms,
+                    phases.finish_ms,
+                    out.state.state.len(),
+                    out.state.reverts.iter().map(Vec::len).sum::<usize>(),
+                );
+            }
+        }
+    }
+
     /// bench_build_run -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing"]

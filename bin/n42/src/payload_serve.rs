@@ -638,6 +638,10 @@ where
                     // engine as executed, when configured. Any failure logs
                     // and leaves the block to the engine's own path.
                     let mut direct_ms: Option<[u64; 9]> = None;
+                    // The block's transaction hashes, known once the direct
+                    // import converted the payload: the prune below then
+                    // needs no keccak over the raw bytes.
+                    let mut mined_hashes: Option<Vec<B256>> = None;
                     if let Some(reuse) = reuse.as_ref().filter(|r| !reused && r.import_foreign.is_some()) {
                         let import = reuse.import_foreign.clone().expect("checked");
                         let validator = reuse.validator.clone();
@@ -671,6 +675,9 @@ where
                                         .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
                                         .collect();
                                     let (number, hash) = (executed.recovered_block.number(), executed.recovered_block.hash());
+                                    mined_hashes = Some(
+                                        executed.recovered_block.body().transactions().map(|tx| *tx.tx_hash()).collect(),
+                                    );
                                     // Held until the chain settles the height (round 43).
                                     tokio::task::spawn_blocking(move || {
                                         let removed = queue.remove_mined_batch_collecting(mined);
@@ -733,21 +740,33 @@ where
                             {
                                 let pruned_at = std::time::Instant::now();
                                 let count = raw_transactions.len();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    use rayon::prelude::*;
-                                    let hashes: Vec<B256> =
-                                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect();
+                                // Not awaited: the answer to this payload is
+                                // what the validator's vote waits for, and the
+                                // prune of a full block was 66 ms of it (round
+                                // 43, loop94). The pool is a few tens of
+                                // milliseconds behind the chain instead of the
+                                // length of its maintenance, which is what the
+                                // `pending` the ingest gate reads needed.
+                                let mined_hashes = mined_hashes.take();
+                                let pruning = tokio::task::spawn_blocking(move || {
+                                    let hashes: Vec<B256> = mined_hashes.unwrap_or_else(|| {
+                                        use rayon::prelude::*;
+                                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect()
+                                    });
                                     prune(hashes);
-                                })
-                                .await;
-                                if count > 10_000 {
-                                    info!(
-                                        target: "n42.payload_serve",
-                                        number,
-                                        count,
-                                        prune_ms = pruned_at.elapsed().as_millis() as u64,
-                                        "imported block's transactions taken out of the pool"
-                                    );
+                                    if count > 10_000 {
+                                        info!(
+                                            target: "n42.payload_serve",
+                                            number,
+                                            count,
+                                            prune_ms = pruned_at.elapsed().as_millis() as u64,
+                                            "imported block's transactions taken out of the pool"
+                                        );
+                                    }
+                                });
+                                // `N42_PRUNE_ASYNC=0`: the answer waits for the prune, as before round 43's loop98.
+                                if !prune_async() {
+                                    let _ = pruning.await;
                                 }
                             }
                             if let Some(ms) = direct_ms {
@@ -886,4 +905,12 @@ mod tests {
         let sealed = SealedBlock::seal_slow(block);
         assert_eq!(encode_block_parallel(&sealed), alloy_rlp::encode(&sealed));
     }
+}
+
+/// Whether an imported block's pool prune runs off the payload answer's path
+/// (default; `N42_PRUNE_ASYNC=0` makes the answer wait for it, the behaviour
+/// before round 43's loop98).
+fn prune_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PRUNE_ASYNC").map_or(true, |v| v != "0"))
 }

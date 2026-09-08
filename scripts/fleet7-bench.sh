@@ -280,13 +280,16 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
 # idling is the slow kind, a leg started right after another leg's fleet was
 # killed the fast kind. `F7_DROP_CACHE=1` evicts stale file pages first
 # (scripts/dropcache.py, no root; necessary, not sufficient) and
-# `F7_HUGEPREP=<GB>` pre-compacts that much memory into huge pages
-# (scripts/hugeprep.py, MADV_COLLAPSE) for the fleet to take. The header line
-# records the state either way, so a leg can be judged afterwards.
-if [ "${F7_DROP_CACHE:-0}" = 1 ]; then
+# `F7_HUGEPREP=<GB>` (default 60; 0 turns it off) pre-compacts that much
+# memory into huge pages (scripts/hugeprep.py, MADV_COLLAPSE, ~5 s) for the
+# fleet to take: loop97-98 read 243-253k on every leg with it, the best totals
+# of the campaign (17.1-18.2M), from any starting state. Both are defaults
+# since loop98. The header line records the state either way, so a leg can be
+# judged afterwards.
+if [ "${F7_DROP_CACHE:-1}" = 1 ]; then
   python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" 2>&1 | tail -1
 fi
-if [ -n "${F7_HUGEPREP:-}" ] && [ "$F7_HUGEPREP" != 0 ]; then
+if [ "${F7_HUGEPREP:-60}" != 0 ]; then
   python3 "$HERE/hugeprep.py" "$F7_HUGEPREP" 3 2>&1 | tail -3
 fi
 echo "memory       : $(awk '/^MemFree|^Cached:|^Shmem:/{printf "%s %.1fG  ", $1, $2/1e6}' /proc/meminfo)huge-page pool $(awk '$4=="Normal"{o9=0; for(i=14;i<=NF;i++) o9+=$i; printf "order9+ %d order10 %d", o9, $NF}' /proc/buddyinfo)"

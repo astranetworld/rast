@@ -58,15 +58,21 @@ def main(argv):
         m[off] = 1
     touched = anon_huge_kb() >> 10
     print(f'hugeprep: touched {gb:.0f} GB in {time.time() - t0:.1f}s, {touched} MB huge at the fault', flush=True)
+    # Collapse in 256 MB chunks: one MADV_COLLAPSE over the whole map stops
+    # at the first 2 MB region it cannot get a huge page for (ENOMEM) and
+    # leaves the rest untried (loop97: 61% after three "passes" of 0.2 s).
+    chunk = 256 << 20
     for i in range(passes):
         t1 = time.time()
-        try:
-            m.madvise(MADV_COLLAPSE)
-            err = ''
-        except OSError as e:
-            err = f' ({e.strerror})'
+        failed = 0
+        for off in range(0, size, chunk):
+            try:
+                m.madvise(MADV_COLLAPSE, off, min(chunk, size - off))
+            except OSError:
+                failed += 1
         now = anon_huge_kb() >> 10
-        print(f'hugeprep: collapse pass {i + 1}: {now} MB huge ({100 * now / (size >> 20):.0f}%) in {time.time() - t1:.1f}s{err}', flush=True)
+        print(f'hugeprep: collapse pass {i + 1}: {now} MB huge ({100 * now / (size >> 20):.0f}%), '
+              f'{failed} of {size // chunk} chunks refused, {time.time() - t1:.1f}s', flush=True)
         if now >= (size >> 20) * 0.97:
             break
     m.close()

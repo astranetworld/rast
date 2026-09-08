@@ -642,12 +642,101 @@ huge. Across loop96-96b the pool at the flood's start predicts the mode:
 line is somewhere near 25-28 GB, which is why a state that leaves the pool
 near it (C1: five minutes idle, then dropcache) can fall on either side.
 
-The remedy under test (loop97): `scripts/hugeprep.py` maps 60 GB, touches
-it and asks for `MADV_COLLAPSE` (synchronous compaction whatever
-`defrag` says), then exits and leaves the huge pages as the pool the
-fleet takes at the flood's start. Alternatives if it does not hold: the
-warm-up leg (what the host rule always was), a 4 KB heap for the
-followers only, or root: `defrag=always` for the fleet's own faults.
+**loop97 (13:01-13:38): building the pool on purpose.** `scripts/hugeprep.py`
+maps 60 GB, touches one byte per 2 MB and asks for `MADV_COLLAPSE`
+(synchronous compaction whatever `defrag` says), then exits and leaves the
+huge pages as free order-9/10 blocks. One call over the whole map stops
+at the first region it cannot serve (ENOMEM after 0.2 s, 61% huge); in
+256 MB chunks over two passes it reaches 100% in 2.7 s and leaves a pool
+of order9+ 19,783 / order10 10,188 (~80 GB) where 40 GB stood. Every leg
+after five minutes of idling plus dropcache; H legs with hugeprep first:
+
+    leg   pool at start (order9+/order10, ~GB)   win1     win2     win3     total
+    I1    13,760 / 2,673   (~38)                 239,058  168,351  151,992  16.79M
+    H1    14,807 / 3,382   (~43; first hugeprep, 61%)  243,773  173,812  152,068  17.09M
+    I2    13,785 / 2,841   (~39)                 242,488  162,943  157,510  16.89M
+    H2    19,783 / 10,188  (~80; chunked)        244,492  173,770  152,089  17.12M
+
+Idling left a pool near 40 GB this time, so every leg was the fast kind
+and the H legs read only +1-2% (inside the band): loop97 does not show a
+rescue, loop98 (which starts its first leg after the unit tests and a
+build, the state that gave P1 its 184k) will. What loop97 does show: even
+from an 80 GB pool the heaps peak at ~42 GB of huge pages and the storm
+starts ~20 s into the flood, when free memory reaches ~35 GB -- the pool
+is also what the datadir's page cache and every 4 KB allocation are cut
+from. Window 1's mode is decided in the first 15 s by what the heaps'
+hot allocations got, and a pool of 40 GB or more decides it the right way.
+
+**loop98 (13:43-14:01): the first follower cuts, bookended, and hugeprep from
+a post-build start.** The unit tests and a release build first (the state
+that gave loop96b's P1 its 184k: pool ~34 GB before prep), then dropcache
+and hugeprep before every leg. S = the loop95 binary (HEAD 42f1cc5eb), B =
+the working tree: `TxEnv`s built on the worker pool, the graft taking the
+largest bundle as the block's bundle instead of re-inserting its 140,000
+accounts, the grafted reverts sorted in parallel. (A third change, the
+pool prune taken off the payload answer, turned out to be a no-op here:
+the "66 ms prune" was the canonical pruner's log line and `prune_pool` is
+unset in the queue configuration; it stays as `N42_PRUNE_ASYNC`.)
+
+    leg   binary   pool at start (~GB)   win1     win2     win3     total
+    S1    old      89                    252,518  184,684  168,379  18.17M
+    B1    cuts     80                    244,858  168,346  146,596  16.80M
+    S2    old      80                    244,492  173,815  152,090  17.12M
+    B2    cuts     80                    245,709  168,375  157,498  17.15M
+
+Null on the fleet. On the same node in the same mode the import fell
+482 -> 470 ms (partition 41 -> 30, merge 75 -> 59, groups 55 -> 62) and
+the import barrier -- the validator's wait for the execution layer's
+answer -- did not move (535 / 528 ms), so the cycle did not either. The
+cuts stay (tests, `N42_GRAFT_BASE_SWAP=0` restores the old graft); the
+lesson is the size of cut the fleet can see: the barrier is ~530 ms of a
+~660 ms cycle (publish->recv 30, barrier 530, vote->decide 20,
+decide->publish 80), and 12 ms of it is inside one leg's noise.
+
+What loop98 did settle is hugeprep: from a post-build start (the P1
+state) every leg read 244-253k, and S1's 18.17M is the campaign's best
+total (17.7M before), window 2 and 3 with it (185k / 168k against 168-174k
+/ 152-157k) -- the pool feeds the heaps' later growth too. **Adopted:
+`fleet7-bench.sh` runs dropcache and `hugeprep 60` before every leg
+(`F7_DROP_CACHE=0`, `F7_HUGEPREP=0` turn them off) and prints a `memory :`
+header line; the "one warm-up leg" host rule is retired in favour of the
+pool.** The import's remaining phases at this shape, fast mode, node 0:
+exec 162-182 (partition 30-41, groups 55-62, merge 59-75), root 100,
+convert 54, hashed 39-43, senders 36, engine 35-38, checks 5 -- total
+470-482 ms. The next cut has to be ~100 ms to show: the giant component
+executing serially (groups), the root, the conversion.
+
+**Offline, after loop98: where the follower's parallel execution goes**
+(`bench_follower_import`, an ignored test in `parallel_transfer.rs`, release
+build, 163,020 transfers from 380 senders in runs of 64 as the queue lays
+them out; recipients either per sender -- repeats only within a sender,
+~380 components as the fleet's ~210 -- or from one shared space of 2M,
+where ~6,000 repeats join every sender into one component):
+
+    shape                 grouping         total   partition  groups (n)     merge [graft take reverts]
+    per-sender (129k acc) components+graft 141-149  22-26     57-58 (380)    53-56 [42-45 0 11-12]
+    per-sender            senders+graft    136-141  10-12     67-69 (380/76) 51-53 [39-41 0 12]
+    per-sender            components+fold  318-323  23        57             217-219 [98 119-121 0]
+    shared 2M (157k acc)  components+graft 341-394  23-27     278-288 (1)    30-71 [13-52 0 17-19]
+    shared 2M             senders+graft    159-165  11-15     68-73 (380/76) 69-71 [50-51 0 18-20]
+
+The base swap was not firing on the fleet at all: every transfer's fee
+lands on the beneficiary, so every bundle holds it and the "no account of
+the base is special" check refused every candidate. With the beneficiary
+taken out as a delta (as everywhere else in the graft) the swap works --
+merge 70 -> 30 ms when one component is the block -- but at the fleet's
+shape the largest of ~210-380 components is a few hundred accounts and the
+swap saves nothing (graft 42 against 45). What the graft costs there is
+~330 ns an account: 129,000 `BundleAccount`s moved into one hash map on
+one thread, which no grouping avoids while the block's bundle is a
+`HashMap`. The old fold path is 2.2x slower (its transition merge alone
+120-147 ms), which is what `N42_FOLLOWER_GRAFT=1` bought in round 43.
+Sender groups and component groups are within 5 ms of each other at this
+shape; the one-component shape is where components lose 4.5x, and the
+flood does not produce it. So the follower's execution phase is ~145 ms
+offline against 162-182 on the fleet (the fleet's is under load), and its
+next cut is the graft's inserts, which needs a different bundle
+representation -- not a knob.
 
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
