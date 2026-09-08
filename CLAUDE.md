@@ -115,9 +115,11 @@ measured on that shape (fixed in ab3c79240; `docs/NATIVE_FLEET7.md` round 43). W
 block touches ~147,000 accounts and the fleet reads 163-168k TPS at a 0.97-1.0 s cycle with the round-41
 configuration, ~200k at 0.8 s with `N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1` (the leader's transfers in
 parallel per-sender batches grafted onto the block's state; the follower's groups grafted the same way;
-both off by default, both bookended: 201-206k against 172-182k), and **223-228k at 0.71-0.73 s** with the
+both off by default, both bookended: 201-206k against 172-182k), and **239-247k at 0.65-0.68 s, 17.4-17.7M transactions a round without a stall**, with the
 parallel state commit on top (QMDB leaves and hashed post-state built on the worker pool; on by default
-since loop82, `N42_PARALLEL_STATE_COMMIT=0` turns it off). The follower's import (622-657 ms:
+since loop82, `N42_PARALLEL_STATE_COMMIT=0` turns it off), the provider's chunked hashed post-state, and
+**`F7_BLOCK_INTERVAL_MS=450`**: the leader outruns a 410-470 ms follower import at 300 ms pacing and every
+tenure handover then stalls for 10-40 s while the next leader catches up (loop85-87; task #14 is the real fix). The follower's import (622-657 ms:
 QMDB root 190, hashed 75, convert 55, execution 183-224) is the cycle; the cycle is linear in the accounts a
 block touches (0.40 s + 2.8 us per account: 393k TPS at ~400 accounts, 337k at 20k, 283k at 67k, 201k at 145k;
 `docs/BLOCK_SHAPE_SURVEY.md`, which also places the shape against Ethereum, BNB, Polygon and Tron).

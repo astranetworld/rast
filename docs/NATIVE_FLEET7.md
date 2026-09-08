@@ -432,6 +432,61 @@ with the parallel builder, the grafted follower and the parallel state
 commit; the follower's import is now ~490-500 ms (execution ~200,
 root 104, convert 55, hashed 37, senders 37).
 
+**loop83-87 (2026-09-08): the last of the state-commit work, and the stall's
+real trigger.**
+
+    change / knob                                                    legs      win1 (cycle)              totals            verdict
+    twig index: key-prefix hasher + reserve; follower graft skips    N1,N3     228,189 (0.714 s) x2      16.6M x2          +2.4% over O2 222,755;
+      the cache insert (1a09ade1d)                                   O2,O3     222,755 / 186,092         15.5M / 14.6M       import 474 vs 488-503 ms
+    provider hashes a large post-state over rayon chunks             N4        246,132 (0.652 s)         (window 2-3 stalled) leader finish 249 -> 116 ms,
+      (dc2dfe08e / 766aa7186), also on the builder's `finish`                                                                build 609 -> 365
+    32-thread build pool (N42_PARALLEL_BUILD_THREADS=32)             T1,T2     242,147 / 239,058         14.5M / 15.9M     null (par_exec 47 vs 52-56 ms)
+    builder graft without cache inserts (N42_BUILD_GRAFT_NO_CACHE)   C1,C2     239,056 / 239,056         16.8M / 14.9M     null (fold 83 vs 82 ms)
+    baseline, new build, thp:always                                  A1-A3     239,057 / 244,479 / 244,315  11.0M / 16.7M / 10.4M  later windows: the stall lottery
+    4 KB heap (MALLOC_CONF unset) on the new build                   K1,K2     184,726 x2 (0.882 s)      15.81M x2         bit-identical legs, no stall, -24% win1
+    thp:always on the new build                                      H1,H2     244,489 / 239,055         7.3M / 12.3M      both collapse after window 1
+
+The leader's full-block build is 362-387 ms now (parallel execution ~50,
+graft + receipts ~82, finish ~120, assemble ~50) and no longer the pole.
+The pole is the follower's import (410-470 ms) -- and the stall.
+
+**The stall's trigger is the leader outrunning the followers**, read in
+loop85 A1's logs (memory quiet: 1.6M major faults): node4 proposed views
+188-191 every 300 ms with a block built ahead each time, while the
+followers imported at ~470 ms and voted on headers before importing the
+bodies; by the end of its 16-view tenure they were several blocks behind.
+The next leader, node5, logged "the block our highest QC certifies is not
+imported; asking for it before proposing view=192"; view 192 timed out
+(5 s), NewView 193 arrived 13 s later, 194 timed out again (fcu 2,854 ms):
+gaps of 16, 13 and 11 s at blocks 191-194. Memory (round 43, continued)
+makes the imports slower and the gap wider; it is not the trigger. The
+4 KB heap avoids the stall by slowing the leader as much as the followers.
+
+So the pacing was swept against the import time (loop87, new build,
+thp:always, interleaved):
+
+    leg     pacing   win1     win2     win3     total    gaps > 4 s
+    P300a   300 ms   244,368  172,921  140,770  16.75M   1
+    P450a   450 ms   239,059  184,657  157,475  17.44M   0
+    P500a   500 ms   196,511  152,056  157,512  15.19M   0
+    P300b   300 ms   244,351   89,328  158,095  14.76M   1 (14 view timeouts)
+    P450b   450 ms   246,590  179,213  162,948  17.67M   0
+    P500b   500 ms   239,049  105,150   59,344  12.11M   2
+
+**450 ms pacing is adopted for the bench**: window 1 unchanged (the cycle
+was the import's anyway, 0.65-0.68 s), no stall in either leg, and the
+two best totals measured on the honest shape (17.4M and 17.7M
+transactions a round; 300 ms's best was 16.8M). 500 ms is too slow for
+window 1 and did not prevent P500b's stall, so pacing is a mitigation,
+not the fix: the fix is a follower that votes after importing, or a
+leader that paces to the slowest quorum importer (task #14).
+
+Where the fleet stands (2026-09-08, 163,000 scattered transfers a block,
+~147,000 accounts touched): **239-247k TPS on window 1 at a 0.65-0.68 s
+cycle, 17.4-17.7M transactions a 90 s round without a stall**, with the
+parallel builder, the grafted follower, the parallel state commit
+(default), the record environment and 450 ms pacing.
+
 What would actually remove the storm is less to reclaim: the tmpfs
 (27-34 GB of other drivers' leftovers under /tmp), the seven heaps'
 huge-page appetite (a 4 KB heap on the followers only, keeping the
