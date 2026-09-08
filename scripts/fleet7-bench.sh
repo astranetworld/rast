@@ -280,19 +280,22 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
 # idling is the slow kind, a leg started right after another leg's fleet was
 # killed the fast kind. `F7_DROP_CACHE=1` evicts stale file pages first
 # (scripts/dropcache.py, no root; necessary, not sufficient) and
-# `F7_HUGEPREP=<GB>` (default 60; 0 turns it off) pre-compacts that much
-# memory into huge pages (scripts/hugeprep.py, MADV_COLLAPSE, ~5 s) for the
-# fleet to take: loop97-98 read 243-253k on every leg with it, the best totals
+# `F7_HUGEPREP=<GB>` (default 40; 0 turns it off) is the free huge-page pool
+# the leg wants: scripts/hugeprep.py writes and collapses a 30 GB working set,
+# repeatedly, until the pool reaches it (each round hands its huge pages back,
+# so rounds accumulate; ~2 s each once the pool is healthy): loop97-98 read 243-253k on every leg with it, the best totals
 # of the campaign (17.1-18.2M), from any starting state. Both are defaults
 # since loop98. The header line records the state either way, so a leg can be
 # judged afterwards.
 F7_DROP_CACHE=${F7_DROP_CACHE:-1}
-F7_HUGEPREP=${F7_HUGEPREP:-60}
+F7_HUGEPREP=${F7_HUGEPREP:-40}
 if [ "$F7_DROP_CACHE" = 1 ]; then
   python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" 2>&1 | tail -1
 fi
 if [ "$F7_HUGEPREP" != 0 ]; then
-  python3 "$HERE/hugeprep.py" "$F7_HUGEPREP" 3 2>&1 | tail -3
+  # Working set 30 GB (what the box can collapse whole), two passes, repeated
+  # until the free huge-page pool reaches F7_HUGEPREP GB or four rounds are up.
+  python3 "$HERE/hugeprep.py" 30 2 "$F7_HUGEPREP" 4 2>&1 | tail -6
 fi
 echo "memory       : $(awk '/^MemFree|^Cached:|^Shmem:/{printf "%s %.1fG  ", $1, $2/1e6}' /proc/meminfo)huge-page pool $(awk '$4=="Normal"{o9=0; for(i=14;i<=NF;i++) o9+=$i; printf "order9+ %d order10 %d", o9, $NF}' /proc/buddyinfo)"
 

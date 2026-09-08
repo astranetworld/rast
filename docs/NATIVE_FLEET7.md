@@ -774,6 +774,30 @@ them; every parallel phase above ran 1.5-2x faster at 32 threads offline
 this parallel). loop99 bookends the build (S-B-R: old binary, new binary,
 new binary with `RAYON_NUM_THREADS=32`).
 
+**loop99's first attempt (21:12-21:21) and what hugeprep was really doing.**
+The first leg died at the huge-page step (`F7_HUGEPREP` read with a default
+in the test and bare afterwards, under `set -u`), and the relaunched leg read
+158,611 at a 1.0 s cycle -- the slow mode -- with a pool of 14 GB after a
+hugeprep that reported "202 of 240 chunks refused". The cause was in
+hugeprep itself: it touched **one byte per 2 MB**, which allocates a whole
+2 MB page only while transparent huge pages are actually available; under a
+fallback it allocates 4 KB per 2 MB, so a "60 GB" pass allocated ~120 MB, put
+no pressure on the page cache (95 GB of it, mostly another fleet's files that
+`dropcache.py`'s paths do not cover), and left `MADV_COLLAPSE` nothing
+contiguous to work with. It worked in loop97-98 only because those legs
+followed a killed fleet, which had already freed 40 GB of huge pages.
+
+Now it writes every page of its working set, which evicts clean page cache
+first (95 -> 20 GB, the tmpfs floor) exactly as the fleet's own heaps would
+at the flood's start, and it iterates: a 30 GB working set collapses whole
+(0 of 120 chunks refused) where 60 GB is refused for want of anywhere to put
+the huge pages, and each round hands its huge pages back to the pool, so
+rounds accumulate -- 17 -> 38 -> 42 GB over three rounds on a box that had
+been busy for hours. `F7_HUGEPREP` is now the **pool target** (default 40 GB;
+`hugeprep.py <working set> <passes> <target> <rounds>`), and once the pool is
+healthy a round costs 2 s. 42 GB is this box's ceiling while the tmpfs holds
+21 GB.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
