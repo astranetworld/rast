@@ -546,6 +546,26 @@ stall and no reorg in any leg, so the held ledger was not exercised on the
 fleet (its queue test stands); the grace legs are now six for six without
 a stall across loop92-93, and nothing regressed with the ledger in.
 
+**loop94 (11:47): where a follower's CPU goes** (`--profile-node 3`, perf
+between the windows of one G450 leg at 179k, profiling binary):
+
+    61.0%  tokio-rt threads   -- the ingest: Ed25519 batch verification (curve25519 pow2k 15.8%,
+                                 the AVX2 field 14.9%, mul/pippenger/edwards ~6%) and keccak (~5%)
+    13.7%  n42 (rayon) threads -- the import's groups, graft, leaves and hashed state; keccak 2.7%
+     6.1%  persistence        -- RocksDB memtable inserts
+     4.4%  payload-builder
+    ~8%    storage-*, engine, rocksdb:high
+
+Every validator verifies every transaction it votes on, so at ~400k
+transactions a second offered per node the Ed25519 verification alone is
+~10 cores of each execution layer's 32, and the import's own work is a
+minority of the CPU: the import bounds the cycle by its latency, the
+ingest by its cores. The next cuts are therefore (a) the ingest's cost
+per transaction -- keccak is computed for the hash and the sender key, the
+Ed25519 batches are 128 wide on 20 slots -- and (b) the import's latency
+(convert 50, groups 60-80, graft 72, root ~100, hashed 37, senders 36 ms),
+in that order of size.
+
 What would actually remove the storm is less to reclaim: the tmpfs
 (27-34 GB of other drivers' leftovers under /tmp), the seven heaps'
 huge-page appetite (a 4 KB heap on the followers only, keeping the

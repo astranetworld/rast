@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-08 10:45)
+# Fleet7 status (living note; last updated 2026-09-08 12:00)
 
 The one-page state of the native seven-node fleet work: what is true now, what
 is in flight, what is decided and what is not. The measurements behind it are
@@ -70,6 +70,14 @@ distinct recipients.
   no stall; if G450 is the steadiest, both.
 - Sender grouping on the follower: adopt if S beats B on import time and
   totals on the clean rerun (loop91).
+
+## Where a follower's CPU goes (loop94 profile)
+
+61% in the tokio threads doing the ingest (Ed25519 batch verification ~36% of
+all samples, keccak ~5%), 14% in the rayon threads doing the import, 6%
+persistence. Each validator verifies every transaction it votes on; at ~400k
+offered per node that is ~10 of 32 cores. The import bounds the cycle by
+latency; the ingest by cores.
 
 ## Next after these
 
