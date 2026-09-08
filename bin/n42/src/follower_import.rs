@@ -254,11 +254,10 @@ where
 
     let hashed_at = std::time::Instant::now();
     stage.at(7);
-    let hashed_state = if parallel_state_commit() {
-        hashed_post_state_parallel(&output.state)
-    } else {
-        state.hashed_post_state(&output.state).map_err(|err| format!("hashed state: {err}"))?
-    };
+    // The provider hashes a large bundle over rayon chunks itself now
+    // (`hashed_post_state_from_bundle`); one implementation for the builder's
+    // `finish` and this import.
+    let hashed_state = state.hashed_post_state(&output.state).map_err(|err| format!("hashed state: {err}"))?;
     let hashed_ms = hashed_at.elapsed().as_millis() as u64;
 
     Ok((
@@ -278,9 +277,9 @@ fn follower_parallel() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARALLEL").is_ok_and(|v| v == "1"))
 }
 
-/// Whether the parallel state commit is on (default; `N42_PARALLEL_STATE_COMMIT=0` turns it off): the QMDB leaf operations and
-/// the hashed post-state are built on the worker pool instead of serially
-/// (round 43: 190 + 75 ms of a follower's 622 ms import at 147,000 accounts).
+/// Whether the parallel state commit is on (default; `N42_PARALLEL_STATE_COMMIT=0` turns it off): the QMDB leaf operations are
+/// keyed, encoded and sorted on the worker pool instead of through the change set
+/// (round 43: 190 -> 104 ms of a follower's import at 147,000 accounts).
 pub fn parallel_state_commit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default since round 43's loop82 (223-228k against 189-201k on
@@ -289,16 +288,3 @@ pub fn parallel_state_commit() -> bool {
     *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").map_or(true, |v| v != "0"))
 }
 
-/// reth's `HashedPostState::from_bundle_state` (a keccak per account and per
-/// slot, serial: 72 ms at 147,000 accounts) over rayon chunks: 28-40 ms.
-pub fn hashed_post_state_parallel(bundle: &reth_revm::db::BundleState) -> reth_trie::HashedPostState {
-    use rayon::prelude::*;
-    let entries: Vec<(&alloy_primitives::Address, &reth_revm::db::BundleAccount)> = bundle.state.iter().collect();
-    entries
-        .par_chunks(4096)
-        .map(|chunk| reth_trie::HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(chunk.iter().copied()))
-        .reduce(reth_trie::HashedPostState::default, |mut a, b| {
-            a.extend(b);
-            a
-        })
-}
