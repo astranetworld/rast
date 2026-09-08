@@ -539,6 +539,13 @@ never committed carried them away for good (40,000 nonce refusals a block
 for the rest of the leg). The queue now holds an own block's transactions
 until the chain settles its height (7c6b8ce11; loop93 validates it).
 
+loop93 (10:23-10:38, the held-ledger build, box recovered): H300a
+184,319 / 152,080 / 157,476, HG300a 238,998 / 168,395 / 157,490, H300b
+240,233 / 168,350 / 162,929, HG300b 239,055 / 168,370 / 152,091 -- no
+stall and no reorg in any leg, so the held ledger was not exercised on the
+fleet (its queue test stands); the grace legs are now six for six without
+a stall across loop92-93, and nothing regressed with the ledger in.
+
 What would actually remove the storm is less to reclaim: the tmpfs
 (27-34 GB of other drivers' leftovers under /tmp), the seven heaps'
 huge-page appetite (a 4 KB heap on the followers only, keeping the

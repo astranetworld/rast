@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-08 10:20)
+# Fleet7 status (living note; last updated 2026-09-08 10:45)
 
 The one-page state of the native seven-node fleet work: what is true now, what
 is in flight, what is decided and what is not. The measurements behind it are
@@ -49,7 +49,7 @@ perfectly steady.
 
 1. (done) **loop89/91** -- follower grouping by sender: null.
 1. (done) **loop92** -- grace: adopted.
-1. **loop93** -- the held own-block ledger under 300 ms pacing (stalls on purpose), with and without the grace.
+1. (done) **loop93** -- no stall occurred in any of its four legs (box recovered: 239-240k win1), so the held own-block ledger is validated by its queue test only; watch for "own block at this height was not the one committed" in future logs.
 1. (old) **loop89** -- follower grouping by sender (`N42_FOLLOWER_SENDER_GROUPS=1`,
    7dbb2cc21) vs connected components, S-B-S-B. Ran under a 17-31 GB `datc`
    neighbour (flood starved: 13 s replies); its numbers are suspect.
