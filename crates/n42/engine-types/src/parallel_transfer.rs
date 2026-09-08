@@ -195,6 +195,29 @@ pub fn build_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Whole groups packed into at most `2 x workers` batches of about equal
+/// size (a couple of thousand transfers each), in group order: what one
+/// worker executes on one view of the parent's state.
+pub fn batch_groups(groups: &[Vec<usize>], total: usize, workers: usize) -> Vec<Vec<&Vec<usize>>> {
+    let wanted = (total / 2048).clamp(1, workers.max(1) * 2);
+    let per_batch = total.div_ceil(wanted).max(1);
+    let mut batches: Vec<Vec<&Vec<usize>>> = Vec::with_capacity(wanted + 1);
+    let mut current: Vec<&Vec<usize>> = Vec::new();
+    let mut filled = 0usize;
+    for group in groups {
+        current.push(group);
+        filled += group.len();
+        if filled >= per_batch {
+            batches.push(std::mem::take(&mut current));
+            filled = 0;
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 /// One transfer executed for a block being built: its index in the candidate
 /// list, the transaction as `convert` produced it, the EVM's result, and the
 /// gas it used. Its state changes are in its batch's bundle
@@ -505,22 +528,7 @@ where
     // own view of the parent, which is not free.
     let pool = build_pool();
     let workers = pool.current_num_threads().max(1);
-    let wanted = (keys.len() / 2048).clamp(1, workers * 2);
-    let per_batch = keys.len().div_ceil(wanted).max(1);
-    let mut batches: Vec<Vec<&Vec<usize>>> = Vec::with_capacity(wanted + 1);
-    let mut current: Vec<&Vec<usize>> = Vec::new();
-    let mut filled = 0usize;
-    for group in &groups {
-        current.push(group);
-        filled += group.len();
-        if filled >= per_batch {
-            batches.push(std::mem::take(&mut current));
-            filled = 0;
-        }
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
+    let batches = batch_groups(&groups, keys.len(), workers);
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
 
@@ -601,7 +609,20 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_transfers_with(evm_config, block, main_db, open, follower_graft())
+    execute_transfers_with(evm_config, block, main_db, open, follower_graft(), follower_sender_groups())
+}
+
+/// Whether `N42_FOLLOWER_SENDER_GROUPS=1` is set: the follower groups a
+/// block's transfers by sender, as the builder does, instead of by connected
+/// component. A block of random transfers is ~200 components with a few
+/// giant ones (partition 35-43 ms, the largest group setting the wall time);
+/// by sender it is ~400 groups packed into 2 x workers batches. A transfer
+/// that only another sender's credit in the same block would fund is refused
+/// by its batch's view and sends the block to the serial path, as any
+/// refusal does -- correct, and rare outside adversarial blocks.
+pub fn follower_sender_groups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_SENDER_GROUPS").is_ok_and(|v| v == "1"))
 }
 
 /// Whether `N42_FOLLOWER_GRAFT=1` is set: the follower folds the groups'
@@ -623,6 +644,7 @@ pub fn execute_transfers_with<EvmConfig, DB, G>(
     main_db: DB,
     open: &(dyn Fn() -> Option<G> + Sync),
     graft: bool,
+    sender_groups: bool,
 ) -> Result<Result<(BlockExecutionOutput<Receipt>, Phases), NotParallel>, BlockExecutionError>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory>,
@@ -640,28 +662,51 @@ where
     let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
     // Address-keyed with the fixed-bytes hasher: the default hasher was
     // ~29 ms of a 163,000-transfer block's partition.
-    let (groups, _parties) = match partition(&txs, beneficiary) {
-        Ok(p) => p,
-        Err(why) => return Ok(Err(why)),
+    let groups: Vec<Vec<usize>> = if sender_groups {
+        let mut keys: Vec<(Address, Address)> = Vec::with_capacity(txs.len());
+        for (i, tx) in txs.iter().enumerate() {
+            let alloy_primitives::TxKind::Call(to) = tx.kind else { return Ok(Err(NotParallel::NotATransfer(i))) };
+            if !tx.data.is_empty() {
+                return Ok(Err(NotParallel::NotATransfer(i)));
+            }
+            keys.push((tx.caller, to));
+        }
+        match partition_by_sender(&keys, beneficiary) {
+            Ok(groups) => groups,
+            Err(why) => return Ok(Err(why)),
+        }
+    } else {
+        match partition(&txs, beneficiary) {
+            Ok((groups, _)) => groups,
+            Err(why) => return Ok(Err(why)),
+        }
     };
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.groups = groups.len();
+    // By sender the groups are many and small: packed into batches like the
+    // builder's. By component each group is its own batch.
+    let batches: Vec<Vec<&Vec<usize>>> = if sender_groups {
+        batch_groups(&groups, txs.len(), rayon::current_num_threads())
+    } else {
+        groups.iter().map(|g| vec![g]).collect()
+    };
+    phases.batches = batches.len();
 
-    // The groups, on the worker pool. Each yields its bundle (the accounts
+    // The batches, on the worker pool. Each yields its bundle (the accounts
     // it changed, with their originals) and the gas each transaction used.
     let at = std::time::Instant::now();
     let results: Vec<Result<(revm::database::BundleState, Vec<(usize, u64)>), NotParallel>> = {
         use rayon::prelude::*;
-        groups
+        batches
             .par_iter()
             .map(|members| {
                 let db = open().ok_or(NotParallel::NoState)?;
                 let mut state = State::builder().with_database(db).with_bundle_update().build();
-                let mut gas = Vec::with_capacity(members.len());
+                let mut gas = Vec::with_capacity(members.iter().map(|g| g.len()).sum());
                 {
                     let mut evm =
                         N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
-                    for &i in members {
+                    for &i in members.iter().flat_map(|g| g.iter()) {
                         match evm.transfer(&txs[i]) {
                             Ok(Some(out)) => {
                                 gas.push((i, out.result.gas_used()));
@@ -835,19 +880,29 @@ mod tests {
 
     #[test]
     fn parallel_matches_serial() {
-        parallel_matches_serial_with(false);
+        parallel_matches_serial_with(false, false);
     }
 
     #[test]
     fn parallel_matches_serial_with_the_graft() {
-        parallel_matches_serial_with(true);
+        parallel_matches_serial_with(true, false);
     }
 
-    fn parallel_matches_serial_with(graft: bool) {
+    #[test]
+    fn parallel_matches_serial_by_sender_with_the_graft() {
+        parallel_matches_serial_with(true, true);
+    }
+
+    #[test]
+    fn parallel_matches_serial_by_sender_with_the_fold() {
+        parallel_matches_serial_with(false, true);
+    }
+
+    fn parallel_matches_serial_with(graft: bool, sender_groups: bool) {
         let (block, db) = fixture(8, 6);
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
-        let (parallel, phases) = execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft)
+        let (parallel, phases) = execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft, sender_groups)
             .expect("no execution error")
             .expect("the block qualifies");
         assert!(phases.groups >= 1);
