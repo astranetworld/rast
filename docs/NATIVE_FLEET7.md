@@ -798,6 +798,44 @@ been busy for hours. `F7_HUGEPREP` is now the **pool target** (default 40 GB;
 healthy a round costs 2 s. 42 GB is this box's ceiling while the tmpfs holds
 21 GB.
 
+**loop99 (22:01-22:29): the import cuts on the fleet, and the ceiling moves to
+the pacing.** S = the loop95 binary (`target/profiling`), B = `target/release`
+with the sharded twig index, the bitmap retirements, the chunked undo entries,
+the conversion's and the sender lookups' in-place collects and the single-fold
+hashed state; R = B with `RAYON_NUM_THREADS=32` (the box has 256 logical CPUs
+and the node sizes its global pool to them). Six legs, dropcache and hugeprep
+before each, pool 50-57 GB at every start.
+
+    leg  win1     cycle    total    barrier  import  exec  root  hashed  convert
+    S1   230,408  0.698 s  17.02M   556 ms   506     192   98    44      54
+    S2   246,681  0.653 s  16.87M   577      506     201   95    42      55
+    B1   244,491  0.652 s  17.28M   480      438     181   63    26      48
+    B2   244,466  0.667 s  17.28M   475      429     180   65    26      48
+    R1   249,914  0.652 s  17.44M   492      446     192   65    26      50
+    R2   250,257  0.638 s  16.83M   474      432     185   63    26      49
+
+The import is the cleanest number the fleet produces (n = 110-123 full blocks
+a leg): **506 ms on both old legs, 429-446 on the four new ones** -- the root
+96 -> 64, the hashed state 43 -> 26, the conversion 54 -> 48, exactly what the
+offline benches said. The barrier follows: 556/577 -> 474-492. Window 1 does
+not: S reads 230k and 247k, B 244.5k twice, R 250k twice. Averaged, B is +2.5%
+over S and R +4.8%, and the round totals say +2.0% and +1.2%.
+
+The reason a 76 ms barrier cut buys 2-5% is in the cycle column: **four of the
+six legs read 0.652-0.667 s whatever the barrier was**, and a 30 s window at
+0.652 s is 46 blocks. The pacing is 450 ms and the parts that do not overlap
+it (publish -> received 30, vote -> decide 20, decide -> published 80, plus
+the leader's own build) are ~200: the cycle is floored at ~0.65 s and the
+barrier, now 475-490, no longer touches it. **The import stopped being the
+pole somewhere between loop98 and here.**
+
+Adopted: the cuts (already in `main`'s path, no knob) and
+`RAYON_NUM_THREADS=32` in the record environment -- the two highest legs of
+the round, and every parallel phase reads 1.5-2x faster at 32 threads offline.
+Next: loop101 sweeps the pacing (450 / 400 / 350, bookended, with the
+stragglers' grace) now that the import is 70 ms faster than when 300 ms
+pacing made every tenure handover stall.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
