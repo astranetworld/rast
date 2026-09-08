@@ -201,7 +201,9 @@ fi
 : "${F7_TX_GAS:=21000}"
 : "${F7_PRECREATE:=0}"
 # The interval is a measurement parameter here, not a property of the chain.
-export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-1000}
+# 450 ms since round 43 (2026-09-08): at 300 the leader outran a 410-470 ms follower
+# import and every tenure handover stalled; 450 read the same window 1 and no stall.
+export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-450}
 # The chain's own baseTimeout unless a round overrides it, and NOT a multiple of
 # the pacing.
 #
@@ -410,6 +412,12 @@ FLOOD=${FLOODS[0]}
 
 for ((w = 1; w <= WINDOWS; w++)); do
   "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w"
+  # The block's shape after the first window: senders, distinct recipients,
+  # run lengths. The flood paid 13,000 recipients a block for 42 rounds before
+  # this line existed (round 43).
+  if (( w == 1 )); then
+    python3 "$HERE/fleet7-shape.py" "$F7_HTTP_BASE" "shape" 2>&1 | tail -1
+  fi
   # A profile is pulled between windows, never inside one.
   if (( PROFILE_NODE >= 0 && w < WINDOWS )); then
     "$HERE/fleet7-profile.sh" "$PROFILE_NODE" "$OUT/profile-win$w" 2>&1 | tail -3
