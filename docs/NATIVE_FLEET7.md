@@ -487,6 +487,24 @@ cycle, 17.4-17.7M transactions a 90 s round without a stall**, with the
 parallel builder, the grafted follower, the parallel state commit
 (default), the record environment and 450 ms pacing.
 
+**loop91 (2026-09-08 09:00): the follower grouped by sender is null.**
+`N42_FOLLOWER_SENDER_GROUPS=1` (7dbb2cc21) against connected components,
+450 ms pacing, S-B-S-B on a box just vacated by a 17-31 GB `datc` (every
+leg 20-25% slower than loop87's: majflt 10.6-10.9M a leg, the leader's
+parallel execution 140-151 ms against 48; read within the round only):
+
+    leg  grouping    win1     win2     win3     total    follower import (partition / groups / merge)
+    S3   by sender   168,274  152,099  157,498  14.34M   573 ms (27 / 99 / 75)
+    B3   components  179,260  157,524  162,952  15.00M   544 ms (47 / 79 / 72)
+    S4   by sender   179,136  157,517  157,511  14.83M
+    B4   components  179,141  157,530  162,924  15.00M
+
+The partition's 20 ms saving is paid back by the batches (99 against 79
+ms: 2 x workers batches of ~2,000 transfers on a contended pool instead of
+~200 components), and the totals favour components by 1-4%. Off, and
+staying off; the follower's execution phase wants a different cut (the
+graft's 72-75 ms and the groups' wall time, not the partition).
+
 What would actually remove the storm is less to reclaim: the tmpfs
 (27-34 GB of other drivers' leftovers under /tmp), the seven heaps'
 huge-page appetite (a 4 KB heap on the followers only, keeping the
