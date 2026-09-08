@@ -246,27 +246,42 @@ where
     let root_at = std::time::Instant::now();
     stage.at(6);
     let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
-    if parallel_state_commit() {
-        // The leaf operations keyed, encoded and sorted on the worker pool,
-        // straight from the bundle (the change set and its serial
-        // `operations()` were 75 ms of this phase at 147,000 accounts).
-        let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague);
-        qmdb.validate_block_operations(parent_hash, block_hash, number, ops, recovered.state_root)
-            .map_err(|err| format!("state root: {err}"))?;
+    // The QMDB root and the hashed post-state read the same bundle and neither
+    // needs the other's result, but they ran one after the other: 63 and 26 ms
+    // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_SERIAL=1` puts
+    // them back in series.
+    let bundle = &output.state;
+    let root_job = || -> Result<B256, String> {
+        if parallel_state_commit() {
+            // The leaf operations keyed, encoded and sorted on the worker pool,
+            // straight from the bundle (the change set and its serial
+            // `operations()` were 75 ms of this phase at 147,000 accounts).
+            let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle, prague);
+            qmdb.validate_block_operations(parent_hash, block_hash, number, ops, recovered.state_root)
+                .map_err(|err| format!("state root: {err}"))
+        } else {
+            let changes = n42_qmdb_reth::changes_from_execution(bundle, prague);
+            qmdb.validate_block(parent_hash, block_hash, number, &changes, recovered.state_root)
+                .map_err(|err| format!("state root: {err}"))
+        }
+    };
+    // The provider is `Send` but not `Sync`, so the hashed job takes it by
+    // value; both jobs borrow the bundle, which is plain data.
+    let hashed_job = move || state.hashed_post_state(bundle).map_err(|err| format!("hashed state: {err}"));
+    let (root_ms, hashed_ms, hashed_state) = if root_hashed_serial() {
+        root_job()?;
+        let root_ms = root_at.elapsed().as_millis() as u64;
+        let hashed_at = std::time::Instant::now();
+        stage.at(7);
+        let hashed_state = hashed_job()?;
+        (root_ms, hashed_at.elapsed().as_millis() as u64, hashed_state)
     } else {
-        let changes = n42_qmdb_reth::changes_from_execution(&output.state, prague);
-        qmdb.validate_block(parent_hash, block_hash, number, &changes, recovered.state_root)
-            .map_err(|err| format!("state root: {err}"))?;
-    }
-    let root_ms = root_at.elapsed().as_millis() as u64;
-
-    let hashed_at = std::time::Instant::now();
-    stage.at(7);
-    // The provider hashes a large bundle over rayon chunks itself now
-    // (`hashed_post_state_from_bundle`); one implementation for the builder's
-    // `finish` and this import.
-    let hashed_state = state.hashed_post_state(&output.state).map_err(|err| format!("hashed state: {err}"))?;
-    let hashed_ms = hashed_at.elapsed().as_millis() as u64;
+        stage.at(7);
+        let (root, hashed) = rayon::join(root_job, hashed_job);
+        root?;
+        let both = root_at.elapsed().as_millis() as u64;
+        (both, 0, hashed?)
+    };
 
     Ok((
         Box::new(BuiltPayloadExecutedBlock {
@@ -277,6 +292,15 @@ where
         }),
         [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits, state_ms],
     ))
+}
+
+/// Whether the QMDB root and the hashed post-state run one after the other
+/// (`N42_ROOT_HASHED_SERIAL=1`) instead of together on the worker pool. They
+/// read the same bundle and neither needs the other; in parallel the phase is
+/// reported as `root_ms` with `hashed_ms` zero.
+fn root_hashed_serial() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_SERIAL").is_ok_and(|v| v == "1"))
 }
 
 /// `N42_FOLLOWER_PARALLEL`, read once.
