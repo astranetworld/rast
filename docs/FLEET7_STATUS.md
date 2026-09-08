@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-08 15:45)
+# Fleet7 status (living note; last updated 2026-09-08 22:35)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -22,10 +22,15 @@ shape a real chain would produce, and record what the ceiling is made of.
   lengths). `docs/BLOCK_SHAPE_SURVEY.md` places that shape against Ethereum
   (88k accounts per 163k transactions), BNB (46k), Polygon (11k) and Tron
   (173k): ours is conservative, close to Tron's.
-- **Throughput at that shape.** 239-253k TPS on window 1 at a 0.64-0.68 s
-  cycle; 17.1-18.2M transactions per round. Best round: loop98 S1, 252,518 /
+- **Throughput at that shape.** 244-253k TPS on window 1 at a 0.64-0.67 s
+  cycle; 16.8-18.2M transactions per round. Best round: loop98 S1, 252,518 /
   184,684 / 168,379 and 18.17M. The cycle is linear in accounts touched:
   0.40 s + 2.8 us per account (loop80 sweep).
+- **The import is no longer the pole** (loop99). With the round-43 cuts it is
+  429-446 ms (506 without them) and the barrier 474-492 (556-577), but four
+  legs in six read a 0.652-0.667 s cycle either way: at 450 ms pacing the
+  floor is the pacing plus the ~200 ms that does not overlap it. The next
+  gain is a tighter pacing, not a faster import -- loop101 sweeps it.
 - **Where the cycle goes.** `cycle ~= publish->recv 30 + import barrier 530 +
   vote->decide 20 + decide->publish 80 ms`. The barrier -- a validator's wait
   for its execution layer's answer -- is the pole. Inside it, at 163,000
@@ -94,9 +99,10 @@ shape a real chain would produce, and record what the ceiling is made of.
 | Own-block ledger (held until the height settles) | queue test | no loss after an uncommitted own block |
 | dropcache + hugeprep before every leg | pool 24 -> 80 GB | every leg 243-253k from any start; best total 18.17M |
 | `TxEnv`s on rayon, graft base swap, parallel revert sort | partition 41 -> 30, merge 75 -> 59 | **null** (barrier 535 -> 528) |
-| Sharded twig index, bitmap retirements, chunked undo entries | apply 52 -> 22-28 ms (15-18 at 32 threads) | loop99 |
-| Conversion's `Result<Vec>` collect off rayon's short-circuit path | 40 -> 26 ms | loop99 |
-| Follower sender lookups, same fix; hashed state folded once | -- | loop99 |
+| Sharded twig index, bitmap retirements, chunked undo entries | apply 52 -> 22-28 ms (15-18 at 32 threads) | import 506 -> 429-446 ms, barrier -85 ms; win1 +2.5%, total +2.0% |
+| Conversion's `Result<Vec>` collect off rayon's short-circuit path | 40 -> 26 ms | (the same legs) |
+| Follower sender lookups, same fix; hashed state folded once | hashed 43 -> 26 ms on the fleet | (the same legs) |
+| `RAYON_NUM_THREADS=32` (the box has 256 logical CPUs) | every parallel phase 1.5-2x | 250k twice, the round's two best legs; adopted |
 
 Null knobs, measured and left off: follower sender grouping, Ed25519 batch
 width, 32-thread build pool, builder graft without cache inserts, MDBX
@@ -109,12 +115,16 @@ pinning. Never `dirty_decay_ms:-1` on this box (OOM-killed an execution layer).
 `N42_PARALLEL_STATE_COMMIT` (on by default), `F7_BLOCK_INTERVAL_MS=450` and
 `F7_STRAGGLER_GRACE_MS=600` (bench defaults), `MALLOC_CONF=thp:always`,
 `N42_TX_INGEST_RECOVER_PARALLEL=20`, `N42_TX_QUEUE_RUN=64`,
-`TOKIO_WORKER_THREADS=8`, `F7_FLOOD_ALG=ed25519`,
+`TOKIO_WORKER_THREADS=8`, `RAYON_NUM_THREADS=32`, `F7_FLOOD_ALG=ed25519`,
 `N42_ALTSIG_SENDER_CACHE=4194304`, `N42_ED25519_BATCH=128`, `--pertx 10000`.
 
 ## In flight
 
-**loop99** (launcher `~/.claude/jobs/2127e0ae/tmp/run-loop99.sh`, waiting at
+**loop100** (running): the fast answer, F-B-F-B. **loop101** (queued): the
+pacing sweep P450/P400/P350 with the grace, now that the import is 70 ms
+faster than when 300 ms pacing made every tenure handover stall.
+
+**loop99** (done, see the cut table) (launcher `~/.claude/jobs/2127e0ae/tmp/run-loop99.sh`, waiting at
 its gate for eight foreign `txflood-r34` processes from another session to
 exit): the S-B-R bookend of the import cuts in b83371904 -- S = the loop95
 binary (`target/profiling`, HEAD 42f1cc5eb), B = `target/release` built by the
