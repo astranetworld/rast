@@ -48,8 +48,14 @@ impl ConsensusEngine {
             {
                 let view_set = self.validator_set_for_view(vote.view);
                 if let Ok(pk) = view_set.get_public_key(vote.voter) {
-                    let msg = self.signing_profile.vote_message(vote.view, vote.block_hash);
-                    if self.signing_profile.verify_single(pk, &msg, &vote.signature) {
+                    // A real vote that was merely slow, or a progress vote
+                    // (see `progress_vote_message`): either says the voter has
+                    // imported the block.
+                    let late = self.signing_profile.vote_message(vote.view, vote.block_hash);
+                    let progress = self.signing_profile.progress_vote_message(vote.view, vote.block_hash);
+                    if self.signing_profile.verify_single(pk, &progress, &vote.signature)
+                        || self.signing_profile.verify_single(pk, &late, &vote.signature)
+                    {
                         self.note_voter(vote.view, vote.voter);
                     }
                 }

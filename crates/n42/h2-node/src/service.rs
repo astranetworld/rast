@@ -748,6 +748,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// passed since v was decided. Local policy: the protocol is untouched.
     pub fn with_straggler_grace(mut self, grace: Duration) -> Self {
         self.straggler_grace = (!grace.is_zero()).then_some(grace);
+        // The followers' side of it: a block imported after its view passed
+        // still tells that view's leader (a progress vote, not a vote).
+        self.engine.set_progress_votes(self.straggler_grace.is_some());
         self
     }
 

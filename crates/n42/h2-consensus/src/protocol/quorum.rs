@@ -59,6 +59,17 @@ impl ConsensusSigningProfile {
         }
     }
 
+    /// The message a *progress vote* signs: a follower that imported a block
+    /// after its view had passed tells that view's leader so, in a `Vote`
+    /// whose signature is over this message and not the vote's. It can never
+    /// count towards a QC (no verifier accepts it as a vote) and is only read
+    /// by the leader's `voters_seen` ledger; see the stragglers' grace.
+    pub fn progress_vote_message(self, view: ViewNumber, block_hash: B256) -> Vec<u8> {
+        let mut message = self.vote_message(view, block_hash);
+        message.extend_from_slice(b"/n42/imported-late");
+        message
+    }
+
     pub fn commit_message(self, view: ViewNumber, block_hash: B256, changes_hash: B256) -> Vec<u8> {
         match self {
             Self::Native => commit_signing_message(view, &block_hash, &changes_hash).to_vec(),

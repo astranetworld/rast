@@ -316,6 +316,14 @@ pub struct ConsensusEngine {
     /// quorum are keeping up (see `voters_seen`); nothing in the protocol's
     /// safety depends on it.
     pub(super) voters_seen: HashMap<ViewNumber, HashSet<u32>>,
+    /// Proposals this node received but had not imported when their view
+    /// passed, so never voted for. When the import completes a *progress
+    /// vote* goes to that view's leader (see `progress_vote_message`), if
+    /// `progress_votes` is on. Bounded to the last few views.
+    pub(super) withheld_votes: VecDeque<PendingProposal>,
+    /// Whether to send progress votes; set by a node running the stragglers'
+    /// grace, off otherwise (a gov5 peer would only log the failed signature).
+    pub(super) progress_votes: bool,
     /// Per-view timing for commit latency diagnosis.
     pub(super) view_timing: ViewTiming,
     /// Timing from the last committed view (preserved across advance_to_view).
@@ -414,6 +422,8 @@ impl ConsensusEngine {
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
+            withheld_votes: VecDeque::new(),
+            progress_votes: false,
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
@@ -524,6 +534,8 @@ impl ConsensusEngine {
             proposal_equivocation_tracker: HashMap::new(),
             future_msg_buffer: Vec::new(),
             voters_seen: HashMap::new(),
+            withheld_votes: VecDeque::new(),
+            progress_votes: false,
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
             pending_tx_roots: BoundedFifoMap::new(64),
@@ -846,6 +858,11 @@ impl ConsensusEngine {
     /// not lead or that has left the window.
     pub fn voters_seen(&self, view: ViewNumber) -> usize {
         self.voters_seen.get(&view).map_or(0, HashSet::len)
+    }
+
+    /// Turns progress votes on or off; see `withheld_votes`.
+    pub fn set_progress_votes(&mut self, on: bool) {
+        self.progress_votes = on;
     }
 
     /// Records a verified Round 1 vote in `voters_seen`, keeping the last
@@ -1301,7 +1318,16 @@ impl ConsensusEngine {
             *view > new_view && *view <= new_view.saturating_add(FUTURE_VIEW_WINDOW)
         });
         self.prepare_qc = None;
-        self.pending_proposal = None;
+        // A proposal this node has not voted for because its block was still
+        // importing: remembered, so the import can still tell the leader.
+        if let Some(pending) = self.pending_proposal.take() {
+            if self.progress_votes && self.round_state.last_voted_view() < pending.view {
+                if self.withheld_votes.len() >= VOTERS_SEEN_WINDOW {
+                    self.withheld_votes.pop_front();
+                }
+                self.withheld_votes.push_back(pending);
+            }
+        }
         // Gov5 keeps successful import evidence across view changes: a new
         // leader commonly reproposes the same uncommitted block, and reth will
         // not emit a second import completion for it. Native optimistic voting

@@ -629,6 +629,29 @@ impl ConsensusEngine {
             }
             tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "import-gated vote: execution validated, sending vote");
             self.send_vote(view, block_hash)?;
+            return Ok(());
+        }
+        // A block whose view has passed unvoted: a progress vote to that
+        // view's leader, so its stragglers' grace can end (see
+        // `withheld_votes`). Not a vote -- signed over another message -- and
+        // nothing is recorded in the vote log.
+        if let Some(at) = self.withheld_votes.iter().position(|w| w.block_hash == block_hash) {
+            let withheld = self.withheld_votes.remove(at).expect("position just found");
+            if self.is_local_validator_active_for_view(withheld.view) {
+                let leader = self.leader_index_for_view(withheld.view);
+                let message = self.signing_profile.progress_vote_message(withheld.view, block_hash);
+                let signature = self.signing_profile.sign(&self.secret_key, &message);
+                tracing::debug!(target: "n42::cl::proposal", view = withheld.view, %block_hash, target_leader = leader, "imported after the view passed: progress vote to its leader");
+                self.emit(EngineOutput::SendToValidator(
+                    leader,
+                    ConsensusMessage::Vote(n42_h2_primitives::consensus::Vote {
+                        view: withheld.view,
+                        block_hash,
+                        voter: self.my_index,
+                        signature,
+                    }),
+                ))?;
+            }
         }
         Ok(())
     }
