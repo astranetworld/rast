@@ -247,9 +247,9 @@ where
     stage.at(6);
     let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
     // The QMDB root and the hashed post-state read the same bundle and neither
-    // needs the other's result, but they ran one after the other: 63 and 26 ms
-    // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_SERIAL=1` puts
-    // them back in series.
+    // needs the other's result, but they run one after the other: 63 and 26 ms
+    // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_PARALLEL=1` puts
+    // them on the worker pool together.
     let bundle = &output.state;
     let root_job = || -> Result<B256, String> {
         if parallel_state_commit() {
@@ -268,7 +268,7 @@ where
     // The provider is `Send` but not `Sync`, so the hashed job takes it by
     // value; both jobs borrow the bundle, which is plain data.
     let hashed_job = move || state.hashed_post_state(bundle).map_err(|err| format!("hashed state: {err}"));
-    let (root_ms, hashed_ms, hashed_state) = if root_hashed_serial() {
+    let (root_ms, hashed_ms, hashed_state) = if !root_hashed_parallel() {
         root_job()?;
         let root_ms = root_at.elapsed().as_millis() as u64;
         let hashed_at = std::time::Instant::now();
@@ -294,13 +294,13 @@ where
     ))
 }
 
-/// Whether the QMDB root and the hashed post-state run one after the other
-/// (`N42_ROOT_HASHED_SERIAL=1`) instead of together on the worker pool. They
-/// read the same bundle and neither needs the other; in parallel the phase is
-/// reported as `root_ms` with `hashed_ms` zero.
-fn root_hashed_serial() -> bool {
+/// Whether the QMDB root and the hashed post-state run together on the worker
+/// pool (`N42_ROOT_HASHED_PARALLEL=1`) instead of one after the other. They
+/// read the same bundle and neither needs the other; in parallel the pair is
+/// reported as `root_ms` with `hashed_ms` zero. Off until loop102 measures it.
+fn root_hashed_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_SERIAL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_PARALLEL").is_ok_and(|v| v == "1"))
 }
 
 /// `N42_FOLLOWER_PARALLEL`, read once.
