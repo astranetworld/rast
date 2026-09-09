@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-09 04:30 EDT)
+# Fleet7 status (living note; last updated 2026-09-09 04:50 EDT)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -162,8 +162,39 @@ senders, hashed state; ~60 ms of a 470 ms import) move the barrier, and
 whether the node's rayon pool should be sized to 32 rather than the box's 256
 logical CPUs (every parallel phase ran 1.5-2x faster at 32 offline).
 
+## What the chain costs (loop105, the number that now governs everything)
+
+`cycle = 4.0 us per transaction`, with no fixed part: doubling the gas ceiling
+doubled the cycle exactly, so 250k TPS is 1/4 us and no arrangement of blocks,
+pacing or consensus timing changes it. Per transfer, at 163,000 transfers and
+147,000 accounts a block:
+
+| where | us per transfer |
+| --- | --- |
+| the follower's import | 2.80 |
+| &nbsp;&nbsp;execution: the EVM itself | 0.43 |
+| &nbsp;&nbsp;execution: the merge (graft) | 0.42 |
+| &nbsp;&nbsp;execution: the partition | 0.18 |
+| &nbsp;&nbsp;QMDB root | 0.43 |
+| &nbsp;&nbsp;payload conversion | 0.29 |
+| &nbsp;&nbsp;senders | 0.21 |
+| &nbsp;&nbsp;hashed post-state | 0.16 |
+| &nbsp;&nbsp;carry cache | 0.15 |
+| &nbsp;&nbsp;header, checks, parent state, dispatch | ~0.35 |
+| publish, vote, decide, the engine | ~1.20 |
+
+**The EVM is under 11% of the chain.** Everything else is the same 147,000
+accounts moved through a hash map (the graft), grouped (the partition), turned
+into trie leaves (the root), hashed again (the hashed state), copied for the
+next block (the carry) and decoded twice (the conversion). A change that does
+not remove one of those passes cannot matter, and one that removes a whole
+pass is worth ~0.2-0.4 us, or 5-10%.
+
 ## Next
 
+0. **Stop cutting milliseconds.** Three rounds spent 17, 53 and 53 ms against
+   a 150 ms resolution and all read null. The next change must remove a whole
+   pass over the block's accounts, or it is not worth a round.
 1. **Read loop99.** If the barrier moves, the import is worth more cuts; if
    not, the barrier is not the import's own latency and the next thing to
    instrument is what the validator does between the answer and its vote.
