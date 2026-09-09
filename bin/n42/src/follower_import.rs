@@ -265,7 +265,22 @@ where
     };
     // The provider is `Send` but not `Sync`, so the hashed job takes it by
     // value; both jobs borrow the bundle, which is plain data.
-    let hashed_job = move || state.hashed_post_state(bundle).map_err(|err| format!("hashed state: {err}"));
+    //
+    // `N42_HASHED_STATE=0` skips the pass entirely. It exists for reth's
+    // Merkle-Patricia trie -- `MemoryOverlayStateProvider::trie_input` feeds
+    // it to `state_root`, `proof`, `multiproof` and `witness`, and
+    // `save_blocks` writes it to `HashedAccounts`/`HashedStorages` -- and this
+    // chain's state root and proofs come from QMDB instead, so on the paths
+    // the node actually runs nothing reads it. Ordinary account and storage
+    // reads do not: the overlay answers those from the bundle. It costs 26 ms
+    // of every import and holds ~15 MB a block until the block is persisted.
+    let hashed_job = move || {
+        if hashed_state_enabled() {
+            state.hashed_post_state(bundle).map_err(|err| format!("hashed state: {err}"))
+        } else {
+            Ok(reth_trie::HashedPostState::default())
+        }
+    };
     let (root_ms, hashed_ms, hashed_state) = if !root_hashed_parallel() {
         root_job()?;
         let root_ms = root_at.elapsed().as_millis() as u64;
@@ -322,6 +337,16 @@ fn fill_carry(
         }
     }
     *carry.lock().unwrap_or_else(|p| p.into_inner()) = Some((block_hash, std::mem::take(cached)));
+}
+
+/// Whether the follower computes the Merkle-Patricia hashed post-state
+/// (default; `N42_HASHED_STATE=0` skips it). See the comment at the call site:
+/// on this chain the state root and the proofs come from QMDB, and the only
+/// readers of the hashed state are reth's trie methods, two debug RPCs and the
+/// `HashedAccounts`/`HashedStorages` tables that persistence fills.
+fn hashed_state_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_HASHED_STATE").map_or(true, |v| v != "0"))
 }
 
 /// Whether the carry is filled on the worker pool after the import returns
