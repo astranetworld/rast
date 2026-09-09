@@ -979,6 +979,40 @@ header 4, checks 4, and ~15 of dispatch. The carry is 25 ms rather than the
 answer; loop104 measures it together with the join and the queue offload,
 ~50 ms in all.
 
+**loop104 (04:05-04:24 EDT): 53 ms off the import, and the fleet still cannot
+see it.** A legs ran `N42_CARRY_ASYNC=1 N42_ROOT_HASHED_PARALLEL=1
+N42_QUEUE_WORK_OFFLOAD=1` together, B legs none of them.
+
+    leg  cuts  win1     win2     win3     total    pool   import  exec  root  hashed  carry
+    A1   on    249,860  179,239  152,090  17.44M   41 GB  403     207   67    0       0
+    B1   off   247,842  184,604  168,341  18.03M   41 GB  456     197   71    26      24
+    A2   on    248,906  190,086  173,806  18.39M   42 GB
+    B2   off   248,907  184,599  168,356  18.06M   39 GB
+
+The import falls **456 -> 403 ms**, exactly the ~50 the three cuts promised
+(carry 24 and hashed 26 leave the path, the queue's 12 with them, against
++10 on execution where the asynchronous carry now competes for the same
+worker pool). Window 1 is a tie: 247.8-249.9k, all 46 blocks.
+
+**A2's 18,388,500 is the campaign's best round** (windows 248,906 / 190,086 /
+173,806, the second window a record too, at 144,121 distinct recipients), but
+A1 read 17.44M, and the two B legs read 18.03M and 18.06M with their later
+windows agreeing to three figures. The cuts do not raise the round; they
+widen it. The likely reason is visible in A1: the asynchronous carry runs on
+the same pool as the next block's execution and the ingest, so what it saves
+on one block it can cost on another.
+
+So three rounds have now spent 17, 53 and 53 ms against a measurement whose
+resolution is 150 ms, and the answer each time was "the fleet cannot see it".
+All three knobs stay opt-in. **The next gain has to come from somewhere
+else**: either ~150 ms out of the execution phase itself (185-207 ms:
+partition 30, groups 60, graft 59), or from the block, which is where
+loop105 goes -- every block is full at the gas ceiling, so a doubled ceiling
+amortises the ~150 ms of consensus overhead over twice the transactions.
+Expect windows 2 and 3 to fall there: they are supply-bound already (the
+flood sends ~188k/s where 46 full blocks a window consume ~250k/s, and the
+pool's backlog is what carries window 1).
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
