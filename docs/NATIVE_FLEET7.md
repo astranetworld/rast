@@ -1103,6 +1103,44 @@ The round is also the clearest argument this campaign has produced for
 running the experiment rather than trusting the reading: the code review was
 careful, specific and wrong, and the fleet said so in four minutes.
 
+**loop107 (06:32-06:50 EDT): the import is contended, but the builder is not
+the thief.** The same work is 1.3-2x slower on the fleet than on an idle box
+(conversion 48 ms against 26, execution 197 against 145, QMDB root 70 against
+44), so the import looked CPU-starved. T legs shrank the builder's own pool
+from 16 threads to 4; B legs left it.
+
+    leg  builder pool  win1     blocks  total    pool at start
+    T1   4             228,526  43      15.82M   34 GB
+    B1   16            249,846  46      17.28M   39 GB
+    T2   4             235,725  44      15.71M   35 GB
+    B2   16            244,488  45      15.65M   39 GB
+
+The import did get faster with the builder quieter -- 445 -> 410 ms, execution
+192 -> 177, root 67 -> 57 -- **so the contention is real**. But window 1 fell
+6% and block production with it (43-44 blocks against 45-46): the leader's
+block arrives late, and three blocks cost more than 35 ms of import buys. The
+builder keeps its threads.
+
+The hypothesis behind the round was also wrong in a way worth recording: it
+assumed six nodes in seven were pre-building a full block they would discard.
+They are not -- building is already gated on leading. One leg's seven nodes
+made 161 builds for ~140 blocks, about one builder per block.
+
+Where the contention actually comes from is arithmetic: **seven nodes share
+256 cores.** At `RAYON_NUM_THREADS=32` the fleet asks for 224 rayon threads +
+56 tokio + 140 ingest recovery slots + 64 flood workers = 484 runnable threads
+on 256 cores, and rayon's default is one thread per core *per process* --
+1,792 rayon threads across the fleet. That is the whole of the offline-versus-
+fleet gap, and it means **the 4.0 us per transaction is a seven-nodes-on-one-
+box number**: a deployment with a node per machine would run each import at
+something near the offline figures (~300 ms rather than 445), which is ~325k
+rather than 250k at this shape.
+
+It also exposed a gap in our own practice: `RAYON_NUM_THREADS=32` was written
+into the record environment after loop99, where its two legs were that round's
+best, **but no launcher since has set it** -- loop100 through loop107 all ran
+at rayon's default. loop108 sweeps 32, 16 and the default.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
