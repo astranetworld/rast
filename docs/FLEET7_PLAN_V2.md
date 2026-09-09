@@ -203,6 +203,15 @@ Plain-state storage mode (section 1.5), the QMDB root (54-107 ms) and the
 remaining passes, in whichever chain is longer at the time. Nothing here
 before phases A and B have crossed the chains.
 
+## 3a. Status
+
+- **A1/A2 built** (2026-09-09 afternoon, `N42_BUILD_ON_SEAL=1`): the
+  validator asks for the next build the moment it seals a block; the
+  execution layer builds it directly on the sealed parent's own post-state
+  (`crates/n42/engine-types/src/direct_build.rs`, `payload_serve.rs`
+  `BUILD_ON_OWN`, `driver.rs` `prepare_build_on_sealed`). Falls back to the
+  forkchoice path when refused. Round: `run-loop110.sh`, not yet run.
+
 ## 4. Rounds, in order
 
 1. **Zero code:** `N42_PARALLEL_BUILD_THREADS=32` under `RAYON_NUM_THREADS=16`

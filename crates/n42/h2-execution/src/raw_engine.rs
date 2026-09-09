@@ -20,8 +20,8 @@ use alloy_eips::eip7685::{Requests, RequestsOrHash};
 use alloy_primitives::{Address, Bloom, Bytes, B256, B64, U256};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
-    ExecutionPayloadV2, ExecutionPayloadV3, ExecutionPayloadV4, PayloadStatus, PayloadStatusEnum,
-    PraguePayloadFields,
+    ExecutionPayloadV2, ExecutionPayloadV3, ExecutionPayloadV4, PayloadAttributes, PayloadStatus,
+    PayloadStatusEnum, PraguePayloadFields,
 };
 
 const VERSION: u8 = 1;
@@ -39,6 +39,15 @@ pub mod request {
     /// The answer is an encoded [`super::PayloadStatus`], or an error
     /// (`unknown build`) telling the caller to send the whole payload.
     pub const OWN_BLOCK: u8 = 3;
+    /// `u32` length and an encoded build-on-own request follow (the RLP of a
+    /// *sealed header* this execution layer built and still keeps, and the
+    /// [`super::PayloadAttributes`] of the block to build on it): build the
+    /// next block on that build's own post-state now, without waiting for
+    /// the engine to import the parent or for a forkchoice to name it. The
+    /// answer is the built block in `GET_PAYLOAD`'s shape, or an error
+    /// (`unknown build`, `no direct builder`) telling the caller to start
+    /// the build the ordinary way.
+    pub const BUILD_ON_OWN: u8 = 4;
 }
 
 struct Writer(Vec<u8>);
@@ -238,6 +247,67 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     Ok(ExecutionData::new(payload, sidecar))
 }
 
+/// Encodes a build-on-own request: the sealed header of the block just built
+/// (RLP) and the attributes of the block to build on it.
+pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttributes) -> Vec<u8> {
+    let rlp = alloy_rlp::encode(header);
+    let mut w = Writer(Vec::with_capacity(rlp.len() + 128 + attrs.withdrawals.as_ref().map_or(0, |w| w.len() * 44)));
+    w.u8(VERSION);
+    w.bytes(&rlp);
+    w.u64(attrs.timestamp);
+    w.fixed(attrs.prev_randao.as_slice());
+    w.fixed(attrs.suggested_fee_recipient.as_slice());
+    match &attrs.withdrawals {
+        Some(withdrawals) => {
+            w.u8(1);
+            w.u32(withdrawals.len() as u32);
+            for wd in withdrawals {
+                w.u64(wd.index); w.u64(wd.validator_index); w.fixed(wd.address.as_slice()); w.u64(wd.amount);
+            }
+        }
+        None => w.u8(0),
+    }
+    match attrs.parent_beacon_block_root {
+        Some(root) => { w.u8(1); w.fixed(root.as_slice()); }
+        None => w.u8(0),
+    }
+    match attrs.slot_number {
+        Some(slot) => { w.u8(1); w.u64(slot); }
+        None => w.u8(0),
+    }
+    match attrs.target_gas_limit {
+        Some(limit) => { w.u8(1); w.u64(limit); }
+        None => w.u8(0),
+    }
+    w.0
+}
+
+/// Decodes what [`encode_build_on_own`] produced.
+pub fn decode_build_on_own(buf: &[u8]) -> Result<(alloy_consensus::Header, PayloadAttributes), String> {
+    use alloy_rlp::Decodable;
+    let mut r = Reader { rest: buf, shared: None };
+    if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
+    let rlp = r.bytes()?;
+    let header = alloy_consensus::Header::decode(&mut &rlp[..]).map_err(|e| format!("header: {e}"))?;
+    let timestamp = r.u64()?;
+    let prev_randao = r.b256()?;
+    let suggested_fee_recipient = Address::from_slice(r.take(20)?);
+    let withdrawals = if r.u8()? == 1 {
+        let n = r.u32()? as usize;
+        let mut list = Vec::with_capacity(n);
+        for _ in 0..n {
+            let index = r.u64()?; let validator_index = r.u64()?;
+            let address = Address::from_slice(r.take(20)?); let amount = r.u64()?;
+            list.push(Withdrawal { index, validator_index, address, amount });
+        }
+        Some(list)
+    } else { None };
+    let parent_beacon_block_root = if r.u8()? == 1 { Some(r.b256()?) } else { None };
+    let slot_number = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+    let target_gas_limit = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+    Ok((header, PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit }))
+}
+
 /// Encodes a [`PayloadStatus`] for the channel.
 pub fn encode_payload_status(status: &PayloadStatus) -> Vec<u8> {
     let mut w = Writer(Vec::with_capacity(80));
@@ -305,6 +375,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_on_own_round_trips_with_and_without_the_optional_fields() {
+        let header = alloy_consensus::Header { number: 41, gas_used: 3_423_000_000, extra_data: Bytes::from_static(&[9, 9]), ..Default::default() };
+        let full = PayloadAttributes {
+            timestamp: 1_700_000_000,
+            prev_randao: B256::repeat_byte(5),
+            suggested_fee_recipient: Address::repeat_byte(6),
+            withdrawals: Some(vec![Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(3), amount: 4 }]),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            slot_number: Some(42),
+            target_gas_limit: Some(3_600_000_000),
+        };
+        let bare = PayloadAttributes { withdrawals: None, parent_beacon_block_root: None, slot_number: None, target_gas_limit: None, ..full.clone() };
+        for attrs in [full, bare] {
+            let (h, a) = decode_build_on_own(&encode_build_on_own(&header, &attrs)).expect("decodes");
+            assert_eq!(h, header);
+            assert_eq!(a, attrs);
+        }
+    }
     #[test]
     fn payload_status_round_trips() {
         for status in [

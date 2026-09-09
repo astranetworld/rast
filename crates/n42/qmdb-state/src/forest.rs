@@ -313,7 +313,14 @@ impl QmdbForest {
         if from == to {
             return Ok(());
         }
-        let from_root = self.root_of(&from).ok_or(StateError::UnknownBlock(from))?;
+        let Some(from_root) = self.root_of(&from) else {
+            // Already renamed by an earlier caller -- the build-on-seal path
+            // files a build under its sealed hash before the import's hand-off
+            // gets to it, and both must succeed. A `from` that is gone while
+            // `to` is held is that case; a `from` that is gone with no `to`
+            // is a block this forest never had.
+            return if self.root_of(&to).is_some() { Ok(()) } else { Err(StateError::UnknownBlock(from)) };
+        };
         if let Some(existing) = self.root_of(&to) {
             // Already filed under the sealed hash -- by an earlier rename, or by
             // a validation that computed it -- with the same root: nothing to do.
@@ -763,6 +770,11 @@ mod tests {
         assert_eq!(linear.apply(h(0x0A), h(0xA2), 2, &changes(2)).unwrap(), root_next);
         // Renaming again onto a hash that already holds the same root is nothing.
         assert!(forest.rename(h(0xAB), h(0xAB)).is_ok());
+        // The same rename a second time -- the build-on-seal path files the
+        // build under its sealed hash before the import's hand-off does, and
+        // the hand-off's rename must find nothing wrong.
+        assert!(forest.rename(h(0x0A), h(0xAA)).is_ok());
+        assert_eq!(forest.root_of(&h(0xAA)), Some(root_built));
         // Renaming a hash that is not filed names it.
         assert!(matches!(forest.rename(h(0x77), h(0x78)), Err(StateError::UnknownBlock(_))));
     }

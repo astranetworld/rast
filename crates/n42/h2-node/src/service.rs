@@ -272,6 +272,11 @@ pub struct H2Service<E> {
     /// default: it is additive on the wire, but it is this node's own protocol
     /// and a fleet should be able to run without it.
     direct_push: bool,
+    /// Whether a leader starts its next build the moment it seals a block,
+    /// on that build's own post-state (`N42_BUILD_ON_SEAL`), instead of after
+    /// its execution layer has imported the block and answered a forkchoice
+    /// on it. Off by default until a round has read it.
+    build_on_seal: bool,
     body_requested_at: std::collections::HashMap<B256, std::time::Instant>,
     body_requested_order: std::collections::VecDeque<B256>,
     /// Height of the last block the execution layer is known to have
@@ -597,6 +602,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
             direct_push: false,
+            build_on_seal: std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"),
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
@@ -1635,7 +1641,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             preparing: true,
             head: parent,
             head_timestamp: self.block_timestamps.get(&parent).copied(),
-            head_header: Some(header),
+            head_header: Some(header.clone()),
             head_seen: self.block_seen.get(&parent).copied(),
         };
         // The builder declines while pacing; that is a "not yet", not a "no",
@@ -1644,8 +1650,13 @@ impl<E: ExecutionLayer> H2Service<E> {
             info!(target: "n42.h2.node", ?parent, next, "no build ahead: the attributes builder declined");
             return;
         };
-        info!(target: "n42.h2.node", ?parent, next, "build ahead requested");
-        if let Err(err) = self.driver.prepare_build_on(parent, attrs).await {
+        info!(target: "n42.h2.node", ?parent, next, on_seal = self.build_on_seal, "build ahead requested");
+        let started = if self.build_on_seal {
+            self.driver.prepare_build_on_sealed(parent, header, attrs).await
+        } else {
+            self.driver.prepare_build_on(parent, attrs).await
+        };
+        if let Err(err) = started {
             warn!(target: "n42.h2.node", %err, ?parent, "could not start a build ahead of leading");
         }
     }
@@ -1824,6 +1835,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // the tree.
                 self.flush_outbox(events);
                 self.driver.spawn_import_own_block(&built);
+                // Build-on-seal: the next build starts here, on this block's
+                // own post-state, while the import above is still in flight.
+                // Without it the build waits for the import's answer and a
+                // forkchoice on the block -- 62 + 72 ms of the leader's
+                // chain at the bench tier, with the leader then waiting for
+                // its own build on nearly every block (loop108). The import's
+                // completion asks again and finds this build prepared.
+                if self.build_on_seal {
+                    self.prepare_next_build(built.hash).await;
+                }
             }
             Err(err) => {
                 // The view will time out and move on; that is the correct

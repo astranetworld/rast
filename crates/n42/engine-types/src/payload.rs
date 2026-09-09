@@ -252,6 +252,7 @@ where
             },
             self.cons.clone(),
             self.qmdb.clone(),
+            None,
         );
         let outcome = if result.is_ok() { "ok" } else { "error" };
         metrics::histogram!(
@@ -305,9 +306,72 @@ where
             |attributes| self.pool.best_transactions_with_attributes(attributes),
             self.cons.clone(),
             self.qmdb.clone(),
+            None,
         )?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
+    }
+}
+
+// The raw payload channel's way in: a build on a block this node built and
+// consensus has just sealed, from that build's own post-state, with reth's
+// payload service out of the way. See `direct_build`.
+impl<Pool, Client, EvmConfig, Cons> crate::direct_build::DirectBuilder
+    for N42PayloadBuilder<Pool, Client, EvmConfig, Cons>
+where
+    EvmConfig: ConfigureEvm<
+            Primitives = EthPrimitives,
+            NextBlockEnvCtx = NextBlockEnvAttributes,
+            BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+            BlockExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<Client::ChainSpec>,
+        > + Send
+        + Sync
+        + 'static,
+    Client: StateProviderFactory
+        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + Send + Sync + 'static,
+    Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + Send + Sync + 'static,
+{
+    fn build_on_own(&self, request: crate::direct_build::BuildOnOwnRequest) -> Result<EthBuiltPayload, String> {
+        let crate::direct_build::BuildOnOwnRequest { parent, parent_execution, attributes } = request;
+        let parent_hash = parent.hash();
+        let executed = crate::direct_build::executed_under_seal(&parent, &parent_execution);
+        let opener = crate::direct_build::opener_on_built_parent(self.client.clone(), parent.parent_hash, executed);
+        // The reads the parent's build cached, filed under the builder's own
+        // hash: warm exactly where this block's senders are.
+        let cached_reads = self
+            .cons
+            .get_cached_reads(parent_execution.block.hash())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let payload_id = reth_payload_primitives::payload_id(&parent_hash, &attributes);
+        let config = PayloadConfig::new(Arc::new(parent), attributes, payload_id);
+        let args = BuildArguments::new(cached_reads, None, None, config, Default::default(), None);
+        let outcome = default_n42_payload(
+            self.evm_config.clone(),
+            self.client.clone(),
+            self.pool.clone(),
+            self.builder_config.clone(),
+            args,
+            |attributes| match n42_tx_queue::global::<Pool::Transaction>() {
+                Some(queue) => Box::new(queue.best_for_build(parent_hash)),
+                None => self.pool.best_transactions_with_attributes(attributes),
+            },
+            self.cons.clone(),
+            self.qmdb.clone(),
+            Some(opener),
+        )
+        .map_err(|err| err.to_string())?;
+        match outcome {
+            BuildOutcome::Better { payload, .. } | BuildOutcome::Freeze(payload) => Ok(payload),
+            BuildOutcome::Aborted { .. } => Err("the build was aborted".to_owned()),
+            BuildOutcome::Cancelled => Err("the build was cancelled".to_owned()),
+        }
     }
 }
 
@@ -349,6 +413,10 @@ pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     best_txs: F,
     cons: Cons,
     qmdb: Option<QmdbNodeState>,
+    // The parent's post-state, when it is not what the client finds by the
+    // parent's hash: a build on an own block the engine has not imported yet
+    // (`direct_build`). `None` reads the client's state at the parent.
+    parent_state: Option<crate::direct_build::ParentStateOpener>,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
     EvmConfig: ConfigureEvm<
@@ -383,7 +451,14 @@ where
         attributes,
     } = config;
 
-    let state_provider = client.state_by_block_hash(parent_header.hash())?;
+    let parent_hash_for_state = parent_header.hash();
+    let open_parent_state = || -> Result<reth_storage_api::StateProviderBox, reth_storage_api::errors::ProviderError> {
+        match &parent_state {
+            Some(open) => open(),
+            None => client.state_by_block_hash(parent_hash_for_state),
+        }
+    };
+    let state_provider = open_parent_state()?;
     let state = StateProviderDatabase::new(&state_provider);
     // The block access list, when the chain is past Amsterdam.
     //
@@ -636,8 +711,7 @@ where
                 let env = evm_config.tx_env(recovered.as_recovered_ref());
                 (recovered, env)
             };
-            let parent_hash = parent_header.hash();
-            let open = || client.state_by_block_hash(parent_hash).ok().map(StateProviderDatabase::new);
+            let open = || open_parent_state().ok().map(StateProviderDatabase::new);
             match crate::parallel_transfer::execute_for_build(&group_env, &keys, &convert, &open) {
                 Ok(run) => {
                     use reth_evm::execute::BlockExecutor as _;
@@ -789,11 +863,10 @@ where
                     wanted.dedup();
                     // The build's state provider is not shared across threads;
                     // each chunk opens its own on the same parent.
-                    let parent_hash = parent_header.hash();
                     let fetched: Vec<(alloy_primitives::Address, Option<Option<revm::state::AccountInfo>>)> = wanted
                         .par_chunks(256)
                         .flat_map_iter(|chunk| {
-                            let provider = client.state_by_block_hash(parent_hash).ok();
+                            let provider = open_parent_state().ok();
                             chunk.iter().map(move |address| {
                                 let info = provider.as_ref().and_then(|provider| {
                                     reth_storage_api::AccountReader::basic_account(provider, address).ok().map(|a| a.map(Into::into))
@@ -1272,6 +1345,9 @@ where
             consensus,
         )
         .with_qmdb(self.qmdb.clone());
+        // The raw payload channel builds on a sealed own block through this
+        // (`direct_build`), with the payload service out of the way.
+        crate::direct_build::register(Arc::new(payload_builder.clone()));
 
         let builder_conf = ctx.config().builder.clone();
 

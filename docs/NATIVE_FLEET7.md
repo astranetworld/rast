@@ -1181,6 +1181,45 @@ outside the code being optimised. Every round since loop95 measured the
 followers' import and cut it; the leader's build was the cycle the whole
 time, and the follower cuts landed in its slack.
 
+**Plan v2, phase A1/A2 built (2026-09-09 afternoon): build-on-seal.** The
+leader's next build now starts the moment it seals a block, on the builder's
+own post-state, instead of after its execution layer has imported the block
+(62 ms round trip) and answered a forkchoice on it (72 ms) and reth's payload
+service has wrapped the builder (~35 ms). `N42_BUILD_ON_SEAL=1` on the
+validators turns it on; off, nothing changes.
+
+How it works, end to end. The validator, right after it publishes a body and
+starts the header-only import, asks for the next build through the driver's
+`prepare_build_on_sealed`, which sends the raw channel a new request
+(`BUILD_ON_OWN`: the sealed header's RLP and the next block's attributes).
+The execution layer finds the parent in the build registry by the header's
+parent, number, roots and gas -- without taking it out; the import that
+follows takes it -- and does first what the import's hand-off would otherwise
+have done before the next build could start: the queue forgets the parent's
+mined transactions (or the build selects them again) and holds them until the
+chain settles the height, and the QMDB tree moves to the sealed hash
+(`QmdbForest::rename` now tolerates being asked twice, since the hand-off
+asks again). Then the builder runs directly (`direct_build`, a registry the
+payload service fills at start-up), with the parent's bundle laid over the
+chain's state at the grandparent by reth's own `MemoryOverlayStateProvider`,
+under a `RecoveredBlock` re-keyed to the sealed header so `BLOCKHASH` reads
+the hash the chain knows. The builder's every state read -- the state
+provider, the cached-reads opener, the parallel path's per-chunk providers --
+goes through one `ParentStateOpener`. The answer is `GET_PAYLOAD`'s shape; a
+refusal (`unknown build`, `no direct builder`) makes the driver fall back to
+the forkchoice path inside the same task, so a prepared build exists either
+way. When the import completes and asks for the build ahead as before, it
+finds this one prepared (same parent, same attributes) and does nothing.
+
+What to read in the round (`run-loop110.sh`, S = on, B = off, S-B-S-B):
+`scripts/fleet7-leader.py` first -- the on-seal builds log `fcu_ms=0
+on_seal=true` on the same "built a block ahead of leading" line, `waited`
+should fall from ~77 ms toward zero and `commit->body` from ~188 toward ~40;
+the execution layer's line is "built ahead on the sealed own block" with
+`find_ms queue_ms rename_ms build_ms`. Window 1 moves only as far as the
+followers' chain lets it (~493 ms against 570), so one or two blocks; the
+proof is in the leader's columns.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

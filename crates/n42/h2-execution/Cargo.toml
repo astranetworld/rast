@@ -15,6 +15,7 @@ alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-eips.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-consensus.workspace = true
+alloy-rlp.workspace = true
 async-trait = "0.1"
 thiserror.workspace = true
 tracing.workspace = true

@@ -185,6 +185,21 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         let _ = header;
         self.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload).await
     }
+    /// Builds the next block on a block this node built and sealed a moment
+    /// ago, from that build's own post-state, without waiting for the engine
+    /// to import it: `header` is the sealed header, `attrs` the next block's
+    /// attributes. `None` means the execution layer does not offer it, or no
+    /// longer has the build, and the caller starts the build the ordinary
+    /// way (forkchoice with attributes, then resolve); the default offers
+    /// nothing.
+    async fn build_on_own_block(
+        &self,
+        header: &alloy_consensus::Header,
+        attrs: PayloadAttributes,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        let _ = (header, attrs);
+        None
+    }
 
     /// Classified Engine-API `newPayload` call.
     ///

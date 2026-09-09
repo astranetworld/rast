@@ -324,6 +324,65 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         Ok(())
     }
 
+    /// [`Self::prepare_build_on`] for a block this node built and has just
+    /// sealed: the build starts on the builder's own post-state at once
+    /// (`ExecutionLayer::build_on_own_block`), instead of after the engine
+    /// has imported the block and answered a forkchoice on it -- own import
+    /// 62 ms and forkchoice 72 ms on the leader's chain at the bench tier,
+    /// with the leader then waiting for the build on nearly every block
+    /// (loop108, `docs/FLEET7_PLAN_V2.md`). An execution layer that does not
+    /// offer the direct build, or no longer holds the parent, falls back to
+    /// the forkchoice path inside the same task, so the prepared build is
+    /// there either way.
+    pub async fn prepare_build_on_sealed(
+        &mut self,
+        parent: B256,
+        header: alloy_consensus::Header,
+        attrs: PayloadAttributes,
+    ) -> Result<(), ElError> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|ahead| ahead.parent == parent && ahead.attrs == attrs)
+        {
+            return Ok(());
+        }
+        if let Some(stale) = self.prepared.take() {
+            stale.task.abort();
+        }
+        let el = std::sync::Arc::clone(&self.el);
+        let state = self.forkchoice(parent);
+        let task_attrs = attrs.clone();
+        info!(target: "n42.h2.el", ?parent, "starting a build ahead on the sealed block");
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match el.build_on_own_block(&header, task_attrs.clone()).await {
+                Some(Ok(built)) => {
+                    // The same line the forkchoice path logs, so the leader
+                    // analysis reads both; `fcu_ms` is zero here by design.
+                    info!(
+                        target: "n42.h2.el",
+                        ?parent,
+                        number = built.number,
+                        fcu_ms = 0u64,
+                        build_ms = started.elapsed().as_millis() as u64,
+                        on_seal = true,
+                        "built a block ahead of leading"
+                    );
+                    return Ok(built);
+                }
+                Some(Err(err)) => {
+                    warn!(target: "n42.h2.el", %err, ?parent, "the build on the sealed block failed; building ahead the ordinary way");
+                }
+                None => {
+                    debug!(target: "n42.h2.el", ?parent, "no build on the sealed block; building ahead the ordinary way");
+                }
+            }
+            build_ahead_by_forkchoice(el, state, task_attrs, parent).await
+        });
+        self.prepared = Some(AheadBuild { parent, attrs, task });
+        Ok(())
+    }
     /// Leader path: builds a block on top of the current head.
     ///
     /// Returns the built block *and* caches its payload, so the subsequent
@@ -728,4 +787,40 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             },
         }
     }
+}
+
+/// The build ahead by the Engine API's own steps: a forkchoice with
+/// attributes that starts the payload job, then a resolve that waits for
+/// it. What [`ExecutionDriver::prepare_build_on`] does; the fallback of
+/// [`ExecutionDriver::prepare_build_on_sealed`].
+async fn build_ahead_by_forkchoice<E: ExecutionLayer>(
+    el: std::sync::Arc<E>,
+    state: ForkchoiceState,
+    attrs: PayloadAttributes,
+    parent: B256,
+) -> Result<BuiltBlock, ElError> {
+    let started = std::time::Instant::now();
+    let updated = el
+        .fork_choice_updated_with_attrs_for(ExecutionPath::LIVE_SEQUENTIAL, state, attrs)
+        .await?;
+    let id = updated.payload_id.ok_or_else(|| {
+        ElError::new(format!(
+            "forkchoiceUpdated started no build ahead of leading (status {:?})",
+            updated.payload_status.status
+        ))
+    })?;
+    let after_fcu = started.elapsed();
+    let built = el
+        .resolve_payload_for(ExecutionPath::LIVE_SEQUENTIAL, id, ResolveKind::WaitForPending)
+        .await
+        .ok_or_else(|| ElError::new(format!("no payload build for id {id}")))??;
+    info!(
+        target: "n42.h2.el",
+        ?parent,
+        number = built.number,
+        fcu_ms = after_fcu.as_millis() as u64,
+        build_ms = (started.elapsed() - after_fcu).as_millis() as u64,
+        "built a block ahead of leading"
+    );
+    Ok(built)
 }

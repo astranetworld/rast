@@ -417,6 +417,116 @@ where
     Ok((status, header.number, handoff_ms, payload_ms))
 }
 
+/// Where a build on an own block spent its time, for the log line.
+#[derive(Debug, Default, Clone, Copy)]
+struct BuildOnOwnTimes {
+    find_ms: u64,
+    queue_ms: u64,
+    rename_ms: u64,
+    build_ms: u64,
+}
+
+/// The next block, built on a block this node built and consensus has just
+/// sealed (`request::BUILD_ON_OWN`) -- before the engine has imported that
+/// block, and without the forkchoice and the payload service that used to
+/// stand between the seal and the build (own import 62 ms + forkchoice 72 +
+/// service ~35 on the leader's chain, loop108; `docs/FLEET7_PLAN_V2.md`).
+///
+/// The parent is found in the build registry by the sealed header's parent,
+/// number, roots and gas, exactly as the header-only import finds it, and is
+/// *not* taken out: that import follows and takes it. What this does first is
+/// what the import's hand-off would otherwise do before the next build could
+/// start: the queue forgets the parent's mined transactions (or the build
+/// would select them again), and the QMDB tree moves to the sealed hash (the
+/// hand-off's later rename finds it there and is content). Then the builder
+/// runs on a blocking thread with the parent's bundle laid over the chain's
+/// state. An `Err` is the message sent back, on which the validator builds
+/// ahead the ordinary way.
+async fn build_on_own_block(
+    reuse: Option<&OwnBlockReuse>,
+    frame: &[u8],
+) -> Result<(N42BuiltPayload, BuildOnOwnTimes), String> {
+    let reuse = reuse.ok_or("no own-block reuse on this node")?;
+    let builder = n42_engine_types::direct_build::get().ok_or("no direct builder")?;
+    let (header, attributes) = raw_engine::decode_build_on_own(frame)?;
+    if header.block_access_list_hash.is_some() {
+        return Err("unknown build: block access list".to_owned());
+    }
+    let mut times = BuildOnOwnTimes::default();
+    let at = std::time::Instant::now();
+    let (built_hash, built) = n42_engine_types::built_executions::find(
+        header.parent_hash,
+        header.number,
+        header.state_root,
+        header.receipts_root,
+        header.gas_used,
+    )
+    .ok_or("unknown build")?;
+    times.find_ms = at.elapsed().as_millis() as u64;
+    let sealed_hash = header.hash_slow();
+    let parent = reth_primitives_traits::SealedHeader::new(header, sealed_hash);
+    // The parent's transactions leave the build's taken list now, held until
+    // the chain settles the height -- the same bookkeeping as the hand-off,
+    // which finds nothing left to forget when it runs.
+    if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
+        let at = std::time::Instant::now();
+        let mined = built
+            .block
+            .transactions_with_sender()
+            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
+        let dropped = queue.forget_mined(built.block.header().parent_hash, mined);
+        debug!(target: "n42.payload_serve", forgotten = dropped.len(), "own block's transactions forgotten by the queue ahead of the build");
+        queue.hold_own_block(built.block.number(), sealed_hash, dropped);
+        times.queue_ms = at.elapsed().as_millis() as u64;
+    }
+    if let Some(qmdb) = &reuse.qmdb {
+        let at = std::time::Instant::now();
+        qmdb.rename(built_hash, sealed_hash).map_err(|err| format!("qmdb rename: {err}"))?;
+        times.rename_ms = at.elapsed().as_millis() as u64;
+    }
+    let at = std::time::Instant::now();
+    let request = n42_engine_types::direct_build::BuildOnOwnRequest { parent, parent_execution: built, attributes };
+    let payload = tokio::task::spawn_blocking(move || builder.build_on_own(request))
+        .await
+        .map_err(|err| format!("build task: {err}"))??;
+    times.build_ms = at.elapsed().as_millis() as u64;
+    Ok((payload, times))
+}
+
+/// Writes a built payload in the channel's answer shape (status 1, the
+/// block's RLP, the requests, the access list); returns the block's size and
+/// how long the encoding took.
+fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, std::time::Duration) {
+    let encode_at = std::time::Instant::now();
+    let block = encode_block_parallel(payload.block());
+    let encoded = encode_at.elapsed();
+    out.reserve(block.len() + 64);
+    out.push(1);
+    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    out.extend_from_slice(&block);
+    match payload.requests() {
+        Some(requests) => {
+            let requests = requests.take();
+            out.push(1);
+            out.extend_from_slice(&(requests.len() as u32).to_le_bytes());
+            for request in &requests {
+                out.extend_from_slice(&(request.len() as u32).to_le_bytes());
+                out.extend_from_slice(request);
+            }
+        }
+        None => out.push(0),
+    }
+    match payload.block_access_list() {
+        Some(bal) => {
+            out.push(1);
+            out.extend_from_slice(&(bal.len() as u32).to_le_bytes());
+            out.extend_from_slice(bal);
+        }
+        None => out.push(0),
+    }
+    (block.len(), encoded)
+}
+
 /// The sealed header a payload describes, given the build it came from: the
 /// payload's fields where the seal may have touched them, the build's where it
 /// cannot. `None` if the shapes disagree; the caller checks the hash.
@@ -577,6 +687,42 @@ where
                 }
                 Err(message) => {
                     debug!(target: "n42.payload_serve", %message, "own block by header refused");
+                    out.push(2);
+                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(message.as_bytes());
+                }
+            }
+            stream.write_all(&out).await?;
+            continue;
+        }
+        if kind == request::BUILD_ON_OWN {
+            let len = stream.read_u32_le().await? as usize;
+            if len > 1 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "build request frame too large"));
+            }
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            out.clear();
+            let started = std::time::Instant::now();
+            match build_on_own_block(reuse.as_ref(), &buf).await {
+                Ok((payload, times)) => {
+                    let (bytes, encoded) = push_built_payload(&mut out, &payload);
+                    info!(
+                        target: "n42.payload_serve",
+                        number = payload.block().number(),
+                        txs = payload.block().body().transactions.len(),
+                        bytes,
+                        find_ms = times.find_ms,
+                        queue_ms = times.queue_ms,
+                        rename_ms = times.rename_ms,
+                        build_ms = times.build_ms,
+                        encode_ms = encoded.as_millis() as u64,
+                        total_ms = started.elapsed().as_millis() as u64,
+                        "built ahead on the sealed own block"
+                    );
+                }
+                Err(message) => {
+                    debug!(target: "n42.payload_serve", %message, "build on own block refused");
                     out.push(2);
                     out.extend_from_slice(&(message.len() as u32).to_le_bytes());
                     out.extend_from_slice(message.as_bytes());
@@ -1016,38 +1162,12 @@ where
                 out.extend_from_slice(message.as_bytes());
             }
             Some(Ok(payload)) => {
-                let encode_at = std::time::Instant::now();
-                let block = encode_block_parallel(payload.block());
-                let encoded = encode_at.elapsed();
-                out.reserve(block.len() + 64);
-                out.push(1);
-                out.extend_from_slice(&(block.len() as u32).to_le_bytes());
-                out.extend_from_slice(&block);
-                match payload.requests() {
-                    Some(requests) => {
-                        let requests = requests.take();
-                        out.push(1);
-                        out.extend_from_slice(&(requests.len() as u32).to_le_bytes());
-                        for request in &requests {
-                            out.extend_from_slice(&(request.len() as u32).to_le_bytes());
-                            out.extend_from_slice(request);
-                        }
-                    }
-                    None => out.push(0),
-                }
-                match payload.block_access_list() {
-                    Some(bal) => {
-                        out.push(1);
-                        out.extend_from_slice(&(bal.len() as u32).to_le_bytes());
-                        out.extend_from_slice(bal);
-                    }
-                    None => out.push(0),
-                }
-                if block.len() > 1_000_000 {
+                let (bytes, encoded) = push_built_payload(&mut out, &payload);
+                if bytes > 1_000_000 {
                     info!(
                         target: "n42.payload_serve",
                         number = payload.block().number(),
-                        bytes = block.len(),
+                        bytes,
                         waited_ms = waited.as_millis() as u64,
                         encode_ms = encoded.as_millis() as u64,
                         "raw payload served"

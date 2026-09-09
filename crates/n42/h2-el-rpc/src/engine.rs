@@ -95,6 +95,9 @@ pub struct EngineApiClient<T> {
     /// A second connection to the same channel for imports, so a build being
     /// collected never waits behind a block being executed.
     raw_import: tokio::sync::Mutex<RawChannel>,
+    /// The build on a sealed own block: its own connection, because it runs
+    /// while the own-block import holds `raw_import`.
+    raw_build: tokio::sync::Mutex<RawChannel>,
 }
 
 /// State of the raw payload channel. See `payload_serve` in `bin/n42`.
@@ -116,6 +119,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             raw_payloads: std::sync::atomic::AtomicBool::new(true),
             raw_channel: tokio::sync::Mutex::new(RawChannel::default()),
             raw_import: tokio::sync::Mutex::new(RawChannel::default()),
+            raw_build: tokio::sync::Mutex::new(RawChannel::default()),
         }
     }
 
@@ -468,6 +472,14 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         accepted
     }
 
+    async fn build_on_own_block(
+        &self,
+        header: &alloy_consensus::Header,
+        attrs: PayloadAttributes,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        self.build_on_own_over_channel(header, attrs).await
+    }
+
     async fn import_own_block(
         &self,
         header: Option<&alloy_consensus::Header>,
@@ -714,6 +726,104 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             }
             Err(err) => {
                 debug!(target: "n42.h2.el", %err, "own block by header failed; sending the payload");
+                None
+            }
+        }
+    }
+
+    /// The build on a sealed own block (`request::BUILD_ON_OWN`): the sealed
+    /// header and the next block's attributes go over the raw channel, the
+    /// built block comes back in `GET_PAYLOAD`'s shape. `None` when there is
+    /// no raw channel, the execution layer refused (no build kept, no direct
+    /// builder) or the request failed: the caller builds ahead the ordinary
+    /// way.
+    async fn build_on_own_over_channel(
+        &self,
+        header: &alloy_consensus::Header,
+        attrs: PayloadAttributes,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut channel = self.raw_build.lock().await;
+        let addr = self.raw_endpoint(&mut channel).await?;
+        let started = std::time::Instant::now();
+        let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
+        let frame = n42_h2_execution::raw_engine::encode_build_on_own(header, &attrs);
+        let taken = channel.stream.take();
+        let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            let stream = &mut conn;
+            stream.write_u8(n42_h2_execution::raw_engine::request::BUILD_ON_OWN).await?;
+            stream.write_u32_le(frame.len() as u32).await?;
+            stream.write_all(&frame).await?;
+            let answer = match stream.read_u8().await? {
+                0 => None,
+                2 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut message = vec![0u8; len];
+                    stream.read_exact(&mut message).await?;
+                    debug!(
+                        target: "n42.h2.el",
+                        message = %String::from_utf8_lossy(&message),
+                        "build on the sealed block refused; building ahead the ordinary way"
+                    );
+                    None
+                }
+                1 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut block = vec![0u8; len];
+                    stream.read_exact(&mut block).await?;
+                    let requests = if stream.read_u8().await? == 1 {
+                        let n = stream.read_u32_le().await? as usize;
+                        let mut requests = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            let len = stream.read_u32_le().await? as usize;
+                            let mut request = vec![0u8; len];
+                            stream.read_exact(&mut request).await?;
+                            requests.push(alloy_primitives::Bytes::from(request));
+                        }
+                        Some(requests)
+                    } else {
+                        None
+                    };
+                    let bal = if stream.read_u8().await? == 1 {
+                        let len = stream.read_u32_le().await? as usize;
+                        let mut bal = vec![0u8; len];
+                        stream.read_exact(&mut bal).await?;
+                        Some(alloy_primitives::Bytes::from(bal))
+                    } else {
+                        None
+                    };
+                    let received = started.elapsed();
+                    let built = built_block_from_parts(block.into(), requests, bal, beacon_root);
+                    debug!(
+                        target: "n42.h2.el",
+                        bytes = len,
+                        channel_ms = received.as_millis() as u64,
+                        split_ms = started.elapsed().saturating_sub(received).as_millis() as u64,
+                        "block built on the sealed block collected"
+                    );
+                    Some(built)
+                }
+                other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
+            };
+            Ok((answer, conn))
+        }
+        .await;
+        match attempt {
+            Ok((answer, conn)) => {
+                channel.stream = Some(conn);
+                answer
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.el", %err, "build on the sealed block failed on the channel; building ahead the ordinary way");
+                channel.stream = None;
                 None
             }
         }

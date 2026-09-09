@@ -211,8 +211,10 @@ Order of work (details, numbers and the judging metric per step in the plan):
 2. **A1/A2: start the next build on the builder's own post-state the moment a
    block is sealed**, engine import and forkchoice beside the chain, our
    builder called directly: removes ~170 ms of plumbing from the leader's
-   chain. `waited` must go to ~0. TPS follows only down to the followers'
-   chain (~300-330k).
+   chain. **Built** (`N42_BUILD_ON_SEAL=1`, `direct_build.rs`, request
+   `BUILD_ON_OWN`); `run-loop110.sh` is the S-B-S-B round, not yet run.
+   `waited` must go to ~0. TPS follows only down to the followers' chain
+   (~300-330k).
 3. A4: allocation profile of the *leader* in window 2 (exec 42 -> 187 ms).
 4. B1/B2: converged pools (followers' `cache_hits` is 0/163000 today) and body
    by reference -- the followers' per-transaction work off their path.

@@ -24,6 +24,7 @@ pub mod n42_evm;
 pub mod pool;
 pub mod rpc;
 pub mod built_executions;
+pub mod direct_build;
 //mod job_generator;
 //mod job;
 //mod metrics;
