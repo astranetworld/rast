@@ -1013,6 +1013,53 @@ Expect windows 2 and 3 to fall there: they are supply-bound already (the
 flood sends ~188k/s where 46 full blocks a window consume ~250k/s, and the
 pool's backlog is what carries window 1).
 
+**loop105 (04:28-04:46 EDT): the block is not a lever either, and what the
+chain actually costs.** G legs doubled the gas ceiling to 6,846,000,000
+(~315,000 transfers a block), N legs kept 3,423,000,000.
+
+    leg  ceiling  win1     blocks  cycle    total
+    G1   doubled  241,551  23      1.305 s  17.36M
+    N1   normal   247,425  46      0.652 s  17.86M
+    G2   doubled  243,143  23      1.305 s  17.73M
+    N2   normal   217,253  40      0.750 s  15.32M
+
+The two G legs are the same leg twice: 23 blocks, 1.305 s, to the
+millisecond. **Doubling the block doubled the cycle exactly**, so the two
+points fit `cycle = -47 ms + 4.29 us per transfer` -- the fixed part is
+statistically zero. There is no consensus overhead to amortise: the chain
+costs ~4 us of cycle per transaction whatever size the blocks are, and 250k
+TPS is simply 1/4 us. Bigger blocks are marginally worse (241-243k against
+247k), because the accounts a block touches grow with it and the cycle is
+linear in those.
+
+That closes the structural questions. Neither the pacing (loop101), nor the
+block size (here), nor 17-53 ms of plumbing (loop102, loop104) moves the
+number. What is left is the 4 us itself, and it is now fully broken down.
+Per transfer, at 163,000 transfers and 147,000 accounts a block:
+
+    the whole cycle                        ~4.00 us
+      the follower's import                 2.80
+        execution                           1.21
+          partition (sender groups)          0.18
+          the groups -- the EVM itself       0.43
+          the merge (graft)                  0.42
+        QMDB root                           0.43
+        payload conversion                  0.29
+        senders                             0.21
+        hashed post-state                   0.16
+        carry cache                         0.15
+        header, checks, state, dispatch     ~0.35
+      publish, vote, decide, the engine    ~1.20
+
+**The virtual machine is 0.43 of 4.00 us -- under 11% of the chain.** The
+rest is moving 147,000 accounts through hash maps, trie leaves and caches:
+the graft's 0.42 and the partition's 0.18 are the bundle's representation,
+the root's 0.43 is QMDB's leaves, the hashed state's 0.16 is keccak over the
+same accounts again, and the conversion's 0.29 is decoding what the ingest
+already decoded once. Halving the chain's cost means halving that data
+movement, not making the EVM faster; the designs for it are in
+`docs/FLEET7_STATUS.md` under "Next".
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
