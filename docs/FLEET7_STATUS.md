@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-09 04:50)
+# Fleet7 status (living note; last updated 2026-09-09 02:25 EDT)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -26,14 +26,19 @@ shape a real chain would produce, and record what the ceiling is made of.
   cycle; 16.8-18.2M transactions per round. Best round: loop98 S1, 252,518 /
   184,684 / 168,379 and 18.17M. The cycle is linear in accounts touched:
   0.40 s + 2.8 us per account (loop80 sweep).
-- **The import is no longer what sets the median cycle** (loop99). With the
-  round-43 cuts it is 429-446 ms (506 without) and the barrier 474-492
-  (556-577), but S2 read a 0.653 s cycle with the round's *worst* barrier,
-  and four legs in six read 0.652-0.667 either way: at 450 ms pacing the
-  median is floored by the pacing plus the ~200 ms that does not overlap it.
-  What the cuts did move is the **tail**: p90 of the view cycle 3,781/2,935 ms
-  before, 1,439/1,854 after. The next gain on the median is a tighter pacing
-  -- loop101 sweeps 450/400/350 with the grace.
+- **Window 1 has a resolution of one block: 5,433 TPS, 2.2%** (loop101). Every
+  block is full at the gas ceiling (163,000 transfers), so a 30 s window reads
+  `blocks x 163,000 / 30` -- 244,500 for 45 blocks, 249,933 for 46. Changes
+  worth less than a block are invisible there; use the round total and the
+  import's own milliseconds.
+- **Neither the import nor the pacing sets the cycle alone.** The import is
+  429-446 ms with the round-43 cuts (506 without) and the quorum's fifth vote
+  ~500 ms, but a leg with the worst barrier of its round still read 0.653 s,
+  and pacing 350/400/450 are equal (loop101). What the cuts did move is the
+  **tail**: p90 of the view cycle 3,781/2,935 ms before, 1,439/1,854 after.
+  The fleet is balanced -- the slowest validator votes ~19 ms after the fifth
+  -- so the way up is a shorter *common* import, and it must be ~150 ms
+  shorter to buy one block.
 - **Where the cycle goes.** `cycle ~= publish->recv 30 + import barrier +
   vote->decide 20 + decide->publish 80 ms`, and the pacing (450 ms) sets a
   floor under all of it. The barrier is a validator's wait for its execution
@@ -131,9 +136,7 @@ pinning. Never `dirty_decay_ms:-1` on this box (OOM-killed an execution layer).
 
 ## In flight
 
-**loop101** (running): the pacing sweep P450/P400/P350 with the grace, now
-that the import is 70 ms faster than when 300 ms pacing made every tenure
-handover stall. **loop102** (queued): the two plumbing cuts together
+**loop102** (running): the two plumbing cuts together
 (`N42_ROOT_HASHED_PARALLEL=1` and `N42_QUEUE_WORK_OFFLOAD=1`), A-B-A-B.
 **loop103** (queued, builds): the fast answer's second attempt, and the first
 round to log `carry_ms`.

@@ -884,6 +884,37 @@ the carry cache: 129,000 accounts copied into the next block's read cache, one
 insert at a time, while the validator waits for the answer. It is timed as
 `carry_ms` from 96072ad05, and nothing reads it before the next block.
 
+**loop101 (01:54-02:21 EDT): the pacing is not the ceiling either, and
+window 1 has a resolution of one block.**
+
+    pacing   win1 (a / b)        total (a / b)     occupancy
+    350 ms   246,359 / 244,489   17.66M / 17.28M   98.6% / 100%
+    400 ms   244,490 / 244,491   17.60M / 17.12M   100%  / 100%
+    450 ms   231,623 / 246,059   16.89M / 17.65M   99.2% / 98.5%
+
+Set aside P450a, a first leg after the gov5 fleet had held the box, and every
+pacing reads 244.5-246.4k on window 1 and 17.1-17.7M on the round. **Pacing
+between 350 and 450 ms is null**, and the stall that 300 ms pacing used to
+cause has not come back at 350 -- the grace and the faster import between them
+removed it. loop99's reading that "the pacing floors the cycle" was wrong: it
+was one leg's coincidence, and the correction is below.
+
+The recurring 244,488 / 244,489 / 244,490 / 244,491 is not a coincidence and
+not precision -- it is arithmetic. Every block is full at the gas ceiling
+(3.423 G / 21,000 = 163,000 transfers), so a 30 s window's TPS is
+`blocks x 163,000 / 30`: 43 blocks is 233,633, 44 is 239,067, 45 is 244,500,
+46 is 249,933. **Window 1 moves in steps of one block, 5,433 TPS, 2.2%.**
+Anything worth less than that cannot appear in it at all; the round total,
+which counts three windows, is the finer instrument, and the import's own
+milliseconds (n = 110-160 blocks a leg) are finer still.
+
+So the chain is gas-ceiling-bound per block and cycle-bound per second, and
+the cycle is the quorum's fifth vote (~500 ms with the round-43 cuts, from
+`scripts/fleet7-quorum.py`) plus ~150 ms of publish, vote and decide. The
+slowest validator votes only ~19 ms after the fifth, so the fleet is balanced
+and there is no straggler left to fix; the way up is to make the *common*
+import shorter, and it has to be ~150 ms shorter to buy a block.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
