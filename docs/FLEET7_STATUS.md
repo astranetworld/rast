@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-09 04:50 EDT)
+# Fleet7 status (living note; last updated 2026-09-09 06:30 EDT)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -220,8 +220,14 @@ read null. Each pass removed is worth ~0.2-0.4 us of the 4.0, so 5-10%.
    already holds -- by hash, from the ingest's own cache -- would not decode
    them twice. This is the largest single *redundant* pass in the chain.
 3. **The hashed post-state, 0.16 us,** is keccak over the same accounts the
-   QMDB root (0.43) already hashed with blake3. One walk that produces both
-   would remove a pass outright.
+   QMDB root (0.43) already hashed with blake3, and looks unused on this
+   chain's paths. **It is not: loop106 skipped it and the fleet produced zero
+   blocks, twice**, dying on the first full block with an executed block the
+   engine saw as having no receipts (`gas spent by each transaction: []`)
+   while consensus had already committed that view. The dependency is
+   somewhere in the engine's insert-and-validate path, not in the trie tables,
+   and it must be understood before this pass can go. `N42_HASHED_STATE=0`
+   reproduces it in one line.
 4. **The supply side**, once the chain passes ~330k: the ingest is ~400k/s per
    node and all seven verify every transaction (7x redundant, ~36% of a
    follower's CPU). Fewer verifications per node is the cheap half; a

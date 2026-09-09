@@ -266,7 +266,8 @@ where
     // The provider is `Send` but not `Sync`, so the hashed job takes it by
     // value; both jobs borrow the bundle, which is plain data.
     //
-    // `N42_HASHED_STATE=0` skips the pass entirely. It exists for reth's
+    // `N42_HASHED_STATE=0` skips the pass entirely -- and stops the chain; see
+    // `hashed_state_enabled`. It exists for reth's
     // Merkle-Patricia trie -- `MemoryOverlayStateProvider::trie_input` feeds
     // it to `state_root`, `proof`, `multiproof` and `witness`, and
     // `save_blocks` writes it to `HashedAccounts`/`HashedStorages` -- and this
@@ -340,10 +341,23 @@ fn fill_carry(
 }
 
 /// Whether the follower computes the Merkle-Patricia hashed post-state
-/// (default; `N42_HASHED_STATE=0` skips it). See the comment at the call site:
-/// on this chain the state root and the proofs come from QMDB, and the only
-/// readers of the hashed state are reth's trie methods, two debug RPCs and the
-/// `HashedAccounts`/`HashedStorages` tables that persistence fills.
+/// (default).
+///
+/// **`N42_HASHED_STATE=0` stops the chain.** It is kept as the one-line
+/// reproduction, not as an option: loop106 ran it twice and the fleet produced
+/// zero blocks both times, dying on the first full block with
+/// `block gas used mismatch: got 0, expected 3423000000; gas spent by each
+/// transaction: []` -- the engine validating an executed block that has no
+/// receipts at all -- while the same binary with the pass left in read 199,751
+/// and 249,924. Reading the code says nothing on this chain's paths consumes
+/// the hashed state (the state root and the proofs come from QMDB; the
+/// overlay answers account and storage reads from the bundle; only reth's
+/// trie methods, two debug RPCs and the `HashedAccounts`/`HashedStorages`
+/// tables touch it). The fleet says otherwise, and the failure is a hard
+/// rejection rather than a missing index, so the dependency is somewhere in
+/// the engine's insert-and-validate path. Removing this pass -- 26 ms of every
+/// import and ~15 MB a block -- needs that path understood first, and the
+/// leader's own build handled too.
 fn hashed_state_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_HASHED_STATE").map_or(true, |v| v != "0"))

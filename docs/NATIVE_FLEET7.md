@@ -1060,6 +1060,49 @@ already decoded once. Halving the chain's cost means halving that data
 movement, not making the EVM faster; the designs for it are in
 `docs/FLEET7_STATUS.md` under "Next".
 
+**loop106 (06:05-06:24 EDT): the hashed post-state cannot be dropped, and
+the code said it could.** The question was whether the follower needs reth's
+Merkle-Patricia hashed post-state at all. Reading the code said no, three
+times over: this chain's state root and proofs come from QMDB; the in-memory
+overlay answers `basic_account` and `storage` from the bundle, not the hashed
+state; and the only things that touch it are reth's trie methods
+(`trie_input` -> `state_root`, `proof`, `multiproof`, `witness`), two debug
+RPCs whose answers would be wrong here anyway, and the
+`HashedAccounts`/`HashedStorages` tables that persistence fills. So
+`N42_HASHED_STATE=0` returns an empty one, saving 26 ms of every import and
+~15 MB a block.
+
+    leg  hashed state  win1     blocks
+    H1   skipped             0       0
+    B1   kept          199,751      37
+    H2   skipped             0       0
+    B2   kept          249,924      46
+
+**Both skipped legs produced no blocks at all.** The fleet dies on the first
+full block with
+
+    block gas used mismatch: got 0, expected 3423000000;
+    gas spent by each transaction: []
+
+-- the engine validating an executed block that carries **no receipts** --
+and the consensus side had already committed that view, so the two halves
+diverge and the chain stops. The same binary with the pass left in ran
+normally in both control legs.
+
+The mechanism is not pinned down. It is not the leader's own-build reuse
+(`built_executions::take` matches on parent, number, state root, receipts
+root and gas used -- the hashed state is not part of the key), and it is not
+a missing index degrading a read: it is a hard rejection inside the engine's
+insert-and-validate path. Whatever it is, **the pass is load-bearing**, so
+its 0.16 us a transfer is not free to take; removing it means understanding
+that path and handling the leader's build too, not flipping a flag. The knob
+stays in the tree as the one-line reproduction, documented as something that
+stops the chain.
+
+The round is also the clearest argument this campaign has produced for
+running the experiment rather than trusting the reading: the code review was
+careful, specific and wrong, and the fleet said so in four minutes.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
