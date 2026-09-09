@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-09 03:10 EDT)
+# Fleet7 status (living note; last updated 2026-09-09 04:05 EDT)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -23,8 +23,9 @@ shape a real chain would produce, and record what the ceiling is made of.
   (88k accounts per 163k transactions), BNB (46k), Polygon (11k) and Tron
   (173k): ours is conservative, close to Tron's.
 - **Throughput at that shape.** 244-253k TPS on window 1 at a 0.64-0.67 s
-  cycle; 16.8-18.2M transactions per round. Best round: loop98 S1, 252,518 /
-  184,684 / 168,379 and 18.17M. The cycle is linear in accounts touched:
+  cycle; 16.8-18.2M transactions per round. **Best round: loop103 F2 --
+  249,105 / 184,637 / 173,811 and 18,231,500**, with the highest third window
+  yet; loop98 S1's 252,518 is still the highest single window. The cycle is linear in accounts touched:
   0.40 s + 2.8 us per account (loop80 sweep).
 - **Window 1 has a resolution of one block: 5,433 TPS, 2.2%** (loop101). Every
   block is full at the gas ceiling (163,000 transfers), so a 30 s window reads
@@ -120,7 +121,8 @@ shape a real chain would produce, and record what the ceiling is made of.
 | `RAYON_NUM_THREADS=32` (the box has 256 logical CPUs) | every parallel phase 1.5-2x | 250k twice, the round's two best legs; adopted |
 | QMDB root and hashed post-state joined (`N42_ROOT_HASHED_PARALLEL`) | the pair 94 -> 81 ms | import 445 -> 428 with the offload; **null** on win1 (17 ms is a ninth of a block). Adopted anyway: no risk |
 | Queue and pool bookkeeping off the vote path (`N42_QUEUE_WORK_OFFLOAD`) | its worker reports 12 ms | null on win1; zero stale transactions in 63 builds, but stays opt-in |
-| Fast answer v1 (`N42_DIRECT_FAST_ANSWER=1`, answer before the engine's pass, no remembered block) | -35 ms on the path | **a loss**: 239k against 244.5k, because the engine's pass went 35 -> 102 ms (it decodes the payload again). v2 keeps the remembered block, cloned off the path; loop103 |
+| Fast answer v1 (`N42_DIRECT_FAST_ANSWER=1`, answer before the engine's pass, no remembered block) | -35 ms on the path | **a loss**: 239k against 244.5k, because the engine's pass went 35 -> 102 ms (it decodes the payload again) |
+| Fast answer v2 (remembers the block from the executed block's `Arc` on a worker thread) | the engine's pass 102 -> 62 ms | loop103: a tie on window 1 (249.1k vs 249.8k) with the totals confounded by different pools. Not a loss any more; needs a clean pair |
 
 Null knobs, measured and left off: follower sender grouping, Ed25519 batch
 width, 32-thread build pool, builder graft without cache inserts, MDBX
@@ -138,7 +140,7 @@ pinning. Never `dirty_decay_ms:-1` on this box (OOM-killed an execution layer).
 
 ## In flight
 
-**loop103** (running, builds): the two plumbing cuts together
+**loop104** (running, builds): the two plumbing cuts together
 (`N42_ROOT_HASHED_PARALLEL=1` and `N42_QUEUE_WORK_OFFLOAD=1`), A-B-A-B.
 **loop103** (queued, builds): the fast answer's second attempt, and the first
 round to log `carry_ms`.

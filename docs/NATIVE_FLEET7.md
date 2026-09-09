@@ -943,6 +943,42 @@ this pacing. It stays opt-in anyway -- 12 ms does not pay for a race that
 needs one unlucky interleaving to cost 87,800 transactions -- while the join,
 which has no such risk, becomes the default.
 
+**loop103 (03:41-04:00 EDT): the fast answer's second attempt, two legs lost
+to my own compiles, and the campaign's best round.**
+
+    leg  fast answer  win1     cycle    total    pool   note
+    F1   v2           195,381  0.834 s  15.81M   34 GB  void: cargo check running
+    B1   off          229,550  0.698 s  16.83M   57 GB  void: cargo check running
+    F2   v2           249,105  0.652 s  18.23M   57 GB  clean
+    B2   off          249,842  0.652 s  17.44M   39 GB  clean
+
+**F2's 18,231,500 is the best round of the campaign** (loop98 S1's 18.17M was
+the previous), and its third window, 173,811, is the highest ever seen -- the
+windows read 249,105 / 184,637 / 173,811 at an honest shape (141,999 distinct
+recipients).
+
+The first two legs are void and the reason is worth recording: a `cargo check`
+running *between* the legs, and then *during* them, cost F1 its huge-page pool
+(1 GB before hugeprep, 34 after, its order-10 blocks 1,644 against the 4,700
+of a good leg) and cost both legs their cores. **The rule "never build while a
+leg runs" extends to between the legs of a round.**
+
+On the clean pair the fast answer is a tie on window 1 (249,105 against
+249,842, both 46 blocks) and ahead on the round total, but B2 started from a
+39 GB pool against F2's 57, so the total is not attributable. What is
+attributable is the mechanism the second version was written for: **the
+engine's pass behind the answer reads 62 ms, where version 1 read 102** --
+remembering the block from the executed block's `Arc` on a worker thread does
+put the conversion back, and does keep the clone off the vote's path. The
+fast answer is no longer a loss; whether it is a win needs a clean pair.
+
+F2 also gives the import's best reading yet: **413 ms** -- convert 48,
+senders 36, execution 185, root 64, hashed 27, **carry 25**, state 5,
+header 4, checks 4, and ~15 of dispatch. The carry is 25 ms rather than the
+44 that was inferred, and `N42_CARRY_ASYNC=1` (73af720b6) moves it behind the
+answer; loop104 measures it together with the join and the queue offload,
+~50 ms in all.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
