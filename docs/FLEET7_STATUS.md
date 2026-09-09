@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-09 06:30 EDT)
+# Fleet7 status (living note; last updated 2026-09-09 07:25 EDT)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -23,8 +23,9 @@ shape a real chain would produce, and record what the ceiling is made of.
   (88k accounts per 163k transactions), BNB (46k), Polygon (11k) and Tron
   (173k): ours is conservative, close to Tron's.
 - **Throughput at that shape.** 244-253k TPS on window 1 at a 0.64-0.67 s
-  cycle; 16.8-18.2M transactions per round. **Best round: loop104 A2 --
-  248,906 / 190,086 / 173,806 and 18,388,500**, with the highest third window
+  cycle; 16.8-18.2M transactions per round. **Best window 1: loop108 R16a,
+  260,485 at 48 blocks** (`RAYON_NUM_THREADS=16`); best round: loop104 A2 --
+  248,906 / 190,086 / 173,806 and 18,388,500, with the highest third window
   yet; loop98 S1's 252,518 is still the highest single window. The cycle is linear in accounts touched:
   0.40 s + 2.8 us per account (loop80 sweep).
 - **Window 1 has a resolution of one block: 5,433 TPS, 2.2%** (loop101). Every
@@ -118,7 +119,7 @@ shape a real chain would produce, and record what the ceiling is made of.
 | Sharded twig index, bitmap retirements, chunked undo entries | apply 52 -> 22-28 ms (15-18 at 32 threads) | import 506 -> 429-446 ms, barrier -85 ms; win1 +2.5%, total +2.0% |
 | Conversion's `Result<Vec>` collect off rayon's short-circuit path | 40 -> 26 ms | (the same legs) |
 | Follower sender lookups, same fix; hashed state folded once | hashed 43 -> 26 ms on the fleet | (the same legs) |
-| `RAYON_NUM_THREADS=32` (the box has 256 logical CPUs) | every parallel phase 1.5-2x | 250k twice, the round's two best legs; adopted |
+| `RAYON_NUM_THREADS` (the box has 256 logical CPUs and seven nodes) | every parallel phase 1.5-2x at 32 | **16 is the value**: 260,485 / 259,233 at 48 blocks against 253k at the default and 248k at 32 (loop108). The gain is outside the import -- 16's barrier is *worse*, 507 ms against 482, and its cycle shorter anyway, because the validators get the cores |
 | QMDB root and hashed post-state joined (`N42_ROOT_HASHED_PARALLEL`) | the pair 94 -> 81 ms | import 445 -> 428 with the offload; **null** on win1 (17 ms is a ninth of a block). Adopted anyway: no risk |
 | Queue and pool bookkeeping off the vote path (`N42_QUEUE_WORK_OFFLOAD`) | its worker reports 12 ms | null on win1; zero stale transactions in 63 builds, but stays opt-in |
 | The carry cache filled after the answer (`N42_CARRY_ASYNC`) | 24 ms off the path | with the other two: import 456 -> 403 ms, window 1 a tie, and the round's spread widens (17.44M and 18.39M against 18.03M and 18.06M). Opt-in |
@@ -136,7 +137,9 @@ pinning. Never `dirty_decay_ms:-1` on this box (OOM-killed an execution layer).
 `N42_PARALLEL_STATE_COMMIT` (on by default), `F7_BLOCK_INTERVAL_MS=450` and
 `F7_STRAGGLER_GRACE_MS=600` (bench defaults), `MALLOC_CONF=thp:always`,
 `N42_TX_INGEST_RECOVER_PARALLEL=20`, `N42_TX_QUEUE_RUN=64`,
-`TOKIO_WORKER_THREADS=8`, `RAYON_NUM_THREADS=32`, `F7_FLOOD_ALG=ed25519`,
+`TOKIO_WORKER_THREADS=8`, **`RAYON_NUM_THREADS=16`** (loop108: 16 beats the default by
+3% and 32 by 5%; the value must be set by the launcher -- loop100-107 silently
+ran at the default), `F7_FLOOD_ALG=ed25519`,
 `N42_ALTSIG_SENDER_CACHE=4194304`, `N42_ED25519_BATCH=128`, `--pertx 10000`.
 
 ## In flight

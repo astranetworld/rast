@@ -1141,6 +1141,38 @@ into the record environment after loop99, where its two legs were that round's
 best, **but no launcher since has set it** -- loop100 through loop107 all ran
 at rayon's default. loop108 sweeps 32, 16 and the default.
 
+**loop108 (06:54-07:21 EDT): sixteen rayon threads a node, and a new record
+window.** Seven execution layers share 256 cores and rayon defaults to one
+thread per core *per process*. Two legs each at 32, at the default, and at 16:
+
+    rayon/node  win1                blocks  cycle    total
+    32          247,939 / 248,358   46      0.652 s  12.82M / 17.56M
+    default     253,223 / 252,532   47      0.638 s  17.87M / 17.85M
+    16          260,485 / 259,233   48      0.625 s  17.76M / 18.37M
+
+Every pair reproduces to within 0.5% and the block counts are exact -- 46, 47,
+48 -- so this is a real 3% over the default and 5% over 32.
+**`RAYON_NUM_THREADS=16` gives the campaign's best window, 260,485**, past
+loop98 S1's 252,518, and R16b's 18,373,000 is within 16,000 of loop104 A2's
+best round.
+
+The mechanism is not what the round was designed to test. R16a's **import is
+slower** than the default leg's -- barrier 507 ms against 482, execution 211
+against ~197 -- and its cycle is shorter anyway, 0.625 s against 0.638. The
+gain is entirely outside the execution layer: with fewer threads in the seven
+ELs, the seven validators get CPU, and the consensus half of the cycle
+(publish, receive, vote, decide) falls ~40 ms, more than paying for the
+slower import. Thirty-two is worse than the default on both counts, so the
+curve is not monotonic and the useful reading is empirical: **16 wins on this
+box, at this shape, twice.**
+
+Two lessons for the record environment. First, `RAYON_NUM_THREADS=32` had been
+written into it after loop99 without any launcher setting it, so loop100-107
+all ran at the default -- and the value that was recorded turns out to be the
+worst of the three. Second, this is the second time this campaign that the
+binding constraint was outside the code being optimised: the import's phases
+say nothing about what a validator does with the cores the import leaves it.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
