@@ -75,7 +75,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     provider: &Provider,
     evm_config: &Evm,
     senders_cache: Option<&reth_evm::SenderRecoveryCache>,
-    carry: &CarriedReads,
+    carry: &Arc<CarriedReads>,
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
@@ -225,25 +225,17 @@ where
         .map_err(|err| format!("post-execution: {err}"))?;
     let checks_ms = checks_at.elapsed().as_millis() as u64;
     // The carry for the next block: this block's post-state over the reads.
+    // The carry: this block's post-state over the reads, for the next block.
+    // Nothing reads it until the next import, ~650 ms away, so with
+    // `N42_CARRY_ASYNC=1` the copy of 129,000 accounts happens on the worker
+    // pool after this returns instead of while the validator waits for its
+    // answer (round 43, loop100: it was most of the 44 ms the import could not
+    // account for). A carry that is not ready in time is not a correctness
+    // problem: the next import simply reads the state provider instead.
     let carry_at = std::time::Instant::now();
-    {
-        if cached.accounts.len() > CARRY_CAP {
-            cached = CachedReads::default();
-        }
-        // 129,000 accounts copied into the next block's read cache, one insert
-        // at a time, on the path the vote waits for: the last untimed step of
-        // the import (round 43, loop100: 44 ms of a 438 ms import was in here
-        // and the spawn dispatch).
-        for (address, account) in &output.state.state {
-            match &account.info {
-                Some(info) => cached.insert_account(*address, info.clone(), Default::default()),
-                None => {
-                    cached.accounts.insert(*address, reth_revm::cached::CachedAccount { info: None, storage: Default::default() });
-                }
-            }
-        }
-        stage.at(5);
-        *carry.lock().unwrap_or_else(|p| p.into_inner()) = Some((block_hash, cached));
+    let carry_async = carry_async();
+    if !carry_async {
+        fill_carry(&mut cached, &output.state, block_hash, carry);
     }
     let carry_ms = carry_at.elapsed().as_millis() as u64;
 
@@ -289,15 +281,55 @@ where
         (both, 0, hashed?)
     };
 
+    let execution_output = Arc::new(output);
+    if carry_async {
+        let state = Arc::clone(&execution_output);
+        let carry = Arc::clone(carry);
+        rayon::spawn(move || {
+            let mut cached = cached;
+            fill_carry(&mut cached, &state.state, block_hash, &carry);
+        });
+    }
+
     Ok((
         Box::new(BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(recovered),
-            execution_output: Arc::new(output),
+            execution_output,
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         }),
         [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits, state_ms, carry_ms],
     ))
+}
+
+/// Copies a block's post-state into the read cache the next import starts
+/// from, and files it under the block's hash.
+fn fill_carry(
+    cached: &mut CachedReads,
+    bundle: &reth_revm::db::BundleState,
+    block_hash: B256,
+    carry: &CarriedReads,
+) {
+    if cached.accounts.len() > CARRY_CAP {
+        *cached = CachedReads::default();
+    }
+    for (address, account) in &bundle.state {
+        match &account.info {
+            Some(info) => cached.insert_account(*address, info.clone(), Default::default()),
+            None => {
+                cached.accounts.insert(*address, reth_revm::cached::CachedAccount { info: None, storage: Default::default() });
+            }
+        }
+    }
+    *carry.lock().unwrap_or_else(|p| p.into_inner()) = Some((block_hash, std::mem::take(cached)));
+}
+
+/// Whether the carry is filled on the worker pool after the import returns
+/// (`N42_CARRY_ASYNC=1`) instead of on the path the validator's vote waits
+/// for. Nothing reads the carry until the next block, ~650 ms later.
+fn carry_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_CARRY_ASYNC").is_ok_and(|v| v == "1"))
 }
 
 /// Whether the QMDB root and the hashed post-state run together on the worker
