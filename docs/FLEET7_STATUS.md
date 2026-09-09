@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-09 02:25 EDT)
+# Fleet7 status (living note; last updated 2026-09-09 03:10 EDT)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -118,6 +118,8 @@ shape a real chain would produce, and record what the ceiling is made of.
 | Conversion's `Result<Vec>` collect off rayon's short-circuit path | 40 -> 26 ms | (the same legs) |
 | Follower sender lookups, same fix; hashed state folded once | hashed 43 -> 26 ms on the fleet | (the same legs) |
 | `RAYON_NUM_THREADS=32` (the box has 256 logical CPUs) | every parallel phase 1.5-2x | 250k twice, the round's two best legs; adopted |
+| QMDB root and hashed post-state joined (`N42_ROOT_HASHED_PARALLEL`) | the pair 94 -> 81 ms | import 445 -> 428 with the offload; **null** on win1 (17 ms is a ninth of a block). Adopted anyway: no risk |
+| Queue and pool bookkeeping off the vote path (`N42_QUEUE_WORK_OFFLOAD`) | its worker reports 12 ms | null on win1; zero stale transactions in 63 builds, but stays opt-in |
 | Fast answer v1 (`N42_DIRECT_FAST_ANSWER=1`, answer before the engine's pass, no remembered block) | -35 ms on the path | **a loss**: 239k against 244.5k, because the engine's pass went 35 -> 102 ms (it decodes the payload again). v2 keeps the remembered block, cloned off the path; loop103 |
 
 Null knobs, measured and left off: follower sender grouping, Ed25519 batch
@@ -136,7 +138,7 @@ pinning. Never `dirty_decay_ms:-1` on this box (OOM-killed an execution layer).
 
 ## In flight
 
-**loop102** (running): the two plumbing cuts together
+**loop103** (running, builds): the two plumbing cuts together
 (`N42_ROOT_HASHED_PARALLEL=1` and `N42_QUEUE_WORK_OFFLOAD=1`), A-B-A-B.
 **loop103** (queued, builds): the fast answer's second attempt, and the first
 round to log `carry_ms`.

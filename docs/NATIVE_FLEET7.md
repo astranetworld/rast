@@ -915,6 +915,34 @@ slowest validator votes only ~19 ms after the fifth, so the fleet is balanced
 and there is no straggler left to fix; the way up is to make the *common*
 import shorter, and it has to be ~150 ms shorter to buy a block.
 
+**loop102 (02:46-03:04 EDT): two plumbing cuts, 17 ms, and the fleet cannot
+see them.** A legs ran with `N42_ROOT_HASHED_PARALLEL=1` (the QMDB root and
+the hashed post-state on the worker pool together instead of in series) and
+`N42_QUEUE_WORK_OFFLOAD=1` (the two walks of the block, the queue's
+mined-removal and the pool prune on a worker thread instead of between the
+execution and the answer); B legs with both off.
+
+    leg  cuts  win1     cycle    total    import  root  hashed
+    A1   on    244,488  0.667 s  16.95M   428     81*   -
+    B1   off   245,093  0.652 s  17.62M   445     67    27
+    A2   on    246,742  0.652 s  17.83M
+    B2   off   248,580  0.652 s  17.89M
+    (* the joined pair, reported as root with hashed zero)
+
+The import falls 445 -> 428 ms and the root-and-hashed pair 94 -> 81, so the
+join is worth ~13 ms and the offload ~12 (its worker thread reports
+`queue_ms` 12 over 130 blocks). Both are real. Both are invisible: 17 ms is
+an ninth of the 150 ms a block costs, and the legs read 244.5-248.6k either
+way, with the two B legs slightly ahead. B2's 17.89M is the campaign's second
+best round after loop98 S1's 18.17M.
+
+The offload's risk did not appear: **zero stale transactions across 63 builds**
+on both kinds of leg, so the round-38 race (a build ahead taking mined
+transactions again because the queue's removal came later) did not trigger at
+this pacing. It stays opt-in anyway -- 12 ms does not pay for a race that
+needs one unlucky interleaving to cost 87,800 transactions -- while the join,
+which has no such risk, becomes the default.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
