@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-09 07:25 EDT)
+# Fleet7 status (living note; last updated 2026-09-09 14:30 EDT)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -119,7 +119,7 @@ shape a real chain would produce, and record what the ceiling is made of.
 | Sharded twig index, bitmap retirements, chunked undo entries | apply 52 -> 22-28 ms (15-18 at 32 threads) | import 506 -> 429-446 ms, barrier -85 ms; win1 +2.5%, total +2.0% |
 | Conversion's `Result<Vec>` collect off rayon's short-circuit path | 40 -> 26 ms | (the same legs) |
 | Follower sender lookups, same fix; hashed state folded once | hashed 43 -> 26 ms on the fleet | (the same legs) |
-| `RAYON_NUM_THREADS` (the box has 256 logical CPUs and seven nodes) | every parallel phase 1.5-2x at 32 | **16 is the value**: 260,485 / 259,233 at 48 blocks against 253k at the default and 248k at 32 (loop108). The gain is outside the import -- 16's barrier is *worse*, 507 ms against 482, and its cycle shorter anyway, because the validators get the cores |
+| `RAYON_NUM_THREADS` (each node is pinned to 16 physical cores + siblings, 32 logical) | every parallel phase 1.5-2x at 32 | **16 is the value**: 260,485 / 259,233 at 48 blocks against 253k at the default (= 32 under the pin) and 248k at explicit 32 (loop108). The gain is outside the followers' import -- 16's barrier is *worse*, 507 ms against 482, and its cycle shorter anyway, because the leader's chain, which is the cycle, gets the cores (`docs/FLEET7_PLAN_V2.md`) |
 | QMDB root and hashed post-state joined (`N42_ROOT_HASHED_PARALLEL`) | the pair 94 -> 81 ms | import 445 -> 428 with the offload; **null** on win1 (17 ms is a ninth of a block). Adopted anyway: no risk |
 | Queue and pool bookkeeping off the vote path (`N42_QUEUE_WORK_OFFLOAD`) | its worker reports 12 ms | null on win1; zero stale transactions in 63 builds, but stays opt-in |
 | The carry cache filled after the answer (`N42_CARRY_ASYNC`) | 24 ms off the path | with the other two: import 456 -> 403 ms, window 1 a tie, and the round's spread widens (17.44M and 18.39M against 18.03M and 18.06M). Opt-in |
@@ -138,8 +138,8 @@ pinning. Never `dirty_decay_ms:-1` on this box (OOM-killed an execution layer).
 `F7_STRAGGLER_GRACE_MS=600` (bench defaults), `MALLOC_CONF=thp:always`,
 `N42_TX_INGEST_RECOVER_PARALLEL=20`, `N42_TX_QUEUE_RUN=64`,
 `TOKIO_WORKER_THREADS=8`, **`RAYON_NUM_THREADS=16`** (loop108: 16 beats the default by
-3% and 32 by 5%; the value must be set by the launcher -- loop100-107 silently
-ran at the default), `F7_FLOOD_ALG=ed25519`,
+3% and 32 by 5%; one thread per physical core of the node's pinned 16; the
+value must be set by the launcher -- loop100-107 silently ran at the default), `F7_FLOOD_ALG=ed25519`,
 `N42_ALTSIG_SENDER_CACHE=4194304`, `N42_ED25519_BATCH=128`, `--pertx 10000`.
 
 ## In flight
@@ -193,62 +193,32 @@ next block (the carry) and decoded twice (the conversion). A change that does
 not remove one of those passes cannot matter, and one that removes a whole
 pass is worth ~0.2-0.4 us, or 5-10%.
 
-## Next
+## Next (rewritten 2026-09-09 afternoon -- read `docs/FLEET7_PLAN_V2.md`)
 
-The rule that governs all of it: **a change must remove a whole pass over the
-block's 147,000 accounts, or it is not worth a round.** Three rounds spent 17,
-53 and 53 ms against a measurement whose resolution is 150 ms and all three
-read null. Each pass removed is worth ~0.2-0.4 us of the 4.0, so 5-10%.
+The pass-removal list that stood here was aimed at the followers' import.
+Re-reading loop108's logs from the leader's side (`scripts/fleet7-leader.py`)
+shows **the leader's chain is the cycle**: own-block import 62 ms + forkchoice
+72 + build 396 + propose + push = 570, and the leader waits 77 ms for its own
+build after holding the quorum on 48 of 49 window-1 blocks; in windows 2-4 the
+build grows to 595-680 and the wait to 174-190, which is the window-2/3
+collapse. The followers' chain is ~493 with 77 ms of slack -- every follower
+cut of rounds 95-106 landed in that slack.
 
-1. **The graft, 0.42 us.** 129,000 `BundleAccount`s inserted into one
-   `HashMap` on one thread -- 28 MB through one core at ~330 ns an account,
-   which is two cache misses per insert and nothing else. No grouping avoids
-   it (component and sender groups are within 5 ms at this shape). Two ways:
-   - **Remove the pass.** The merged `BundleState` has three consumers:
-     `sorted_operations_from_execution` (the QMDB leaves), the provider's
-     `hashed_post_state`, and the engine's executed insert. The first two can
-     take the batch bundles *separately* -- both already work per account on
-     rayon and their outputs merge as sorted vectors -- and only the engine's
-     insert needs one map, which nothing reads before the answer. Then the
-     merge happens once, off the path, instead of before two more passes.
-     Duplicate accounts across batches (~5,000 of 147,000, by birthday) need
-     resolving before the leaves are built; that is the whole difficulty.
-   - **Shard it.** `BundleState.state` is revm's `AddressMap`, which the
-     batches cannot write concurrently. A sharded bundle owned in
-     `n42-engine-types`, converted once at the boundary, trades a conversion
-     for parallelism -- only worth it if the above is not enough.
-2. **The conversion, 0.29 us.** The payload's 163,000 transactions are
-   decoded by the ingest when they arrive and decoded again when the block
-   carrying them is imported. A follower that recognised the transactions it
-   already holds -- by hash, from the ingest's own cache -- would not decode
-   them twice. This is the largest single *redundant* pass in the chain.
-3. **The hashed post-state, 0.16 us,** is keccak over the same accounts the
-   QMDB root (0.43) already hashed with blake3, and looks unused on this
-   chain's paths. **It is not: loop106 skipped it and the fleet produced zero
-   blocks, twice**, dying on the first full block with an executed block the
-   engine saw as having no receipts (`gas spent by each transaction: []`)
-   while consensus had already committed that view. The dependency is
-   somewhere in the engine's insert-and-validate path, not in the trie tables,
-   and it must be understood before this pass can go. `N42_HASHED_STATE=0`
-   reproduces it in one line.
-4. **The supply side**, once the chain passes ~330k: the ingest is ~400k/s per
-   node and all seven verify every transaction (7x redundant, ~36% of a
-   follower's CPU). Fewer verifications per node is the cheap half; a
-   de-duplicated ingest is a design, not a patch.
-5. **1,000k TPS** needs a sharded state commit and that de-duplicated ingest.
-   At 4.0 us per transaction the chain is 250k; 1,000k means 1.0 us, which
-   means the import cannot survive in its present shape -- it is 2.8 of the 4.
+Order of work (details, numbers and the judging metric per step in the plan):
 
-## Open defects and hazards
+1. Zero code: `N42_PARALLEL_BUILD_THREADS=32` under rayon 16 -- judge by
+   `build`/`waited` in `fleet7-leader.py`.
+2. **A1/A2: start the next build on the builder's own post-state the moment a
+   block is sealed**, engine import and forkchoice beside the chain, our
+   builder called directly: removes ~170 ms of plumbing from the leader's
+   chain. `waited` must go to ~0. TPS follows only down to the followers'
+   chain (~300-330k).
+3. A4: allocation profile of the *leader* in window 2 (exec 42 -> 187 ms).
+4. B1/B2: converged pools (followers' `cache_hits` is 0/163000 today) and body
+   by reference -- the followers' per-transaction work off their path.
+5. A3/B3: the graft on both sides via sharded output; the hashed post-state
+   only via a plain-state storage mode (loop106's mechanism: on `--storage.v2`
+   the hashed tables *are* the state).
 
-- Queue desync after a reorg is fixed (b6413c5af, 7c6b8ce11) but has not been
-  exercised by a real reorg on the fleet; watch for "own block at this height
-  was not the one committed ... offered again" in future logs.
-- Launcher hygiene: gate on `pgrep -fc 'n4[2] node'` (any target dir), chain
-  launchers by ALLDONE, an `F7_BIN` dir needs `examples/h2_keygen` and
-  `send_tx` too. `pkill -f` with a self-matching pattern kills the shell.
-  **Never edit a script while a leg is running** -- bash reads it
-  incrementally and the running copy hits garbage at the edit offset
-  (loop95E512a lost its end-of-round section this way).
-- `/tmp` is a 69 GB tmpfs and holds 20-34 GB of other sessions' leftovers;
-  that memory is not available to the fleet and is not reclaimable.
+Rule: cut the longer chain, judge by that chain's metric, and expect TPS to
+move only when the two chains cross.

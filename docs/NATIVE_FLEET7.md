@@ -1126,20 +1126,23 @@ assumed six nodes in seven were pre-building a full block they would discard.
 They are not -- building is already gated on leading. One leg's seven nodes
 made 161 builds for ~140 blocks, about one builder per block.
 
-Where the contention actually comes from is arithmetic: **seven nodes share
-256 cores.** At `RAYON_NUM_THREADS=32` the fleet asks for 224 rayon threads +
-56 tokio + 140 ingest recovery slots + 64 flood workers = 484 runnable threads
-on 256 cores, and rayon's default is one thread per core *per process* --
-1,792 rayon threads across the fleet. That is the whole of the offline-versus-
-fleet gap, and it means **the 4.0 us per transaction is a seven-nodes-on-one-
-box number**: a deployment with a node per machine would run each import at
-something near the offline figures (~300 ms rather than 445), which is ~325k
-rather than 250k at this shape.
+**Correction, written the same afternoon (see `docs/FLEET7_PLAN_V2.md` 1.3):**
+the paragraph that stood here attributed the contention to "seven nodes
+sharing 256 cores, 1,792 rayon threads across the fleet". That was wrong.
+Every node is pinned to 16 physical cores plus SMT siblings (`F7_PIN=1`,
+`F7_CORES_PER_NODE=32`), the flood to the last 16 cores, and rayon's default
+honours the affinity: 32 threads per node, 224 across the fleet. The
+contention is *inside* a node's 32 logical CPUs, between its own rayon pool,
+builder pool, tokio, ingest and validator. The offline-versus-fleet gap is the
+offline bench's 128 cores against a node's 16, and the "a node per machine
+would read 325k" inference is retracted; the honest statement is 260k TPS on
+seven 16-core nodes.
 
 It also exposed a gap in our own practice: `RAYON_NUM_THREADS=32` was written
 into the record environment after loop99, where its two legs were that round's
 best, **but no launcher since has set it** -- loop100 through loop107 all ran
-at rayon's default. loop108 sweeps 32, 16 and the default.
+at rayon's default, which under the pin is 32 anyway. loop108 sweeps 32, 16
+and the default.
 
 **loop108 (06:54-07:21 EDT): sixteen rayon threads a node, and a new record
 window.** Seven execution layers share 256 cores and rayon defaults to one
@@ -1159,19 +1162,24 @@ best round.
 The mechanism is not what the round was designed to test. R16a's **import is
 slower** than the default leg's -- barrier 507 ms against 482, execution 211
 against ~197 -- and its cycle is shorter anyway, 0.625 s against 0.638. The
-gain is entirely outside the execution layer: with fewer threads in the seven
-ELs, the seven validators get CPU, and the consensus half of the cycle
-(publish, receive, vote, decide) falls ~40 ms, more than paying for the
-slower import. Thirty-two is worse than the default on both counts, so the
-curve is not monotonic and the useful reading is empirical: **16 wins on this
-box, at this shape, twice.**
+gain is outside the followers' import. Re-reading the same logs from the
+leader's side (`scripts/fleet7-leader.py`, written after this round) says
+where: **the leader's chain -- own-block import 62, forkchoice 72, build 396,
+propose, push -- is the cycle, and the leader waits 77 ms for its own build
+on 48 of 49 blocks after it already holds the quorum.** Fewer rayon threads
+in the execution layer leave the node's 16 physical cores to the builder's
+own pool and the validator, and the leader's chain shortens. Thirty-two
+(which is also the default under the pin) is worse than sixteen; the useful
+reading is empirical: **16 wins on this box, at this shape, twice.** The full
+account, and the plan it forces, is `docs/FLEET7_PLAN_V2.md`.
 
 Two lessons for the record environment. First, `RAYON_NUM_THREADS=32` had been
 written into it after loop99 without any launcher setting it, so loop100-107
-all ran at the default -- and the value that was recorded turns out to be the
-worst of the three. Second, this is the second time this campaign that the
-binding constraint was outside the code being optimised: the import's phases
-say nothing about what a validator does with the cores the import leaves it.
+all ran at the default (32 under the pin) -- and that value turns out to be
+the worst of the three. Second, and larger: the binding constraint was
+outside the code being optimised. Every round since loop95 measured the
+followers' import and cut it; the leader's build was the cycle the whole
+time, and the follower cuts landed in its slack.
 
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
