@@ -164,7 +164,7 @@ pub struct OwnBlockReuse {
 pub type ForeignImport = dyn Fn(
         SealedBlock<n42_tx_types::Block>,
     ) -> Result<
-        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 8]),
+        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 9]),
         String,
     > + Send
     + Sync;
@@ -639,11 +639,15 @@ where
                     // Another node's block: executed here and handed to the
                     // engine as executed, when configured. Any failure logs
                     // and leaves the block to the engine's own path.
-                    let mut direct_ms: Option<[u64; 12]> = None;
+                    let mut direct_ms: Option<[u64; 13]> = None;
                     // The block's transaction hashes, known once the direct
                     // import converted the payload: the prune below then
                     // needs no keccak over the raw bytes.
                     let mut mined_hashes: Option<Vec<B256>> = None;
+                    // The executed block kept for the engine's own conversion when
+                    // the answer goes out before that pass.
+                    let mut remembered: Option<std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>> = None;
+                    let fast_taken = direct_fast_answer();
                     if let Some(reuse) = reuse.as_ref().filter(|r| !reused && r.import_foreign.is_some()) {
                         let import = reuse.import_foreign.clone().expect("checked");
                         let validator = reuse.validator.clone();
@@ -659,8 +663,10 @@ where
                             // payload: let it take this block instead.
                             // The engine's own conversion of the same payload takes
                             // this instead of decoding 163,000 transactions again.
-                            // With the fast answer that conversion is off the vote
-                            // path, and the clone of the whole block with it.
+                            // With the fast answer the clone moves off this path
+                            // instead: the block is remembered from the executed
+                            // block's `Arc` on a worker thread below, well before
+                            // the engine's pass runs.
                             if !fast {
                                 n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
                             }
@@ -688,6 +694,11 @@ where
                                 // by those walks, and a build ahead that starts before
                                 // the removal takes the mined transactions again
                                 // (87,800 stale ones in one build, round 38).
+                                // The block for the engine's own conversion, taken
+                                // from the executed block before it is handed over.
+                                if fast_taken {
+                                    remembered = Some(std::sync::Arc::clone(&executed.recovered_block));
+                                }
                                 let queue_offloaded = queue_work_offload();
                                 if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
                                     if queue_offloaded {
@@ -758,6 +769,7 @@ where
                                         started.elapsed().as_millis() as u64,
                                         phases[6],
                                         phases[7],
+                                        phases[8],
                                         mined_ms,
                                         insert_at.elapsed().as_millis() as u64,
                                     ]);
@@ -803,11 +815,27 @@ where
                                 total_ms = ms[7],
                                 senders_cached = ms[8],
                                 state_ms = ms[9],
-                                mined_ms = ms[10],
-                                insert_ms = ms[11],
+                                carry_ms = ms[10],
+                                mined_ms = ms[11],
+                                insert_ms = ms[12],
                                 answered_ms = answered,
                                 "direct import: answered before the engine's own pass"
                             );
+                        }
+                        // The engine's pass would otherwise decode the payload's
+                        // 163,000 transactions again (round 43, loop100: its pass
+                        // went 35 -> 102 ms without the remembered block). The
+                        // clone is made here, off the answered path, and always
+                        // finishes before the pass below reads it.
+                        if let Some(block) = remembered.take() {
+                            let hash = block.hash();
+                            let cloned = tokio::task::spawn_blocking(move || {
+                                n42_engine_types::built_executions::remember_sealed(hash, block.sealed_block().clone());
+                            })
+                            .await;
+                            if let Err(err) = cloned {
+                                warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
+                            }
                         }
                         let engine_at = std::time::Instant::now();
                         match engine.new_payload(data).await {
@@ -933,8 +961,9 @@ where
                                     total_ms = ms[7],
                                     senders_cached = ms[8],
                                     state_ms = ms[9],
-                                    mined_ms = ms[10],
-                                    insert_ms = ms[11],
+                                    carry_ms = ms[10],
+                                    mined_ms = ms[11],
+                                    insert_ms = ms[12],
                                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
                                     status = ?status.status,
                                     "direct import: executed here, handed to the engine as executed"

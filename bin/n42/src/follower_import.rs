@@ -79,7 +79,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 8]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 9]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
     Evm: ConfigureEvm<
@@ -225,10 +225,15 @@ where
         .map_err(|err| format!("post-execution: {err}"))?;
     let checks_ms = checks_at.elapsed().as_millis() as u64;
     // The carry for the next block: this block's post-state over the reads.
+    let carry_at = std::time::Instant::now();
     {
         if cached.accounts.len() > CARRY_CAP {
             cached = CachedReads::default();
         }
+        // 129,000 accounts copied into the next block's read cache, one insert
+        // at a time, on the path the vote waits for: the last untimed step of
+        // the import (round 43, loop100: 44 ms of a 438 ms import was in here
+        // and the spawn dispatch).
         for (address, account) in &output.state.state {
             match &account.info {
                 Some(info) => cached.insert_account(*address, info.clone(), Default::default()),
@@ -240,6 +245,7 @@ where
         stage.at(5);
         *carry.lock().unwrap_or_else(|p| p.into_inner()) = Some((block_hash, cached));
     }
+    let carry_ms = carry_at.elapsed().as_millis() as u64;
 
     // The QMDB root against the header's, which also files the block's tree
     // under its hash for the engine and the next block.
@@ -290,7 +296,7 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         }),
-        [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits, state_ms],
+        [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits, state_ms, carry_ms],
     ))
 }
 
