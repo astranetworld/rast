@@ -846,6 +846,44 @@ Next: loop101 sweeps the pacing (450 / 400 / 350, bookended, with the
 stragglers' grace) now that the import is 70 ms faster than when 300 ms
 pacing made every tenure handover stall.
 
+**loop100 (04:28-04:47): the fast answer, first attempt -- a loss, and it says
+why in its own log.** `N42_DIRECT_FAST_ANSWER=1` answers the validator VALID as
+soon as the direct import has executed the block and the engine has taken it
+as executed, running the engine's own `newPayload` behind the answer; the
+remembered sealed block, which exists only to make that pass's conversion
+free, was skipped with it.
+
+    leg  fast answer  win1     cycle    total
+    F1   on           216,977  0.751 s  16.63M
+    B1   off          244,488  0.667 s  17.44M
+    F2   on           239,385  0.667 s  17.13M
+    B2   off          244,489  0.667 s  17.44M
+
+The two B legs are the same number twice (244,488 and 244,489; 17.441M both),
+and they match loop99's B legs exactly -- the bench reproduces to four figures
+when the box is in the same state. Against that, both F legs lose. F1's 217k
+is a first leg after datc had held the box for 4.8 hours and should not be
+read as the size of the effect; F2's 239k against 244.5k is.
+
+The mechanism is in the fast answer's own line: **the engine's pass behind the
+answer read 102 ms, where it was 35 with the remembered block.** Skipping
+`remember_sealed` makes the engine decode the payload's 163,000 transactions
+again, so the fast answer traded 35 ms on the vote's path for ~70 ms of extra
+work per block on the node's blocking pool -- and at seven nodes all doing it,
+that is cores the ingest wanted. Second attempt (96072ad05): remember the
+block after answering, cloning it from the executed block's `Arc` on a worker
+thread, which is off the path and always finishes before the pass reads it.
+loop103 measures that.
+
+What the round also bought is the end of the import's unaccounted time. On a
+fast-answer leg: convert 49, header 4, senders 36, exec 201, checks 4, root
+68, hashed 27, **state 5, mined 3, insert 0** -- so the parent-state lookup,
+the two walks of the block for the queue, and the engine's acknowledgement are
+between them 8 ms, not the 78 they were suspected of. The remaining ~44 ms is
+the carry cache: 129,000 accounts copied into the next block's read cache, one
+insert at a time, while the validator waits for the answer. It is timed as
+`carry_ms` from 96072ad05, and nothing reads it before the next block.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

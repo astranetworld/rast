@@ -1,4 +1,4 @@
-# Fleet7 status (living note; last updated 2026-09-08 22:35)
+# Fleet7 status (living note; last updated 2026-09-09 04:50)
 
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
@@ -113,6 +113,7 @@ shape a real chain would produce, and record what the ceiling is made of.
 | Conversion's `Result<Vec>` collect off rayon's short-circuit path | 40 -> 26 ms | (the same legs) |
 | Follower sender lookups, same fix; hashed state folded once | hashed 43 -> 26 ms on the fleet | (the same legs) |
 | `RAYON_NUM_THREADS=32` (the box has 256 logical CPUs) | every parallel phase 1.5-2x | 250k twice, the round's two best legs; adopted |
+| Fast answer v1 (`N42_DIRECT_FAST_ANSWER=1`, answer before the engine's pass, no remembered block) | -35 ms on the path | **a loss**: 239k against 244.5k, because the engine's pass went 35 -> 102 ms (it decodes the payload again). v2 keeps the remembered block, cloned off the path; loop103 |
 
 Null knobs, measured and left off: follower sender grouping, Ed25519 batch
 width, 32-thread build pool, builder graft without cache inserts, MDBX
@@ -130,9 +131,17 @@ pinning. Never `dirty_decay_ms:-1` on this box (OOM-killed an execution layer).
 
 ## In flight
 
-**loop100** (running): the fast answer, F-B-F-B. **loop101** (queued): the
-pacing sweep P450/P400/P350 with the grace, now that the import is 70 ms
-faster than when 300 ms pacing made every tenure handover stall.
+**loop101** (running): the pacing sweep P450/P400/P350 with the grace, now
+that the import is 70 ms faster than when 300 ms pacing made every tenure
+handover stall. **loop102** (queued): the two plumbing cuts together
+(`N42_ROOT_HASHED_PARALLEL=1` and `N42_QUEUE_WORK_OFFLOAD=1`), A-B-A-B.
+**loop103** (queued, builds): the fast answer's second attempt, and the first
+round to log `carry_ms`.
+
+The bench reproduces to four figures when the box is in the same state:
+loop100's two B legs read 244,488 and 244,489 with identical totals, matching
+loop99's B legs. A first leg after another driver has held the box for hours
+is still not comparable (loop100 F1: 217k).
 
 **loop99** (done, see the cut table) (launcher `~/.claude/jobs/2127e0ae/tmp/run-loop99.sh`, waiting at
 its gate for eight foreign `txflood-r34` processes from another session to
