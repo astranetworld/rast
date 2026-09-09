@@ -192,38 +192,43 @@ pass is worth ~0.2-0.4 us, or 5-10%.
 
 ## Next
 
-0. **Stop cutting milliseconds.** Three rounds spent 17, 53 and 53 ms against
-   a 150 ms resolution and all read null. The next change must remove a whole
-   pass over the block's accounts, or it is not worth a round.
-1. **Read loop99.** If the barrier moves, the import is worth more cuts; if
-   not, the barrier is not the import's own latency and the next thing to
-   instrument is what the validator does between the answer and its vote.
-2. **The graft's 42 ms** is 129,000 `BundleAccount`s inserted into one
-   `HashMap` on one thread -- 28 MB moved through one core at ~330 ns an
-   account, which is two cache misses per insert and nothing else. No
-   grouping avoids it (component and sender groups are within 5 ms at this
-   shape). Two ways out, in order of appetite:
-   - **Overlap it.** The merged `BundleState` is needed by three consumers:
+The rule that governs all of it: **a change must remove a whole pass over the
+block's 147,000 accounts, or it is not worth a round.** Three rounds spent 17,
+53 and 53 ms against a measurement whose resolution is 150 ms and all three
+read null. Each pass removed is worth ~0.2-0.4 us of the 4.0, so 5-10%.
+
+1. **The graft, 0.42 us.** 129,000 `BundleAccount`s inserted into one
+   `HashMap` on one thread -- 28 MB through one core at ~330 ns an account,
+   which is two cache misses per insert and nothing else. No grouping avoids
+   it (component and sender groups are within 5 ms at this shape). Two ways:
+   - **Remove the pass.** The merged `BundleState` has three consumers:
      `sorted_operations_from_execution` (the QMDB leaves), the provider's
      `hashed_post_state`, and the engine's executed insert. The first two can
      take the batch bundles *separately* -- both already work per account on
-     rayon, and their outputs merge as sorted vectors, which is cheap. Only
-     the engine's insert needs one map, and it is not read until the answer
-     is given. So: compute the operations and the hashed state from the
-     batch bundles while a worker thread builds the merged map, and join
-     before the insert. That hides 42 ms behind the 63 ms root instead of
-     spending it in series.
-   - **Shard it.** `BundleState.state` is revm's `AddressMap`; the batches
-     cannot write it concurrently. Owning a sharded bundle type in
-     `n42-engine-types` and converting once at the boundary trades the
-     conversion for parallelism, and is only worth it if the overlap above
-     is not enough.
-3. **The supply side**, once the chain passes ~330k: the ingest is ~400k/s
-   per node and every node verifies every transaction (7x redundant). The
-   cheap half is fewer verifications per node; the expensive half is a
-   de-duplicated ingest, which is a design, not a patch.
-4. **1,000k TPS** needs a sharded state commit and that de-duplicated
-   ingest. Separate design work, not a knob.
+     rayon and their outputs merge as sorted vectors -- and only the engine's
+     insert needs one map, which nothing reads before the answer. Then the
+     merge happens once, off the path, instead of before two more passes.
+     Duplicate accounts across batches (~5,000 of 147,000, by birthday) need
+     resolving before the leaves are built; that is the whole difficulty.
+   - **Shard it.** `BundleState.state` is revm's `AddressMap`, which the
+     batches cannot write concurrently. A sharded bundle owned in
+     `n42-engine-types`, converted once at the boundary, trades a conversion
+     for parallelism -- only worth it if the above is not enough.
+2. **The conversion, 0.29 us.** The payload's 163,000 transactions are
+   decoded by the ingest when they arrive and decoded again when the block
+   carrying them is imported. A follower that recognised the transactions it
+   already holds -- by hash, from the ingest's own cache -- would not decode
+   them twice. This is the largest single *redundant* pass in the chain.
+3. **The hashed post-state, 0.16 us,** is keccak over the same accounts the
+   QMDB root (0.43) already hashed with blake3. One walk that produces both
+   would remove a pass outright.
+4. **The supply side**, once the chain passes ~330k: the ingest is ~400k/s per
+   node and all seven verify every transaction (7x redundant, ~36% of a
+   follower's CPU). Fewer verifications per node is the cheap half; a
+   de-duplicated ingest is a design, not a patch.
+5. **1,000k TPS** needs a sharded state commit and that de-duplicated ingest.
+   At 4.0 us per transaction the chain is 250k; 1,000k means 1.0 us, which
+   means the import cannot survive in its present shape -- it is 2.8 of the 4.
 
 ## Open defects and hazards
 
