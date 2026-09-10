@@ -152,6 +152,13 @@ struct AheadBuild {
 }
 
 impl AheadBuild {
+    /// Whether this build is for a later block than `attrs` asks for. The
+    /// chain's attributes carry the block's number as `slot_number`, so two
+    /// requests compare without either block being known here.
+    fn is_newer_than(&self, attrs: &PayloadAttributes) -> bool {
+        matches!((self.attrs.slot_number, attrs.slot_number), (Some(mine), Some(theirs)) if mine > theirs)
+    }
+
     fn covers(&self, parent: B256, attrs: &PayloadAttributes) -> bool {
         self.parent == parent
             && self.attrs == *attrs
@@ -294,6 +301,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         if self.prepared.as_ref().is_some_and(|ahead| ahead.covers(parent, &attrs)) {
             return Ok(());
         }
+        if self.prepared.as_ref().is_some_and(|ahead| ahead.is_newer_than(&attrs)) {
+            // A request for a parent older than the build already prepared:
+            // the own import of block N completing after N+1 was sealed and
+            // its build started (loop116 S2: a hand-off held 491 ms by a QMDB
+            // checkpoint). Replacing the build would abort N+2's, and the
+            // forkchoice to N that started the replacement made reth unwind
+            // N+1 as a reorg -- 11 s on the engine, the validator's request
+            // timing out, the chain forking on the rebuilt block.
+            info!(target: "n42.h2.el", ?parent, "a build ahead is already prepared on a newer parent; the request is stale");
+            return Ok(());
+        }
         if let Some(stale) = self.prepared.take() {
             stale.task.abort();
         }
@@ -352,6 +370,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         attrs: PayloadAttributes,
     ) -> Result<(), ElError> {
         if self.prepared.as_ref().is_some_and(|ahead| ahead.covers(parent, &attrs)) {
+            return Ok(());
+        }
+        if self.prepared.as_ref().is_some_and(|ahead| ahead.is_newer_than(&attrs)) {
+            info!(target: "n42.h2.el", ?parent, "a build ahead is already prepared on a newer parent; the request is stale");
             return Ok(());
         }
         if let Some(stale) = self.prepared.take() {
