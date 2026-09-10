@@ -99,12 +99,18 @@ impl ForestSnapshot {
         // A delta is only meaningful on the state it was taken against. Applying
         // one to a different base would produce a tree that is neither the base
         // nor the head, and whose root would be wrong in a way nothing downstream
-        // could attribute.
-        if delta.base_next_slot != self.tree.next_slot {
+        // could attribute. A base *below* the cursor is a rewind (a branch
+        // switch that reverted persisted appends): the slots above it are
+        // dropped and re-appended from the delta.
+        if delta.base_next_slot > self.tree.next_slot {
             return Err(StateError::DeltaBase {
                 expected: self.tree.next_slot,
                 found: delta.base_next_slot,
             });
+        }
+        if delta.base_next_slot < self.tree.next_slot {
+            self.tree.entries.truncate(delta.base_next_slot as usize);
+            self.tree.next_slot = delta.base_next_slot;
         }
         // Everything is checked before anything is written. A delta that fails
         // halfway leaves a snapshot that is neither state, and a caller holding
@@ -121,8 +127,8 @@ impl ForestSnapshot {
                 return Err(StateError::DeltaSlot(*slot));
             }
         }
-        for (slot, entry) in &delta.changed {
-            self.tree.entries[*slot as usize] = entry.clone();
+        for (slot, active) in &delta.changed {
+            self.tree.entries[*slot as usize].active = *active;
         }
         self.tree.entries.extend(delta.appended.iter().cloned());
         self.tree.next_slot = delta.next_slot;
@@ -153,21 +159,23 @@ pub struct ForestDelta {
     pub next_slot: u64,
     /// Slots `base_next_slot..next_slot`, in order.
     pub appended: Vec<QmdbEntrySnapshot>,
-    /// Slots below `base_next_slot` whose entry differs afterwards — in
-    /// practice the ones the moved blocks deactivated or revived.
-    pub changed: Vec<(u64, QmdbEntrySnapshot)>,
+    /// Slots below `base_next_slot` whose active flag differs afterwards --
+    /// the ones the moved blocks deactivated or revived -- with the flag. A
+    /// slot's content never changes after its append, so this is all a
+    /// delta has to say about it (version 2; version 1 carried the entry,
+    /// which cost 133,000 random reads of the retired slots a block).
+    pub changed: Vec<(u64, bool)>,
 }
 
 impl ForestDelta {
     /// The layout this crate writes.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 
     /// Roughly what this costs to store, for a caller deciding when a run of
     /// deltas has grown longer than the checkpoint it is replacing.
     pub fn weight(&self) -> usize {
         let entry = |e: &QmdbEntrySnapshot| e.value.len() + 33;
-        self.appended.iter().map(entry).sum::<usize>()
-            + self.changed.iter().map(|(_, e)| entry(e) + 8).sum::<usize>()
+        self.appended.iter().map(entry).sum::<usize>() + self.changed.len() * 9
     }
 }
 
@@ -455,14 +463,16 @@ impl QmdbForest {
             .into_par_iter()
             .map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree"))
             .collect();
-        let changed: Vec<(u64, QmdbEntrySnapshot)> = undo
+        // The block only ever deactivates the slots its undo names (a
+        // revival is a move, not a block), so no read: the flag is false.
+        let changed: Vec<(u64, bool)> = undo
             .entries
             .iter()
             .map(|entry| entry.slot)
             .filter(|slot| *slot < base_next_slot)
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter_map(|slot| tree.entry_at(slot).map(|entry| (slot, entry)))
+            .map(|slot| (slot, false))
             .collect();
         ForestDelta {
             version: ForestDelta::VERSION,
@@ -632,25 +642,22 @@ impl QmdbForest {
                 found: base_next_slot,
             });
         }
-        let appended = (base_next_slot..next_slot)
+        // Every slot the cursor was rewound past and then re-appended over
+        // has new content: the delta's base drops to the low-water mark and
+        // those slots travel as appends (the replay truncates to the base
+        // first). Below that, the slots a move flipped travel as flags.
+        let base = self.min_cursor.min(base_next_slot);
+        let appended = (base..next_slot)
             .map(|slot| self.tree.entry_at(slot).ok_or(StateError::DeltaSlot(slot)))
             .collect::<Result<Vec<_>, _>>()?;
-        // What lies below the base and may differ from it: the slots a move
-        // flipped, plus every slot the cursor was rewound past and then
-        // re-appended over. Slots above the base need no entry here — they are
-        // already carried by `appended`, at their current value.
-        let rewound_from = self.min_cursor.min(base_next_slot);
         let changed = self
             .dirty_slots
             .iter()
             .copied()
-            .filter(|slot| *slot < base_next_slot)
-            .chain(rewound_from..base_next_slot)
+            .filter(|slot| *slot < base)
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .map(|slot| {
-                self.tree.entry_at(slot).map(|entry| (slot, entry)).ok_or(StateError::DeltaSlot(slot))
-            })
+            .map(|slot| self.tree.slot_active(slot).map(|active| (slot, active)).ok_or(StateError::DeltaSlot(slot)))
             .collect::<Result<Vec<_>, _>>()?;
         self.dirty_slots.clear();
         self.min_cursor = next_slot;
@@ -658,7 +665,7 @@ impl QmdbForest {
             version: ForestDelta::VERSION,
             head_number: self.head.0,
             head_hash: head,
-            base_next_slot,
+            base_next_slot: base,
             next_slot,
             appended,
             changed,

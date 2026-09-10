@@ -1017,8 +1017,14 @@ pub struct UndoEntry {
 pub struct BlockUndo {
     /// The append cursor before the block's operations.
     pub prev_next_slot: u64,
-    /// The slots the block deactivated, with what they held.
+    /// The slots the block deactivated, with what they held -- or, when
+    /// `slots_only`, just the slots: a tree whose entries live in the file
+    /// reads a retired slot's key at revival, the only time it is needed,
+    /// instead of 133,000 random reads on every block (loop123).
     pub entries: Vec<UndoEntry>,
+    /// `entries` carry slots only (key and value left empty).
+    #[serde(default)]
+    pub slots_only: bool,
     /// `appended_keys[i]` is the key appended at slot `prev_next_slot + i`.
     /// Not needed to revert an in-memory tree, whose entries are always
     /// readable; carried so the record is self-describing, as gov5's is.
@@ -1335,7 +1341,14 @@ impl QmdbCompatTree {
             prev_next_slot: self.next_slot,
             entries: Vec::new(),
             appended_keys: Vec::new(),
+            slots_only: self.entries.file_path().is_some(),
         });
+    }
+
+    /// Whether `slot` is live, `None` past the cursor.
+    pub fn slot_active(&self, slot: u64) -> Option<bool> {
+        let slot = usize::try_from(slot).ok()?;
+        (slot < self.entries.len()).then(|| self.entries.is_active(slot))
     }
 
     /// Ends the capture and returns the block's record, or `None` if recording
@@ -1391,10 +1404,22 @@ impl QmdbCompatTree {
         }
         // Revivals below the cursor must name what the slot actually holds:
         // a record from another history would otherwise revive the wrong key.
-        for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
-            let slot = entry.slot as usize;
-            if self.entries.key(slot) != entry.key || self.entries.value(slot) != entry.value.as_slice() {
-                return Err(QmdbUndoError::EntryMismatch { slot: entry.slot });
+        if undo.slots_only {
+            // No content to compare; the record's appended keys bind it to
+            // this history instead: every slot it says the block appended
+            // must hold that key.
+            for (i, key) in undo.appended_keys.iter().enumerate() {
+                let slot = prev + i as u64;
+                if slot >= self.next_slot || self.entries.key(slot as usize) != *key {
+                    return Err(QmdbUndoError::EntryMismatch { slot });
+                }
+            }
+        } else {
+            for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
+                let slot = entry.slot as usize;
+                if self.entries.key(slot) != entry.key || self.entries.value(slot) != entry.value.as_slice() {
+                    return Err(QmdbUndoError::EntryMismatch { slot: entry.slot });
+                }
             }
         }
 
@@ -1434,8 +1459,9 @@ impl QmdbCompatTree {
         //    the truncation.
         for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
             let slot = entry.slot;
+            let key = if undo.slots_only { self.entries.key(slot as usize) } else { entry.key };
             self.entries.set_active(slot as usize, true);
-            self.index.insert(entry.key, slot);
+            self.index.insert(key, slot);
             let twig_id = (slot as usize) / TWIG_SIZE;
             let local = (slot as usize) % TWIG_SIZE;
             self.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
@@ -1450,16 +1476,16 @@ impl QmdbCompatTree {
 
     /// Captures a slot's pre-deactivation state into the active record.
     fn record_deactivation(&mut self, slot: u64) {
-        if self.recording.is_none() {
-            return;
-        }
-        let entry = self.entries.entry(slot as usize);
+        let slots_only = match self.recording.as_ref() {
+            Some(record) => record.slots_only,
+            None => return,
+        };
+        let entry = if slots_only { UndoEntry { slot, key: NULL_HASH, value: Vec::new() } } else {
+            let e = self.entries.entry(slot as usize);
+            UndoEntry { slot, key: e.key, value: e.value }
+        };
         if let Some(record) = self.recording.as_mut() {
-            record.entries.push(UndoEntry {
-                slot,
-                key: entry.key,
-                value: entry.value,
-            });
+            record.entries.push(entry);
         }
     }
 
@@ -1516,8 +1542,12 @@ impl QmdbCompatTree {
         let at = std::time::Instant::now();
         // The undo record's entries -- what every retired slot held -- built
         // on the worker pool rather than cloned one at a time in the loop.
-        if self.recording.is_some() {
-            let retired = undo_entries(&self.entries, &held);
+        if let Some(slots_only) = self.recording.as_ref().map(|record| record.slots_only) {
+            let retired = if slots_only {
+                held.iter().flatten().map(|slot| UndoEntry { slot: *slot, key: NULL_HASH, value: Vec::new() }).collect()
+            } else {
+                undo_entries(&self.entries, &held)
+            };
             if let Some(record) = self.recording.as_mut() {
                 record.entries.extend(retired);
             }

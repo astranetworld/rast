@@ -508,19 +508,36 @@ mod tests {
             let (root_h, undo_h) = heap.apply_sorted_ops_recorded(ops.clone()).unwrap();
             let (root_f, undo_f) = file.apply_sorted_ops_recorded(ops).unwrap();
             assert_eq!(root_h, root_f, "block {b}");
-            assert_eq!(undo_h, undo_f, "undo of block {b}");
+            // The file tree's record names the same slots but carries no
+            // content (it reads a key at revival instead).
+            assert!(undo_f.slots_only && !undo_h.slots_only);
+            assert_eq!(undo_h.prev_next_slot, undo_f.prev_next_slot);
+            assert_eq!(undo_h.appended_keys, undo_f.appended_keys);
+            assert_eq!(
+                undo_h.entries.iter().map(|e| e.slot).collect::<Vec<_>>(),
+                undo_f.entries.iter().map(|e| e.slot).collect::<Vec<_>>(),
+                "retired slots of block {b}"
+            );
             assert_eq!(heap.snapshot(), file.snapshot(), "snapshot after block {b}");
             undos.push(undo_f);
         }
         assert_eq!(heap.get(&key(1234)), file.get(&key(1234)));
         assert_eq!(heap.prove(&key(1234)), file.prove(&key(1234)));
-        // Revert the last three blocks on both, newest first.
+        // Revert the last three blocks on both, newest first -- the file
+        // tree from its slot-only records, the heap tree from the same
+        // records (a heap tree revives from a slot-only record by reading
+        // the key too).
         for undo in undos.iter().rev().take(3) {
             heap.apply_undo(undo).unwrap();
             file.apply_undo(undo).unwrap();
             assert_eq!(heap.root(), file.root());
             assert_eq!(heap.next_slot(), file.next_slot());
         }
+        // A slot-only record from another history is refused: its appended
+        // keys are not what the slots hold.
+        let mut foreign = undos[5].clone();
+        foreign.prev_next_slot = file.next_slot() - foreign.appended_keys.len() as u64;
+        assert!(file.apply_undo(&foreign).is_err());
         assert_eq!(heap.snapshot(), file.snapshot(), "after the reverts");
         // A different block on the reverted state, then the file's clone
         // reads the same state.
