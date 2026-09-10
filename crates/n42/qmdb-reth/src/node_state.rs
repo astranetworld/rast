@@ -149,6 +149,10 @@ struct Inner {
 /// The delta log's position, as the node last left it.
 #[derive(Debug, Default, Clone, Copy)]
 struct PersistCursor {
+    /// The block the checkpoint plus the log currently stand at, so a
+    /// block's own delta (captured when it was computed) can be used when
+    /// it is that block's child.
+    head: B256,
     /// The append cursor the checkpoint plus the log currently describe.
     next_slot: u64,
     /// Bytes of `forest.log` that belong to that description. A restart that
@@ -274,6 +278,7 @@ impl QmdbNodeState {
                     });
                 }
                 *cursor = PersistCursor {
+                    head: snapshot.head_hash,
                     next_slot: snapshot.tree.next_slot,
                     log_len,
                     checkpoint_len,
@@ -302,6 +307,7 @@ impl QmdbNodeState {
                 // delta to be measured against.
                 let _ = std::fs::remove_file(&log_path);
                 *cursor = PersistCursor {
+                    head: forest.head().1,
                     next_slot: forest.next_slot(),
                     log_len: 0,
                     checkpoint_len: 0,
@@ -359,6 +365,7 @@ impl QmdbNodeState {
         // which is safe but reads as corruption; removing it is the truth.
         let _ = std::fs::remove_file(self.delta_log_path());
         *cursor = PersistCursor {
+            head: snapshot.head_hash,
             next_slot: snapshot.tree.next_slot,
             log_len: 0,
             checkpoint_len,
@@ -516,6 +523,41 @@ impl QmdbNodeState {
         if cursor.checkpoint_len == 0 {
             return self.checkpoint(block_hash, &mut cursor);
         }
+        // The block's own delta from its parent, captured when it was
+        // computed, when the persisted state is its parent (or an ancestor
+        // whose every step is held): nothing here moves the tree, which may
+        // stand at the next block's build by now. Otherwise -- a branch switch,
+        // a restored forest, a block whose delta went by the other path -- the
+        // difference is measured by standing the tree at the head as before.
+        let ready = self.with_forest(|forest| {
+            forest.set_canonical(block_hash)?;
+            Ok(forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash))
+        })?;
+        if let Some(deltas) = ready {
+            for delta in &deltas {
+                let written = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
+                cursor.next_slot = delta.next_slot;
+                cursor.log_len = written;
+                debug!(
+                    target: "n42.qmdb",
+                    block = delta.head_number, block_hash = %delta.head_hash,
+                    appended = delta.appended.len(), changed = delta.changed.len(),
+                    "persisted a QMDB block from its own delta",
+                );
+            }
+            cursor.head = block_hash;
+            // The tree's move bookkeeping describes changes since the last
+            // measured delta; what these deltas carried is measured now, and
+            // any move that follows records itself afresh.
+            self.with_forest(|forest| {
+                forest.forget_changes();
+                Ok(())
+            })?;
+            if cursor.log_len >= cursor.checkpoint_len && cursor.log_len >= MIN_LOG_BEFORE_CHECKPOINT {
+                return self.checkpoint(block_hash, &mut cursor);
+            }
+            return Ok(());
+        }
         let delta = self.with_forest(|forest| {
             forest.set_canonical(block_hash)?;
             forest.delta_since(cursor.next_slot)
@@ -528,6 +570,7 @@ impl QmdbNodeState {
             return self.checkpoint(block_hash, &mut cursor);
         }
         let written = append_delta(&self.delta_log_path(), cursor.log_len, &delta)?;
+        cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
         cursor.log_len = written;
         debug!(
@@ -560,6 +603,7 @@ impl QmdbNodeState {
         // that is merely redundant rather than a state with neither.
         let _ = std::fs::remove_file(self.delta_log_path());
         *cursor = PersistCursor {
+            head: block_hash,
             next_slot: snapshot.tree.next_slot,
             log_len: 0,
             checkpoint_len: len,

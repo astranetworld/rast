@@ -11,6 +11,7 @@ description = "QMDB state commitment: the twig-forest root that is a gov5 block'
 
 [dependencies]
 n42-twig-core = { workspace = true, features = ["rayon"] }
+rayon = { workspace = true }
 alloy-genesis.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }

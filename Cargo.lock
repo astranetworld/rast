@@ -8257,6 +8257,7 @@ dependencies = [
  "alloy-primitives 1.7.1",
  "hex",
  "n42-twig-core",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

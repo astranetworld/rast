@@ -49,6 +49,9 @@ pub struct PreparedBlock {
     pub root: B256,
     parent: B256,
     ops: Vec<QmdbOperation>,
+    /// The block's delta from its parent (see `BlockRecord::delta`); its head
+    /// fields are filled in when the block is filed under its hash.
+    delta: Option<ForestDelta>,
 }
 
 impl PreparedBlock {
@@ -180,6 +183,11 @@ struct BlockRecord {
     root: B256,
     /// Present exactly while the block is applied on the tree's current path.
     undo: Option<BlockUndo>,
+    /// What the block changed against its parent, captured the moment it was
+    /// computed, so persisting it never has to stand the tree at it. Taken by
+    /// the first persistence that uses it; `None` for a restored head and for
+    /// a block persisted already.
+    delta: Option<ForestDelta>,
 }
 
 /// Trees for recent blocks, keyed by block hash, over one shared tree.
@@ -257,6 +265,7 @@ impl QmdbForest {
                 ops: Vec::new(),
                 root,
                 undo: None,
+                delta: None,
             },
         );
         Self {
@@ -327,7 +336,10 @@ impl QmdbForest {
             // A different root under that hash is a block this is not.
             return if existing == from_root { Ok(()) } else { Err(StateError::UnknownBlock(to)) };
         }
-        let record = self.records.remove(&from).ok_or(StateError::UnknownBlock(from))?;
+        let mut record = self.records.remove(&from).ok_or(StateError::UnknownBlock(from))?;
+        if let Some(delta) = record.delta.as_mut() {
+            delta.head_hash = to;
+        }
         self.records.insert(to, record);
         // Every reference to the old hash follows it: the tip the tree stands
         // at, the canonical head, the parent of pending work, and the parent
@@ -384,11 +396,13 @@ impl QmdbForest {
         let ops = changes.operations();
         let (root, undo) = self.tree.apply_sorted_ops_recorded(ops.clone())?;
         self.note_move(&undo);
+        let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
         Ok(PreparedBlock {
             root: B256::from(root),
             parent,
             ops,
+            delta: Some(delta),
         })
     }
 
@@ -402,12 +416,85 @@ impl QmdbForest {
         self.move_to(parent)?;
         let (root, undo) = self.tree.apply_sorted_ops_recorded(ops.clone())?;
         self.note_move(&undo);
+        let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
         Ok(PreparedBlock {
             root: B256::from(root),
             parent,
             ops,
+            delta: Some(delta),
         })
+    }
+
+    /// The delta from the parent to the block just applied on the tree, read
+    /// while the tree stands at it: the slots the block appended, and the
+    /// slots below its parent's cursor it deactivated or revived (the ones
+    /// its undo names). The head fields are filled in when the block is filed.
+    ///
+    /// Captured here, and not when the block is persisted, so that persisting
+    /// a block never has to stand the tree at it: the tree can be several
+    /// blocks past it by then (the next block's build, or the next block),
+    /// and moving it back and forth was 50-200 ms of every block on both the
+    /// build's and the hand-off's side of the forest's one lock (loop114).
+    fn delta_of_applied(&self, undo: &BlockUndo) -> ForestDelta {
+        use rayon::prelude::*;
+        let base_next_slot = undo.prev_next_slot;
+        let next_slot = self.tree.next_slot();
+        let tree = &self.tree;
+        let appended: Vec<QmdbEntrySnapshot> = (base_next_slot..next_slot)
+            .into_par_iter()
+            .map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree"))
+            .collect();
+        let changed: Vec<(u64, QmdbEntrySnapshot)> = undo
+            .entries
+            .iter()
+            .map(|entry| entry.slot)
+            .filter(|slot| *slot < base_next_slot)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|slot| tree.entry_at(slot).map(|entry| (slot, entry)))
+            .collect();
+        ForestDelta {
+            version: ForestDelta::VERSION,
+            head_number: 0,
+            head_hash: B256::ZERO,
+            base_next_slot,
+            next_slot,
+            appended,
+            changed,
+        }
+    }
+
+    /// The deltas that take the persisted state at `persisted_head` (whose
+    /// cursor is `persisted_next_slot`) to `block`, oldest first, taken out of
+    /// the records; `None` when the chain between the two is not held whole
+    /// with a delta at every step -- a branch switch, a restored forest, a
+    /// block persisted by the other path -- and the caller measures the
+    /// difference by standing the tree at the head instead. Nothing is taken
+    /// unless the whole chain qualifies.
+    pub fn take_block_deltas(&mut self, persisted_head: B256, persisted_next_slot: u64, block: B256) -> Option<Vec<ForestDelta>> {
+        let mut chain = Vec::new();
+        let mut current = block;
+        while current != persisted_head {
+            let record = self.records.get(&current)?;
+            record.delta.as_ref()?;
+            chain.push(current);
+            current = record.parent;
+        }
+        chain.reverse();
+        let mut deltas = Vec::with_capacity(chain.len());
+        let mut cursor = persisted_next_slot;
+        for hash in &chain {
+            let delta = self.records.get(hash)?.delta.as_ref()?;
+            if delta.base_next_slot != cursor {
+                return None;
+            }
+            cursor = delta.next_slot;
+        }
+        for hash in &chain {
+            deltas.push(self.records.get_mut(hash)?.delta.take()?);
+        }
+        Some(deltas)
     }
 
     /// Files a computed block under the hash it turned out to have.
@@ -431,6 +518,11 @@ impl QmdbForest {
             None => None,
         };
         let applied = undo.is_some();
+        let delta = prepared.delta.map(|mut delta| {
+            delta.head_number = number;
+            delta.head_hash = block_hash;
+            delta
+        });
         self.records.insert(
             block_hash,
             BlockRecord {
@@ -439,6 +531,7 @@ impl QmdbForest {
                 ops: prepared.ops,
                 root: prepared.root,
                 undo,
+                delta,
             },
         );
         if applied {
@@ -478,9 +571,17 @@ impl QmdbForest {
             .get(&block_hash)
             .ok_or(StateError::UnknownBlock(block_hash))?
             .number;
-        // Stand the tree at the head before pruning: once records below the
-        // window are gone, nothing can be walked through them.
-        self.move_to(block_hash)?;
+        // Stand the tree at the head before pruning -- once records below the
+        // window are gone, nothing can be walked through them -- unless it
+        // already stands on a path through the head: at the head itself, or
+        // at a descendant (the next block, or the next block's build, which
+        // is where it is on a producer). Moving it back would revert that
+        // work only for the next computation to replay it (loop114: 50-200 ms
+        // on both sides of the lock, every block), and nothing here reads the
+        // tree; the head's own delta was captured when it was computed.
+        if !self.ancestry(self.tip).contains(&block_hash) {
+            self.move_to(block_hash)?;
+        }
         self.head = (number, block_hash);
         let cutoff = number.saturating_sub(self.retain_depth);
         self.records
@@ -868,6 +969,86 @@ mod tests {
         let direct = forest.snapshot().unwrap();
         assert_eq!(replayed.tree, direct.tree);
         assert_eq!(QmdbForest::from_snapshot(&replayed).unwrap().root(), forest.root());
+    }
+
+    /// Persisting a block by its own delta: the deltas captured at each
+    /// block's computation, applied in order to a checkpoint, are the same
+    /// tree as the one the forest stands at -- and taking them never moved
+    /// the tree, which stood at the next block's pending work throughout.
+    #[test]
+    fn per_block_deltas_replay_to_the_same_tree_without_moving_it() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let mut replayed = forest.snapshot().unwrap();
+        let mut persisted = (GENESIS, forest.next_slot());
+
+        let mut parent = GENESIS;
+        for number in 1..=40u8 {
+            let hash = h(number);
+            // The block, then the next block's build left pending on top of it
+            // (a producer's shape), then the block goes canonical.
+            forest.apply(parent, hash, number as u64, &changes(number % 7)).unwrap();
+            let _next = forest.compute(hash, &changes(0xE0 + number % 5)).unwrap();
+            forest.set_canonical(hash).unwrap();
+            assert_eq!(forest.tip(), hash, "the pending build on top of the head is left where it is");
+            assert!(forest.pending.is_some(), "and not reverted by the head's persistence");
+            let deltas = forest.take_block_deltas(persisted.0, persisted.1, hash).expect("a chain of one");
+            assert_eq!(deltas.len(), 1);
+            assert_eq!((deltas[0].head_number, deltas[0].head_hash), (number as u64, hash));
+            replayed.apply_delta(&deltas[0]).unwrap();
+            persisted = (hash, deltas[0].next_slot);
+            parent = hash;
+        }
+
+        let direct = forest.snapshot().unwrap();
+        assert_eq!(replayed.tree, direct.tree, "the per-block deltas describe the written tree");
+        assert_eq!(QmdbForest::from_snapshot(&replayed).unwrap().root(), forest.root());
+    }
+
+    /// Several blocks at once (persistence runs behind the chain), and a
+    /// block filed under a builder's hash then renamed: the chain of deltas
+    /// is taken oldest first, each carries the hash it was filed under, and
+    /// a second take finds nothing -- the deltas are consumed.
+    #[test]
+    fn a_chain_of_block_deltas_is_taken_once_oldest_first() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let mut replayed = forest.snapshot().unwrap();
+        let start = forest.next_slot();
+        let built = forest.compute(GENESIS, &changes(1)).unwrap();
+        forest.insert(h(0x1B), 1, built).unwrap();
+        forest.rename(h(0x1B), h(0x1A)).unwrap();
+        forest.apply(h(0x1A), h(0x2A), 2, &changes(2)).unwrap();
+        forest.apply(h(0x2A), h(0x3A), 3, &changes(1)).unwrap();
+        forest.set_canonical(h(0x3A)).unwrap();
+        let deltas = forest.take_block_deltas(GENESIS, start, h(0x3A)).expect("three held steps");
+        assert_eq!(deltas.iter().map(|d| d.head_hash).collect::<Vec<_>>(), vec![h(0x1A), h(0x2A), h(0x3A)]);
+        for delta in &deltas {
+            replayed.apply_delta(delta).unwrap();
+        }
+        assert_eq!(replayed.tree, forest.snapshot().unwrap().tree);
+        assert!(forest.take_block_deltas(GENESIS, start, h(0x3A)).is_none(), "taken deltas are gone");
+        assert!(matches!(forest.take_block_deltas(h(0x3A), replayed.tree.next_slot, h(0x3A)), Some(v) if v.is_empty()), "nothing to do at the persisted head");
+    }
+
+    /// A branch switch has no chain of deltas from the persisted head (the
+    /// new head's parent is not what was persisted): the caller falls back to
+    /// measuring the difference, which still carries the revert.
+    #[test]
+    fn a_branch_switch_has_no_chain_of_deltas_and_the_measured_delta_still_works() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let mut replayed = forest.snapshot().unwrap();
+        let start = forest.next_slot();
+        forest.apply(GENESIS, h(0x0A), 1, &changes(1)).unwrap();
+        forest.set_canonical(h(0x0A)).unwrap();
+        let first = forest.take_block_deltas(GENESIS, start, h(0x0A)).unwrap();
+        replayed.apply_delta(&first[0]).unwrap();
+        forest.forget_changes();
+        forest.apply(GENESIS, h(0x0B), 1, &changes(2)).unwrap();
+        forest.apply(h(0x0B), h(0xB2), 2, &changes(3)).unwrap();
+        forest.set_canonical(h(0xB2)).unwrap();
+        assert!(forest.take_block_deltas(h(0x0A), first[0].next_slot, h(0xB2)).is_none(), "B2's chain does not pass through A");
+        let measured = forest.delta_since(first[0].next_slot).unwrap();
+        replayed.apply_delta(&measured).unwrap();
+        assert_eq!(replayed.tree, forest.snapshot().unwrap().tree);
     }
 
     /// A delta is refused by the state it does not describe. Applying one to
