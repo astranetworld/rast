@@ -721,6 +721,20 @@ fn submit(
     }
 }
 
+/// The same funding batch to every other node's RPC. Without transaction
+/// gossip (`F7_NO_TX_GOSSIP=1`) a pool holds only what was sent to it, and a
+/// leader tenure longer than the funding wait never mines funding sent to
+/// the first node alone (loop118 T1: tenure 64, node1 then node2 led for
+/// 29 s each and node0's turn came at view 448, after the 120 s). A node
+/// that mines the batch prunes the copies the others hold when the block
+/// lands; the counts stay the first node's.
+fn fund_others(client: &reqwest::blocking::Client, args: &Args, batch: &[String]) {
+    let (sent, rejected) = (AtomicU64::new(0), AtomicU64::new(0));
+    for rpc in args.rpcs.iter().skip(1) {
+        let _ = submit(client, rpc, batch, &sent, &rejected);
+    }
+}
+
 /// One transfer per sender from the faucet, enough to cover every transaction
 /// the flood will ask of it plus its own gas.
 fn fund(
@@ -785,11 +799,13 @@ fn fund(
             // Funding is one nonce sequence from the faucet and it either goes
             // in or the round is over; the prefix count is for the flood.
             let _ = submit(client, rpc, &batch, &sent, &rejected);
+            fund_others(client, args, &batch);
             batch.clear();
         }
     }
     if !batch.is_empty() {
         let _ = submit(client, rpc, &batch, &sent, &rejected);
+        fund_others(client, args, &batch);
     }
     println!(
         "funding      : {} submitted, {} rejected, {:.1}s",
