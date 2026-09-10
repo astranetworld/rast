@@ -120,7 +120,21 @@ stay under ~40 GB, and windows 2-3, which lose 30-35% to page-cache reclaim toda
 read within a few blocks of window 1. Judge by `fleet7-windows.py`'s MemAvailable and major
 faults per window on a D-A-D-A round, then by windows 2-3.
 
-## 7. Implementation order
+## 7. Status (2026-09-10 evening)
+
+- Step 1 done (`056c6a235`): `Entries::{Heap, File}`; `N42_QMDB_ENTRY_FILE=1`. loop123: the
+  fleet's anonymous memory peaks 15-20 GB lower, window 2's major faults fall by half to three
+  quarters, and both chains paid ~70 ms a block for 266,000 random reads into a mapping
+  re-established every 64 MB (minor faults on cached pages).
+- The mapping is chunked (`bad780f40`): sealed 256 MB chunks mapped once with populated page
+  tables; loop124 measures it.
+- Step 3a done (delta v2 + slot-only undo): the retired slots are read by nothing on the block
+  path any more; loop125 measures it. Step 3b (the checkpoint as bits + roots, the file as the
+  persistence with `sync` before the delta) and step 4 (restart from the file) are next; until
+  then the file is recreated from the checkpoint at every start and the checkpoint still
+  carries every entry.
+
+## 8. Implementation order
 
 1. `EntryStore` trait with the in-memory implementation (today's `Vec<Entry>`) and the file
    implementation; `QmdbCompatTree` generic over it (the gov5 vector tests run on both).
