@@ -175,7 +175,7 @@ by the user (8 GB, 0 used).*
 0e. **Ask the user for a swapoff/swapon** (root) before the memory phase's
     rounds; record `SwapFree` in every `good regime` line meanwhile.
 
-### Phase A -- the leader's chain (window 1)
+### Phase A -- the leader's chain (window 1) -- A1/A2 DONE 2026-09-10
 
 *Status 2026-09-09 23:00 EDT -- A1/A2 measured (loop110-113, `docs/NATIVE_FLEET7.md`
 "loop110-111" and "loop113"): the plumbing leaves the chain as designed (`fcu` 0,
@@ -199,8 +199,12 @@ window 1 -- parity -- and S2's windows 2-3 the best of the campaign (217k / 185k
 (flood replies 2 s, builds waiting 618 ms for the queue), unexplained. loop116 repeats
 the round: loop116 S1 248,774 / 211,787 / 206,361 = 20,007,660 (the best round), B1/B2 19.5M /
 18.9M, and S2 collapsed -- a stale build-ahead request after a slow hand-off became a reorg
-(NATIVE_FLEET7 loop116); the guard is in loop117. The flag stays off by default until an
-S-B-S-B round has no collapse; the capture's own cost
+(NATIVE_FLEET7 loop116); the guard (35e5ba4b4) went into loop117, which read S 266,223 / 211,839 / 200,977 =
+20,371,170 and 266,222 / 211,842 / 190,086 against B 19.39M / 19.23M with no collapse.
+**A1/A2 done and adopted** (`N42_BUILD_ON_SEAL=1` in the record configuration). Window
+1 now reads 49 blocks on both arms: the cycle is the followers' chain, so phase B is next
+as written; on the leader's side the checkpoint's clone under the forest lock and the
+delta capture's cost remain; the capture's own cost
 (the assembler's root phase 76-105 ms against ~60) is the next cut -- a lazy appended
 range.*
 

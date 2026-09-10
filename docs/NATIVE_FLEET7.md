@@ -1394,6 +1394,34 @@ by the attributes' `slot_number`, which on this chain is the block number). loop
 carries it. After that the checkpoint itself is the next cut: its clone of the tree
 under the forest lock and its `move_to(head)`, which reverts the pending build.
 
+**loop117 (2026-09-10 07:11-07:33 EDT): the guard in, and build-on-seal adopted.** The
+stale-request guard (35e5ba4b4) on the loop115 binaries otherwise, W S1 B1 S2 B2:
+
+    W   266,224 / 206,393 / 184,679  (warm-up)
+    S1  266,223 / 211,839 / 200,977  = 20,371,170, the best round
+    B1  266,221 / 195,552 / 184,647  = 19,393,000
+    S2  266,222 / 211,842 / 190,086  = 20,046,000
+    B2  266,224 / 195,532 / 179,252  = 19,230,240
+
+No collapse; the guard fired once in S1 (the request that forked loop116 S2) and never in
+S2. Window 1 is the same number on all five legs -- 49 blocks, 266,22x -- so the cycle
+there is no longer the leader's chain on either arm (`waited` 0 on the S legs, 55-68 on
+the B legs, and the B legs' waits fit in the slack): it is the followers' chain, ~0.61 s,
+as plan v2 said it would be once the leader's plumbing left. The gain is in windows 2-3,
+where the S legs read 211.8k / 191-201k against the B legs' 195.5k / 179-185k -- 16k and
+6-16k a window, 0.65-1.0M transactions a round -- because the leader's build no longer
+grows with the leg's memory state the way the forkchoice build did (the S legs' `build`
+456-645 across the windows against the B legs' 390-620 with 55-195 of `waited` on top).
+
+Adopted: `N42_BUILD_ON_SEAL=1` joins the record configuration (the launchers' `C` set
+next to `N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1`); `=0` is the A/B's off arm. Three
+rounds (loop115-117) read the same shape and the last one read it without a loss. What
+made it pay was not the on-seal path itself (bae77e3e0 read 233-244k against 266-271k)
+but the four defects it exposed and the forest that moved its tree for persistence
+(e7b60c513); the record configuration's next items are the followers' chain (plan v3
+phase B, since the cycle is theirs now) and, on the leader's side, the checkpoint's clone
+of the tree under the forest lock and the capture cost of the per-block delta.
+
 What loop110-114 settled: build-on-seal removes the 130 ms of plumbing it was meant to
 (`own_rt` and `fcu` leave the chain, `waited` reads 0), and gave it back, with
 interest, in forest-lock contention -- the direct build must not touch the forest

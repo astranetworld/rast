@@ -27,8 +27,11 @@ shape a real chain would produce, and record what the ceiling is made of.
   275,839 at 51 blocks** (2026-09-09 night, the round-43 configuration with
   `RAYON_NUM_THREADS=16`; four baseline legs of loop110-111 read 271,634 /
   271,655 / 271,645 / 275,839, so the number is the box's state that night,
-  not a fluke); before it loop108 R16a, 260,485 at 48 blocks; **best round: loop116 S1,
-  248,774 / 211,787 / 206,361 = 20,007,660** (build-on-seal; loop115 S2 19,884,000 before it) (build-on-seal on the forest that no longer
+  not a fluke); before it loop108 R16a, 260,485 at 48 blocks; **best round: loop117 S1,
+  266,223 / 211,839 / 200,977 = 20,371,170** (build-on-seal, adopted after loop117's
+  S-B-S-B read no collapse: S 20.37M / 20.05M against B 19.39M / 19.23M, window 1
+  identical at 49 blocks on every leg; loop116 S1 20,007,660 and loop115 S2 19,884,000
+  before it; the pre-on-seal best 18,388,500, loop104 A2) (build-on-seal on the forest that no longer
   moves for persistence, e7b60c513; one round, loop116 repeats it; B2 of the same round
   19,706,000; the previous best 18,388,500, loop104 A2); best round: loop104 A2 --
   248,906 / 190,086 / 173,806 and 18,388,500, with the highest third window
