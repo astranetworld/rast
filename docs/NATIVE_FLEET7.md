@@ -1611,6 +1611,37 @@ them); the round totals are within the run-to-run spread. Adopted for the bench:
 entry log's step 3 makes the records cheap regardless). Window 1 read 52-53 blocks on all
 four legs (285,737 the best window 1 so far).
 
+**loop123 (2026-09-10 19:11-19:32 EDT): the entry log's first form -- the memory it gives back,
+and the reads it makes expensive.** `docs/QMDB_ENTRY_LOG.md` step 1: the tree's entries in an
+append-only file behind `N42_QMDB_ENTRY_FILE=1` (E legs), read through one mapping of the whole
+file that is re-established every 64 MB of appends plus a tail buffer; A legs the heap. Record
+configuration + tenure 64, retention at the default:
+
+    leg  win1          win2     win3     round    leader finish (w1/w2/w3)  follower w1  follower w2  w1 majflt  w2 majflt  AnonPages peak
+    E1   260,768 (49)  193,635  178,496  19.01M   158 / 182 / 232           402-426      433-462      20k        295k       88 GB
+    A1   286,225 (53)  200,554  182,923  20.10M    95 / 122 / 121           328-371      405-423      24k        1.26M      98 GB
+    E2   260,021 (49)  194,651  184,355  19.20M   164 / 183 / 257           400-457      454-493      13k        598k       83 GB
+    A2   277,089 (53)  210,084  185,322  20.18M    96 / 117 / 128           344-362      401-428      49k        1.02M      103 GB
+
+The memory side is what the design said: the fleet's anonymous memory peaks 15-20 GB lower,
+window 2's major faults fall by half to three quarters, and the file is 973 MB a node at the
+end of a leg against the ~4 GB of heap entries it replaces. And both chains pay for it on every
+block: the leader's finish phase (the QMDB root and the block's filing) 158-257 ms against
+95-128, the follower's import 400-457 against 328-371 in window 1 -- ~70 ms a block, four
+blocks a window, 19.0-19.2M against 20.1-20.2M a round. The cost is the reads: a block retires
+~133,000 slots, and the undo record reads each one's key and value (`undo_entries`), then the
+delta capture reads them again (`entry_at` for `changed`, the v1 delta carrying their content)
+-- 266,000 random reads a block into a mapping that was just re-established, each a minor
+fault on a page the page cache already holds, sixteen threads faulting under one `mmap_lock`.
+The heap version was two cache misses a read.
+
+Two cuts, in order: the mapping is now sealed in 256 MB chunks, each mapped once with its
+page tables populated (`MAP_POPULATE`), so a read never faults (loop124 measures it); and
+step 3's delta v2 carries `(slot, active)` for a retired slot instead of its content, which
+removes the second read entirely, with the undo record reduced to slot numbers for the file
+store (the key is read at revival, the only time it is needed) removing the first. The
+retention knob (loop122) and the entry file are independent: their memory savings add.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
