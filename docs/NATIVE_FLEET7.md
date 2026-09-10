@@ -1220,6 +1220,123 @@ the execution layer's line is "built ahead on the sealed own block" with
 followers' chain lets it (~493 ms against 570), so one or two blocks; the
 proof is in the leader's columns.
 
+**loop110-111 (2026-09-09 21:40-22:25 EDT): build-on-seal measured -- two defects, a
+hang, and a cost of its own; the baseline reads 271-276k four times.** Box state for
+the night: gov5's seven-node fleet had held the box until 21:39 (105 GB of the 143 GB;
+the box is 143 GB, not 256), swap was emptied and re-enabled by the user, `/tmp` cut
+from 20 to 8.4 GB (stale Erigon sort buffers, reth-test and Go link dirs older than a
+day; the swap then refilled with 7 GB of tmpfs pages under the legs' reclaim, which is
+harmless and is what "swap keeps filling" was). Both rounds: pacing 450, grace 600,
+rayon 16, the round-43 configuration, `S` = `N42_BUILD_ON_SEAL=1`, `B` = without.
+
+loop110 (bae77e3e0 as built at 18:05): S1 202,634 / B1 217,246 / S2 232,707 / B2
+271,634 -- monotonic across the legs whatever the arm, so the S-vs-B TPS is unreadable
+(the box warmed leg by leg after gov5's run: window-1 major faults 350k, 1.07M, 2k;
+S1 was also the first leg after a debug compile, pool 34 GB). The chain columns were
+readable and found two defects. (1) `fleet7-leader.py` on the S legs: `fcu` 82-94, not
+0 -- the on-seal build was refused on 49 of 52 blocks per leader, silently (debug
+level): the own-block import's `built_executions::take` and the `BUILD_ON_OWN`
+request's `find` leave the validator in the same breath on two connections, and the
+import's take won. (2) The refusal's fallback sent a forkchoice before the import had
+landed, was answered SYNCING, the prepared task failed, and the import's later request
+found a build "already prepared" and returned -- so every other block was built on
+the critical path (`leader build path ahead=false`, 345 ms): S2's `waited` read 14
+against B1's 122, but `commit->body` 428 against 152. Fixes, both in the tree for
+loop111: taken builds stay findable (`built_executions::find_kept`, a `handed` set of
+the same size; the import path unchanged), refusals log at info, and -- from the peer
+session working the same tree -- a refused on-seal build is marked so the import's
+request replaces it, the on-seal request goes out before the import, and
+`fleet7-leader.py` gained a `now` column (proposals built on the critical path).
+`direct_build.rs` gained an offline test of the overlay (the parent's nonces and
+created accounts over the grandparent, `BLOCKHASH` = sealed hash, take -> find_kept).
+
+loop111 (the combined tree, W S1 B1 S2 B2, W an unmeasured warm-up):
+
+    W   271,655 / 217,231 / 195,498      B1  271,645 / 206,399 / 190,085
+    S1   97,797 /       0 /       0      B2  275,839 / 217,233 / 190,067  (51 blocks, best window 1)
+    S2  244,492 / 195,502 / 173,811
+
+The baseline reproduces to four figures across W, B1, B2 and loop110's B2, and
+275,839 is the campaign's best window 1. The S legs:
+
+- **S1 hung.** On-seal builds now succeed (`fcu 0`, `waited 0`, 15-29 per leader,
+  1-2 refusals), but on node1's third on-seal block after the first tenure change
+  (view 132, block 131) the execution layer's watchdog reported the direct build
+  stuck in `build_stage="finishing"` for the rest of the leg (`import_stage=idle`);
+  the leader never proposed, every follower timed out view 132 every 12 s, 18
+  blocks in window 1, none after. The own-block hand-off for the parent had just
+  taken 188 ms instead of ~40. S2 did not hang (the hang is a race, not a rule).
+- **S2 is slower than its bookends, 45 blocks against 50-51**, with the leader's
+  median cycle *shorter* (534 vs 571) and the followers' import equal (291-316 vs
+  289-318 in window 1). What costs the blocks: (a) 2-3 proposals a window built on
+  the critical path (`now` 410-672 ms) -- at a tenure change the new leader's parent
+  is a peer's block, the on-seal request for it can only be refused, and the
+  peer-session change made a refusal mean "no build ahead" (fixed after the round:
+  `prepare_next_build(parent, on_seal)`, on-seal only for a block this node built;
+  a peer's block takes the forkchoice path directly); (b) the direct build is slower
+  than the payload-service build as seen by the validator: 435 vs 384 in window 1,
+  756-820 vs 444-590 in windows 2-3, and on node0 it splits as builder 311 (same as
+  B's 330) + QMDB `rename` 23 median but 172 p90 / 208 max + queue 13 + encode 9 +
+  ~50 of copies and scheduling; in window 3 builder 554, rename p90 357. The same
+  legs show the own import's hand-off p90 193-376 (58 median) and the assembly's
+  QMDB root p90 152-167 (B: ~41): **the build of N+1 and the hand-off/persistence of
+  N now overlap on the QMDB forest's one mutex** (`node_state.rs`: `compute`,
+  `insert`, `rename`, `on_canonical` all under `with_forest`), and each waits for the
+  other's pass. Six gaps over a second in S2's first minute were all the leader waiting
+  416-1136 ms for an on-seal build. The hang is most likely the same interplay; loop112
+  (profiling binaries, `N42_WATCHDOG_STACKS=1`, one S leg) is armed to dump every
+  thread's stack when the watchdog fires.
+
+**loop113 (22:39-22:42 EDT): the hang's stacks.** One S leg on `--profile profiling`
+binaries with `N42_WATCHDOG_STACKS=1` (and `prepare_next_build(parent, on_seal)` in:
+`now` read 0 in window 1, 45 blocks, 244,488 -- the same as S2, so the tenure-change
+builds were not the missing blocks). node4 hung on parent 189 and the watchdog dumped
+191 threads. The deadlock, thread by thread: a rayon worker ("n42") inside the
+assembler's QMDB branch holds the forest's mutex in `QmdbNodeState::compute_operations`
+and, in `QmdbForest::compute_operations`' parallel hashing, waits on the pool -- and a
+rayon worker that waits *steals*: it picked up the other assembly's QMDB root job
+(`N42BlockAssembler` again in the same stack), which calls `compute_operations` and
+blocks on the lock its own thread holds. Around it: `payload-builder` (reth's
+`BasicPayloadJob`, the forkchoice build) blocked in `QmdbNodeState::insert` on the same
+lock, and two `tokio-rt` blocking threads -- `build_on_own_block` (the on-seal build) and
+the `BasicPayloadJob` -- waiting on the assembler's condvar for their root. Two
+assemblies in flight are the precondition, and build-on-seal is what creates them (the
+on-seal build beside a forkchoice build from the import's request, or beside the
+follower path's `validate_block` at a tenure change). rayon's `in_worker_cross` says a
+private pool does not help (a worker blocked in another pool's `install` still processes
+its own pool's jobs). Fix: the assembler runs the QMDB root job on a plain thread
+(`std::thread::scope`, `qmdb-root`), never as a rayon job -- a non-pool thread that
+waits on the pool injects and blocks, and steals nothing. The forest's own parallelism
+is unchanged. Compiled (`cargo check`), in loop114 with the rest.
+
+**loop114 (2026-09-10 00:45-01:06 EDT): every on-seal fix in, and the cost that is left.**
+A release build with all four fixes (find_kept, the refused flag, on-seal for own blocks
+only, the QMDB root job on its own thread), W S1 B1 S2 B2 after gov5's second run of the
+night:
+
+    W   231,279 / 173,820 / 162,934  (warm-up, not read)
+    S1  233,620 / 184,616 / 157,475      B1  266,225 / 211,802 / 195,534
+    S2  244,491 / 184,672 /  43,446      B2  266,222 / 211,819 / 190,105
+
+No hang in either S leg (watchdog 0 on every node); 260 on-seal builds per leg across the
+leaders, 0 refusals, 0 proposals built on the critical path (`now` 0 -- the tenure-change
+fix works); `fcu` 0 and `waited` 0-40 in window 1. And the S legs are still 6-7 blocks
+behind the B legs on window 1 (43-45 against 49-50; B1 and B2 agree to five figures),
+with the direct build at 428-438 ms against 388-390, growing to 597-849 in windows 2-3
+against 446-578 -- the forest-lock contention, now the whole of the difference. S2's third
+window (8 blocks) is the round-43 memory stall (views 237-238 timed out with "the votes
+did not arrive"), which the B legs also draw one leg in two; not the arm's.
+
+What this settles: build-on-seal removes the 130 ms of plumbing it was meant to
+(`own_rt` and `fcu` leave the chain, `waited` reads 0), and gives it back, with
+interest, in forest-lock contention -- the direct build must not touch the forest
+while the parent is being handed off: compute the root on the tree under the
+builder's own hash (no rename on the build path; the hand-off renames later), and
+take the parent's persistence off the forest lock (a snapshot for `compute`, or a
+reader/writer split). Until then the flag stays off; the 275,839 baseline stands.
+loop114 measured exactly that: the S legs stop hanging, and the contention alone
+costs 6-7 blocks a window (233-244k against 266k).
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

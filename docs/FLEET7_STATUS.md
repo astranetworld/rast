@@ -23,8 +23,11 @@ shape a real chain would produce, and record what the ceiling is made of.
   (88k accounts per 163k transactions), BNB (46k), Polygon (11k) and Tron
   (173k): ours is conservative, close to Tron's.
 - **Throughput at that shape.** 244-253k TPS on window 1 at a 0.64-0.67 s
-  cycle; 16.8-18.2M transactions per round. **Best window 1: loop108 R16a,
-  260,485 at 48 blocks** (`RAYON_NUM_THREADS=16`); best round: loop104 A2 --
+  cycle; 16.8-18.2M transactions per round. **Best window 1: loop111 B2,
+  275,839 at 51 blocks** (2026-09-09 night, the round-43 configuration with
+  `RAYON_NUM_THREADS=16`; four baseline legs of loop110-111 read 271,634 /
+  271,655 / 271,645 / 275,839, so the number is the box's state that night,
+  not a fluke); before it loop108 R16a, 260,485 at 48 blocks; best round: loop104 A2 --
   248,906 / 190,086 / 173,806 and 18,388,500, with the highest third window
   yet; loop98 S1's 252,518 is still the highest single window. The cycle is linear in accounts touched:
   0.40 s + 2.8 us per account (loop80 sweep).
@@ -194,6 +197,12 @@ not remove one of those passes cannot matter, and one that removes a whole
 pass is worth ~0.2-0.4 us, or 5-10%.
 
 ## Next (rewritten 2026-09-09 afternoon -- read `docs/FLEET7_PLAN_V2.md`)
+
+*2026-09-09 evening: `docs/FLEET7_PLAN_V3.md` supersedes the round order below.
+loop108 split per window shows the followers' import grows with the leader's
+build (305 -> 579 ms across a leg) while the fleet's major faults climb 2.5-3M
+per 30 s: windows 2-3 are the box's memory, a phase of their own (M), and
+build-on-seal (A1/A2) can only move window 1.*
 
 The pass-removal list that stood here was aimed at the followers' import.
 Re-reading loop108's logs from the leader's side (`scripts/fleet7-leader.py`)
