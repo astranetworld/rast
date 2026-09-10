@@ -41,21 +41,29 @@ pub struct SlotEntry {
 /// The record layout in the file: the key, the value's length, the value.
 const KEY_LEN: usize = 32;
 const LEN_LEN: usize = 4;
-/// Bytes appended since the map was last refreshed are read from a tail
-/// buffer; past this the file is remapped and the buffer emptied, so the
-/// buffer never holds more than a few blocks of entries.
-const REMAP_TAIL_BYTES: usize = 64 << 20;
+/// The file is mapped in chunks of about this many bytes, each sealed and
+/// mapped once, with its page tables populated at that moment, so a read
+/// never takes a page fault afterwards: 133,000 random reads a block on a
+/// mapping that was just re-established cost 50-80 ms of minor faults
+/// (loop123 E1, the follower's root phase 100-135 ms against ~56). Bytes
+/// past the last sealed chunk are read from a tail buffer.
+const CHUNK_BYTES: usize = 256 << 20;
+
+/// One sealed, populated mapping of `[start, start + len)` of the file.
+struct Chunk {
+    start: u64,
+    map: memmap2::Mmap,
+}
 
 /// The append-only entry file, mapped for reads.
 pub(crate) struct FileEntries {
     path: PathBuf,
     file: File,
-    /// Read mapping of `[0, mapped_len)` of the file.
-    map: Option<memmap2::Mmap>,
-    mapped_len: u64,
-    /// Bytes appended after `mapped_len` and not yet remapped: exactly the
-    /// file's content from `mapped_len` on, since every append is written
-    /// through to the file as it is made.
+    /// Sealed chunks in file order; `chunks[i].start` ascending.
+    chunks: Vec<Chunk>,
+    /// Bytes of the file the sealed chunks cover.
+    sealed_len: u64,
+    /// The file's content from `sealed_len` on.
     tail: Vec<u8>,
     /// Bytes of the file that belong to slots.
     len_bytes: u64,
@@ -71,6 +79,7 @@ impl std::fmt::Debug for FileEntries {
             .field("path", &self.path)
             .field("slots", &self.offsets.len())
             .field("bytes", &self.len_bytes)
+            .field("chunks", &self.chunks.len())
             .finish_non_exhaustive()
     }
 }
@@ -85,8 +94,8 @@ impl FileEntries {
         Ok(Self {
             path: path.to_path_buf(),
             file,
-            map: None,
-            mapped_len: 0,
+            chunks: Vec::new(),
+            sealed_len: 0,
             tail: Vec::new(),
             len_bytes: 0,
             offsets: Vec::new(),
@@ -102,13 +111,16 @@ impl FileEntries {
     fn record(&self, slot: usize) -> &[u8] {
         let start = self.offsets[slot];
         let end = self.offsets.get(slot + 1).copied().unwrap_or(self.len_bytes);
-        if start >= self.mapped_len {
-            let s = (start - self.mapped_len) as usize;
-            let e = (end - self.mapped_len) as usize;
+        if start >= self.sealed_len {
+            let s = (start - self.sealed_len) as usize;
+            let e = (end - self.sealed_len) as usize;
             &self.tail[s..e]
         } else {
-            let map = self.map.as_ref().expect("a mapping covers every byte below mapped_len");
-            &map[start as usize..end as usize]
+            // A record never straddles two chunks: a chunk is sealed at a
+            // record boundary.
+            let i = self.chunks.partition_point(|chunk| chunk.start <= start) - 1;
+            let chunk = &self.chunks[i];
+            &chunk.map[(start - chunk.start) as usize..(end - chunk.start) as usize]
         }
     }
 
@@ -139,7 +151,7 @@ impl FileEntries {
     }
 
     /// Appends a live entry as the next slot: written through to the file
-    /// and kept in the tail buffer until the next remap.
+    /// and kept in the tail until the tail is sealed into a chunk.
     pub(crate) fn push(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
         let slot = self.offsets.len();
         let mut record = Vec::with_capacity(KEY_LEN + LEN_LEN + value.len());
@@ -155,29 +167,33 @@ impl FileEntries {
         self.set_active(slot, true);
         self.len_bytes += record.len() as u64;
         self.tail.extend_from_slice(&record);
-        if self.tail.len() > REMAP_TAIL_BYTES {
-            self.remap()?;
+        if self.tail.len() >= CHUNK_BYTES {
+            self.seal_tail()?;
         }
         Ok(())
     }
 
-    /// Maps `[0, len_bytes)` of the file and empties the tail.
-    fn remap(&mut self) -> io::Result<()> {
-        self.file.flush()?;
-        if self.len_bytes == 0 {
-            self.map = None;
-            self.mapped_len = 0;
-            self.tail.clear();
+    /// Maps the tail as a chunk (page tables populated) and empties it.
+    fn seal_tail(&mut self) -> io::Result<()> {
+        if self.tail.is_empty() {
             return Ok(());
         }
-        // SAFETY: the mapping is read-only; every byte below `len_bytes` was
-        // written by `push` before any read of it through the map, and the
-        // file is only ever shortened (by `truncate`, which remaps to the
-        // shorter length first), so no mapped byte changes under a reader.
-        let map = unsafe { memmap2::MmapOptions::new().len(self.len_bytes as usize).map(&self.file)? };
-        self.map = Some(map);
-        self.mapped_len = self.len_bytes;
+        self.file.flush()?;
+        // SAFETY: the mapping is read-only over bytes that `push` wrote
+        // before this call and that nothing rewrites: the file is only ever
+        // shortened, and a shortening below a chunk's start unmaps the chunk
+        // first (`truncate`).
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(self.sealed_len)
+                .len(self.tail.len())
+                .populate()
+                .map(&self.file)?
+        };
+        self.chunks.push(Chunk { start: self.sealed_len, map });
+        self.sealed_len = self.len_bytes;
         self.tail.clear();
+        self.tail.shrink_to(CHUNK_BYTES);
         Ok(())
     }
 
@@ -198,13 +214,20 @@ impl FileEntries {
         }
         self.active.truncate(len.div_ceil(64));
         self.len_bytes = new_len_bytes;
-        if new_len_bytes >= self.mapped_len {
-            self.tail.truncate((new_len_bytes - self.mapped_len) as usize);
+        if new_len_bytes >= self.sealed_len {
+            self.tail.truncate((new_len_bytes - self.sealed_len) as usize);
         } else {
-            // The map extends past the new end: remap to the shorter file, so
-            // later appends (which start at `len_bytes`) land in the tail.
-            self.file.set_len(new_len_bytes)?;
-            self.remap()?;
+            // The cut lands inside a sealed chunk: that chunk and every later
+            // one go, and the chunk's bytes below the cut become the tail
+            // again, re-read from the file.
+            let keep = self.chunks.partition_point(|chunk| chunk.start < new_len_bytes);
+            let cut = &self.chunks[keep - 1];
+            let within = (new_len_bytes - cut.start) as usize;
+            let mut bytes = cut.map[..within].to_vec();
+            let start = cut.start;
+            self.chunks.truncate(keep - 1);
+            self.sealed_len = start;
+            std::mem::swap(&mut self.tail, &mut bytes);
         }
         self.file.set_len(new_len_bytes)?;
         Ok(())
@@ -222,18 +245,31 @@ impl FileEntries {
     /// afterwards (a checkpoint's read, a test's comparison).
     pub(crate) fn duplicate(&self) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        let mut copy = Self {
+        let mut chunks = Vec::with_capacity(self.chunks.len());
+        for chunk in &self.chunks {
+            // SAFETY: as in `seal_tail`; the same sealed bytes.
+            let map = unsafe {
+                memmap2::MmapOptions::new().offset(chunk.start).len(chunk.map.len()).populate().map(&file)?
+            };
+            chunks.push(Chunk { start: chunk.start, map });
+        }
+        Ok(Self {
             path: self.path.clone(),
             file,
-            map: None,
-            mapped_len: 0,
-            tail: Vec::new(),
+            chunks,
+            sealed_len: self.sealed_len,
+            tail: self.tail.clone(),
             len_bytes: self.len_bytes,
             offsets: self.offsets.clone(),
             active: self.active.clone(),
-        };
-        copy.remap()?;
-        Ok(copy)
+        })
+    }
+
+    /// Seals the tail now (tests: exercise the chunked reads without
+    /// appending 256 MB).
+    #[cfg(test)]
+    fn seal_now(&mut self) -> io::Result<()> {
+        self.seal_tail()
     }
 }
 
@@ -415,14 +451,14 @@ mod tests {
         assert!(file.is_active(17));
         file.set_active(17, false);
         assert!(!file.is_active(17));
-        // Force a remap, then read through the map and the tail both.
-        file.remap().unwrap();
+        // Seal a chunk, then read through the chunk and the tail both.
+        file.seal_now().unwrap();
         for i in 1000..1200 {
             file.push(&key(i), &[7u8; 3]).unwrap();
         }
         assert_eq!(file.value(500), &vec![(500 % 256) as u8; 1 + 500 % 50][..]);
         assert_eq!(file.value(1100), &[7u8; 3]);
-        // Truncate into the mapped part, then append over it.
+        // Truncate into the sealed chunk, then append over it.
         file.truncate(800).unwrap();
         assert_eq!(file.len(), 800);
         file.push(&key(9000), &[9u8; 4]).unwrap();
