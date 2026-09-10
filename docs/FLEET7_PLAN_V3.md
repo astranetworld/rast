@@ -347,7 +347,48 @@ phases A-C is wasted if D is refused, and nothing in them assumes it.
 6. **C** after the chains have crossed; **D** as a written proposal at the
    same time.
 
-## 5. What not to do
+## 5. The path to 1,000,000 TPS (added 2026-09-10 evening, the standing target)
+
+Everything above is judged against one number: the campaign's target is 1M TPS
+sustained at the bench's block shape (163,000 transfers touching ~147,000
+accounts a block). Where loop120 stands against it, in the cost model:
+
+    cycle = slowest follower import + fixed  (the leader's build is hidden by on-seal as long as it is shorter)
+          = 360 ms                    + ~100 ms  (push 35, vote/commit 10, seal/encode 20, straggler wait, proposal)
+          = ~540 ms median a block  ->  52 blocks / 30 s  ->  282k TPS (loop120 T2)
+
+    per transaction: import 2.2 us, build 2.8 us, fixed 0.6 us; the box gives each node 16 physical cores.
+
+1M TPS at this block shape is 6.1 blocks a second, a 163 ms cycle. No arrangement of the
+current pieces reaches it: the fixed ~100 ms alone is 60% of that cycle, and the import
+would have to fall from 360 to ~60 ms. Bigger blocks do not help while every follower
+executes the block before it votes: the cycle is linear in transactions (4.0 us each, loop105).
+So 1M needs all three of the following, and the phases of this plan are exactly them:
+
+1. **The cycle becomes max(build, import, network) instead of a sum** -- phase D, deferred
+   execution (the header of N carries the post-state of N-1; followers vote on structure and
+   availability and execute N while N+1 is proposed). It removes the fixed ~100 ms and the
+   execute-then-vote coupling from the cycle. A cross-client rule; the proposal goes to gov5.
+2. **The per-transaction work falls ~4x on both sides** -- phase C (plain-state storage, the
+   incremental root, the carry) removes whole passes; phase B's B2/B3 remove the body decodes
+   and the graft; and the parallel phases (execution 92, root 56, convert 37, senders 37,
+   hashed 23 ms on 16 cores) scale with cores, which a node on its own 64-core machine has and a
+   node on this shared box does not. On this box the ceiling of the current protocol is
+   ~400k (section 1.4, the last row); 1M is a seven-machine number.
+3. **The state stops living in memory** -- phase M. At 1M TPS a node's state changes
+   200 MB a second; an in-memory entry log (`QmdbCompatTree`, ~220 B a slot, loop121) is not
+   a stopgap at that rate, it is the wall: M2a/M2b/M2c buy this bench's 90 s windows back,
+   and the 1M form is gov5's -- the entry log on disk, only twig roots, active bits and the
+   key index in memory. That is the M-phase item to design after M2b.
+
+What the phases buy, in order, toward the target: A (done) and B0 (done) took window 1 from
+260k to 282k by removing the leader's plumbing and the tail; B1-B3 and M are worth ~4M a
+round and are prerequisites for C and D to show; C brings both chains to ~300 ms a side (~400k);
+D lifts the fixed cost and the coupling (~540k at C's per-transaction cost on this box); the
+rest of the way to 1M is cores per node and the on-disk state. Nothing in this plan is spent
+on something that stops paying at the next phase.
+
+## 6. What not to do
 
 - Do not read loop110's windows 2-3 as a verdict on build-on-seal; they are
   the box's memory. Read window 1 and `waited`.
