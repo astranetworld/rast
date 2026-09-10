@@ -39,6 +39,29 @@
 //! chain while the database persists on its own schedule, so the log routinely
 //! runs ahead of the head a restarted node finds, and the blocks past it arrive
 //! again through the engine.
+//!
+//! # Rewriting the checkpoint without touching the tree
+//!
+//! The checkpoint used to be taken from the live forest: stand the tree at the
+//! head, clone it, serialise and write it -- the clone under the forest lock,
+//! the rest on the canonical follower's task. At the fleet7 bench tier that is
+//! a 300-800 MB tree cloned under the lock every 10-50 blocks, ~0.5 s during
+//! which the builder's next block and the follower's import both wait, and the
+//! move to the head reverts the build in flight so the next computation
+//! replays it (loop117: the leader's own import 245-571 ms and its build
+//! 713-1029 ms on exactly those blocks, ~4 stalls a window). So the checkpoint
+//! is now compacted from the files instead: when the log has outgrown the
+//! checkpoint, `forest.log` is renamed to `forest.log.sealed` and a plain
+//! thread replays the old checkpoint plus the sealed segment into a new
+//! checkpoint -- the same state, by the same replay a restart performs --
+//! writes it, and deletes the segment; new deltas go to a fresh `forest.log`
+//! meanwhile. The forest lock is never taken. A restart while the segment
+//! exists replays checkpoint, segment, log in that order (a delta the
+//! checkpoint already covers is skipped, so a crash between the checkpoint's
+//! rename and the segment's deletion is harmless) and compacts the segment
+//! again. `N42_QMDB_CHECKPOINT_SYNC=1` keeps the old path, and
+//! `N42_QMDB_CHECKPOINT_RATIO=<n>` lets the log grow to `n` times the
+//! checkpoint before either path runs (default 1).
 
 use n42_twig_core::qmdb_compat::QmdbOperation;
 use std::path::{Path, PathBuf};
@@ -57,11 +80,65 @@ use crate::changes::changes_from_alloc;
 
 const SNAPSHOT_FILE: &str = "forest.bin";
 const DELTA_LOG_FILE: &str = "forest.log";
+/// The log segment a background compaction is folding into the checkpoint.
+const SEALED_LOG_FILE: &str = "forest.log.sealed";
 
 /// Below this the log is left to grow even if it has passed the checkpoint.
 /// Without a floor, a chain whose state is a few kilobytes would rewrite its
 /// checkpoint on almost every block — the very cost this is here to avoid.
 const MIN_LOG_BEFORE_CHECKPOINT: u64 = 1 << 20;
+
+/// `N42_QMDB_CHECKPOINT_SYNC=1`: rewrite the checkpoint from the live forest
+/// on the canonical follower, as before, instead of compacting the files on a
+/// background thread. The A/B's off arm; read once.
+fn checkpoint_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_CHECKPOINT_SYNC").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_QMDB_CHECKPOINT_RATIO`: how many times the checkpoint's size the log
+/// may reach before the checkpoint is rewritten (default 1: the log is
+/// bounded at the size of the state). Bounds the disk at `1 + ratio` times
+/// the state and what a restart has to replay at `ratio` times it.
+fn checkpoint_ratio() -> u64 {
+    static RATIO: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RATIO.get_or_init(|| {
+        std::env::var("N42_QMDB_CHECKPOINT_RATIO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// `N42_QMDB_COMPACT_NICE`: the compaction thread's nice value (default 10),
+/// so its read, replay and write of the whole state yield to the builder and
+/// the import on the same cores. 0 leaves it at the process's priority.
+fn compact_nice() -> i32 {
+    static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *NICE.get_or_init(|| {
+        std::env::var("N42_QMDB_COMPACT_NICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|n| n.clamp(0, 19))
+            .unwrap_or(10)
+    })
+}
+
+/// Lowers the calling thread's priority to [`compact_nice`].
+fn apply_compact_nice() {
+    let nice = compact_nice();
+    if nice == 0 {
+        return;
+    }
+    // SAFETY: setpriority on the calling thread (PRIO_PROCESS with a thread
+    // id) is a plain syscall with no memory effects; a failure leaves the
+    // priority as it was.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, nice);
+    }
+}
 
 /// Why the node's QMDB state could not be used.
 #[derive(Debug, thiserror::Error)]
@@ -144,6 +221,10 @@ struct Inner {
     /// big that checkpoint was. Held beside the forest rather than inside it,
     /// because none of it is state — it is bookkeeping about a file.
     persist: Mutex<PersistCursor>,
+    /// The background compaction's thread, kept so a test (or a shutdown)
+    /// can wait for it. Only ever one: the cursor's `compacting` flag stops a
+    /// second from starting while it runs.
+    compaction: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// The delta log's position, as the node last left it.
@@ -161,6 +242,10 @@ struct PersistCursor {
     log_len: u64,
     /// Size of the checkpoint the log is measured against.
     checkpoint_len: u64,
+    /// A background compaction is folding `forest.log.sealed` into the
+    /// checkpoint; no second one starts, and the log is not rotated again,
+    /// until it has finished.
+    compacting: bool,
 }
 
 /// A handle to the node's QMDB state. Cheap to clone; all clones share it.
@@ -201,6 +286,7 @@ impl QmdbNodeState {
                 chain,
                 dir: dir.into(),
                 persist: Mutex::new(PersistCursor::default()),
+                compaction: Mutex::new(None),
             }),
         }
     }
@@ -213,6 +299,11 @@ impl QmdbNodeState {
     /// Where the delta log lives.
     pub fn delta_log_path(&self) -> PathBuf {
         self.inner.dir.join(DELTA_LOG_FILE)
+    }
+
+    /// Where the log segment under compaction lives, while one is.
+    pub fn sealed_log_path(&self) -> PathBuf {
+        self.inner.dir.join(SEALED_LOG_FILE)
     }
 
     fn cursor(&self) -> MutexGuard<'_, PersistCursor> {
@@ -263,6 +354,18 @@ impl QmdbNodeState {
         let forest = match read_snapshot(&path)? {
             Some(checkpoint) => {
                 let checkpoint_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                // A segment a compaction had sealed but not folded in when the
+                // node last stopped comes first: the log's deltas continue
+                // from its end. What the checkpoint already covers is skipped.
+                let sealed_path = self.sealed_log_path();
+                let sealed = sealed_path.exists();
+                let (checkpoint, sealed_head) = if sealed {
+                    let (state, _) = replay_delta_log(&sealed_path, checkpoint, Some(head_hash))?;
+                    let at = (state.head_number, state.head_hash);
+                    (state, Some(at))
+                } else {
+                    (checkpoint, None)
+                };
                 // Walk the log forward until the state stands at the head the
                 // database is at. The log can end short of it (a delta was lost
                 // to a crash) or run past it (the forest followed blocks the
@@ -282,13 +385,20 @@ impl QmdbNodeState {
                     next_slot: snapshot.tree.next_slot,
                     log_len,
                     checkpoint_len,
+                    compacting: false,
                 };
                 info!(
                     target: "n42.qmdb",
-                    block = head_number, %head_hash, log_bytes = log_len,
+                    block = head_number, %head_hash, log_bytes = log_len, sealed,
                     "restored the QMDB forest",
                 );
-                QmdbForest::from_snapshot(&snapshot)?
+                let forest = QmdbForest::from_snapshot(&snapshot)?;
+                // The interrupted compaction resumes: the segment is folded
+                // into the checkpoint as it would have been.
+                if let Some(sealed_head) = sealed_head {
+                    self.spawn_compaction(&mut cursor, sealed_head);
+                }
+                forest
             }
             None if head_number == 0 => {
                 let chain = &self.inner.chain;
@@ -306,11 +416,13 @@ impl QmdbNodeState {
                 // head move writes one, and until then there is nothing for a
                 // delta to be measured against.
                 let _ = std::fs::remove_file(&log_path);
+                let _ = std::fs::remove_file(self.sealed_log_path());
                 *cursor = PersistCursor {
                     head: forest.head().1,
                     next_slot: forest.next_slot(),
                     log_len: 0,
                     checkpoint_len: 0,
+                    compacting: false,
                 };
                 forest
             }
@@ -364,11 +476,13 @@ impl QmdbNodeState {
         // Its first delta would be refused for standing on the wrong cursor,
         // which is safe but reads as corruption; removing it is the truth.
         let _ = std::fs::remove_file(self.delta_log_path());
+        let _ = std::fs::remove_file(self.sealed_log_path());
         *cursor = PersistCursor {
             head: snapshot.head_hash,
             next_slot: snapshot.tree.next_slot,
             log_len: 0,
             checkpoint_len,
+            compacting: false,
         };
         info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
         *self.lock() = Some(forest);
@@ -501,6 +615,7 @@ impl QmdbNodeState {
         self.with_forest(|forest| forest.rename(from, to))
     }
 
+    /// The root of a block the forest holds, if it does.
     pub fn root_of(&self, block_hash: &B256) -> Option<B256> {
         self.lock().as_ref()?.root_of(block_hash)
     }
@@ -553,8 +668,8 @@ impl QmdbNodeState {
                 forest.forget_changes();
                 Ok(())
             })?;
-            if cursor.log_len >= cursor.checkpoint_len && cursor.log_len >= MIN_LOG_BEFORE_CHECKPOINT {
-                return self.checkpoint(block_hash, &mut cursor);
+            if checkpoint_due(&cursor) {
+                return self.rewrite_checkpoint(block_hash, &mut cursor);
             }
             return Ok(());
         }
@@ -566,9 +681,10 @@ impl QmdbNodeState {
         // only once the log it replaces has grown to the same size. That bounds
         // what a restart has to replay, bounds the disk to twice the state, and
         // leaves the per-block cost at the size of the block.
-        if cursor.log_len >= cursor.checkpoint_len && cursor.log_len >= MIN_LOG_BEFORE_CHECKPOINT {
-            return self.checkpoint(block_hash, &mut cursor);
-        }
+        //
+        // The measured delta is appended first either way: the compaction
+        // folds the log as it stands, and the synchronous checkpoint's
+        // snapshot covers it too (the log is then emptied).
         let written = append_delta(&self.delta_log_path(), cursor.log_len, &delta)?;
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
@@ -579,15 +695,145 @@ impl QmdbNodeState {
             appended = delta.appended.len(), changed = delta.changed.len(),
             "persisted the QMDB head as a delta",
         );
+        if checkpoint_due(&cursor) {
+            return self.rewrite_checkpoint(block_hash, &mut cursor);
+        }
         Ok(())
     }
 
-    /// Writes the whole tree and starts a fresh log.
+    /// The checkpoint, rewritten at `block_hash` = the log's head: from the
+    /// files on a background thread (the default), or from the live forest
+    /// on this one (`N42_QMDB_CHECKPOINT_SYNC=1`).
+    fn rewrite_checkpoint(
+        &self,
+        block_hash: B256,
+        cursor: &mut PersistCursor,
+    ) -> Result<(), NodeStateError> {
+        if checkpoint_sync() {
+            return self.checkpoint(block_hash, cursor);
+        }
+        if cursor.compacting {
+            // The previous compaction is still running; the log keeps growing
+            // and the next head asks again.
+            return Ok(());
+        }
+        let head = self.with_forest(|forest| Ok(forest.head()))?;
+        let sealed_path = self.sealed_log_path();
+        if sealed_path.exists() {
+            // A compaction that failed left its segment behind (it is still
+            // needed: the checkpoint does not cover it). Fold that one first;
+            // the log is rotated once it is gone.
+            warn!(target: "n42.qmdb", path = %sealed_path.display(), "a sealed QMDB log segment is still waiting to be compacted; retrying it");
+            self.spawn_compaction(cursor, head);
+            return Ok(());
+        }
+        let log_path = self.delta_log_path();
+        if !log_path.exists() {
+            return Ok(());
+        }
+        std::fs::rename(&log_path, &sealed_path).map_err(|source| NodeStateError::Io {
+            path: log_path.clone(),
+            source,
+        })?;
+        // The log starts again from nothing; the cursor's head and slot are
+        // unchanged, because checkpoint + sealed segment is the state they
+        // describe.
+        cursor.log_len = 0;
+        self.spawn_compaction(cursor, head);
+        Ok(())
+    }
+
+    /// Starts the thread that folds `forest.log.sealed` into the checkpoint,
+    /// ending at `sealed_head`. The cursor's `compacting` flag is set here
+    /// and cleared by the thread.
+    fn spawn_compaction(&self, cursor: &mut PersistCursor, sealed_head: (u64, B256)) {
+        cursor.compacting = true;
+        let state = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("qmdb-compact".into())
+            .spawn(move || state.compact(sealed_head));
+        let mut slot = self.inner.compaction.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match spawned {
+            Ok(handle) => {
+                // A finished predecessor's handle is replaced; joining it is
+                // free since `compacting` was clear when this one started.
+                if let Some(previous) = slot.take() {
+                    let _ = previous.join();
+                }
+                *slot = Some(handle);
+            }
+            Err(err) => {
+                cursor.compacting = false;
+                warn!(target: "n42.qmdb", %err, "could not start the QMDB compaction thread; the log keeps growing");
+            }
+        }
+    }
+
+    /// The compaction thread's body: checkpoint + sealed segment, replayed the
+    /// way a restart replays them, written as the new checkpoint; then the
+    /// segment is deleted. Nothing here takes the forest lock.
+    fn compact(&self, sealed_head: (u64, B256)) {
+        apply_compact_nice();
+        let started = std::time::Instant::now();
+        let path = self.snapshot_path();
+        let sealed_path = self.sealed_log_path();
+        let result = (|| -> Result<(u64, u64), NodeStateError> {
+            let checkpoint = read_snapshot(&path)?.ok_or_else(|| NodeStateError::NoSnapshot {
+                path: path.clone(),
+                head_number: sealed_head.0,
+            })?;
+            let read_ms = started.elapsed().as_millis() as u64;
+            let (snapshot, _) = replay_delta_log(&sealed_path, checkpoint, Some(sealed_head.1))?;
+            if snapshot.head_hash != sealed_head.1 {
+                return Err(NodeStateError::SnapshotMismatch {
+                    snapshot_number: snapshot.head_number,
+                    snapshot_hash: snapshot.head_hash,
+                    head_number: sealed_head.0,
+                    head_hash: sealed_head.1,
+                });
+            }
+            let len = write_snapshot(&path, &snapshot)?;
+            // The segment goes only once the checkpoint that covers it is on
+            // disk; a crash in between leaves a segment a restart skips.
+            let _ = std::fs::remove_file(&sealed_path);
+            Ok((len, read_ms))
+        })();
+        let mut cursor = self.cursor();
+        cursor.compacting = false;
+        match result {
+            Ok((len, read_ms)) => {
+                cursor.checkpoint_len = len;
+                info!(
+                    target: "n42.qmdb",
+                    block = sealed_head.0, block_hash = %sealed_head.1, bytes = len,
+                    read_ms, total_ms = started.elapsed().as_millis() as u64,
+                    "compacted the QMDB log into a new checkpoint",
+                );
+            }
+            Err(err) => {
+                // The files are still consistent (checkpoint + segment + log);
+                // the segment is retried at the next due point.
+                warn!(target: "n42.qmdb", %err, "QMDB compaction failed; the sealed segment is kept");
+            }
+        }
+    }
+
+    /// Waits for a background compaction, if one is running. For tests and
+    /// for a shutdown that wants the checkpoint settled.
+    pub fn wait_for_compaction(&self) {
+        let handle = self.inner.compaction.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    /// Writes the whole tree and starts a fresh log, from the live forest.
     fn checkpoint(
         &self,
         block_hash: B256,
         cursor: &mut PersistCursor,
     ) -> Result<(), NodeStateError> {
+        let started = std::time::Instant::now();
         let snapshot = self.with_forest(|forest| {
             forest.set_canonical(block_hash)?;
             let snapshot = forest.snapshot()?;
@@ -607,14 +853,22 @@ impl QmdbNodeState {
             next_slot: snapshot.tree.next_slot,
             log_len: 0,
             checkpoint_len: len,
+            compacting: cursor.compacting,
         };
-        debug!(
+        info!(
             target: "n42.qmdb",
             block = snapshot.head_number, %block_hash, bytes = len,
+            total_ms = started.elapsed().as_millis() as u64,
             "checkpointed the QMDB head",
         );
         Ok(())
     }
+}
+
+/// Whether the log has grown to the point where the checkpoint is rewritten.
+fn checkpoint_due(cursor: &PersistCursor) -> bool {
+    cursor.log_len >= cursor.checkpoint_len.saturating_mul(checkpoint_ratio())
+        && cursor.log_len >= MIN_LOG_BEFORE_CHECKPOINT
 }
 
 impl StateProofProvider for QmdbNodeState {
@@ -775,6 +1029,17 @@ fn replay_delta_log(
             warn!(target: "n42.qmdb", offset = at, "QMDB delta did not decode; ignoring the rest");
             break;
         };
+        // A delta the checkpoint already covers -- a sealed segment whose
+        // compaction wrote its checkpoint and then stopped before deleting
+        // the segment -- stands on an older cursor and lands no later than
+        // the state does; it is skipped. A delta on the wrong cursor that
+        // would move the state forward is the corruption `apply_delta`
+        // refuses.
+        if delta.base_next_slot != state.tree.next_slot && delta.head_number <= state.head_number {
+            at = end;
+            good = at as u64;
+            continue;
+        }
         state.apply_delta(&delta)?;
         at = end;
         good = at as u64;
@@ -928,6 +1193,11 @@ mod tests {
             parent = hash;
         }
         assert!(rotated, "the log never outgrew its checkpoint, last size {previous_log}");
+        // The compaction runs behind the chain; once it is done the sealed
+        // segment is in the checkpoint and gone from the directory.
+        state.wait_for_compaction();
+        assert!(!state.sealed_log_path().exists(), "a sealed segment survived its compaction");
+        assert!(!state.cursor().compacting);
 
         // What rotation is for: a node that restarts after one restores the
         // same state, from a checkpoint it never wrote the whole of per block.
@@ -935,6 +1205,86 @@ mod tests {
         restarted.initialize((20_000, parent)).unwrap();
         assert_eq!(restarted.head(), Some((20_000, parent)));
         assert_eq!(restarted.state_root(), root);
+    }
+
+    /// A node can stop while a compaction is in flight: the checkpoint is
+    /// then behind, the sealed segment carries the blocks up to the rotation
+    /// and the log the ones after it. A restart replays all three in order,
+    /// and resumes the compaction. And if the node stopped between the new
+    /// checkpoint's rename and the segment's deletion, the segment describes
+    /// blocks the checkpoint already holds, and the replay skips them.
+    #[test]
+    fn a_restart_during_compaction_replays_the_sealed_segment_then_the_log() {
+        use n42_qmdb_state::AccountState;
+        use alloy_primitives::{Address, U256};
+
+        let chain = qmdb_chain();
+        let dir = scratch("sealed");
+        let state = QmdbNodeState::new(chain.clone(), &dir);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+
+        let mut parent = chain.genesis_hash();
+        let mut roots = vec![state.state_root()];
+        let mut hashes = vec![parent];
+        let mut advance = |state: &QmdbNodeState, number: u64, parent: &mut B256| {
+            let mut changes = BlockChanges::new();
+            changes.set_account(
+                Address::from_word(B256::from(U256::from(number))),
+                AccountState { nonce: number, balance: U256::from(number), code_hash: B256::ZERO },
+            );
+            let hash = B256::from(U256::from(number) << 64);
+            let prepared = state.compute(*parent, &changes).unwrap();
+            roots.push(prepared.root);
+            state.insert(hash, number, prepared).unwrap();
+            state.on_canonical(hash).unwrap();
+            hashes.push(hash);
+            *parent = hash;
+        };
+        for number in 1..=5 {
+            advance(&state, number, &mut parent);
+        }
+        // The rotation by hand, without the thread that would fold it in: the
+        // state a crash mid-compaction leaves. The cursor's log length starts
+        // again, as `rewrite_checkpoint` leaves it.
+        std::fs::rename(state.delta_log_path(), state.sealed_log_path()).unwrap();
+        state.cursor().log_len = 0;
+        for number in 6..=10 {
+            advance(&state, number, &mut parent);
+        }
+        let sealed_copy = dir.join("sealed.copy");
+        std::fs::copy(state.sealed_log_path(), &sealed_copy).unwrap();
+        drop(state);
+
+        // Checkpoint (block 1) + sealed segment (2-5) + log (6-10).
+        let restarted = QmdbNodeState::new(chain.clone(), &dir);
+        restarted.initialize((10, hashes[10])).unwrap();
+        assert_eq!(restarted.head(), Some((10, hashes[10])));
+        assert_eq!(restarted.state_root(), roots[10]);
+        // The interrupted compaction resumed and finished: the checkpoint now
+        // stands at block 5 and the segment is gone.
+        restarted.wait_for_compaction();
+        assert!(!restarted.sealed_log_path().exists());
+        let checkpoint = read_snapshot(&restarted.snapshot_path()).unwrap().unwrap();
+        assert_eq!((checkpoint.head_number, checkpoint.head_hash), (5, hashes[5]));
+        assert_eq!(restarted.cursor().checkpoint_len, std::fs::metadata(restarted.snapshot_path()).unwrap().len());
+        drop(restarted);
+
+        // The segment reappears although the checkpoint covers it (a crash
+        // between the checkpoint's rename and the segment's deletion): every
+        // delta in it is skipped, the log still applies, the root is the same.
+        std::fs::copy(&sealed_copy, dir.join(SEALED_LOG_FILE)).unwrap();
+        let again = QmdbNodeState::new(chain.clone(), &dir);
+        again.initialize((10, hashes[10])).unwrap();
+        assert_eq!(again.state_root(), roots[10]);
+        again.wait_for_compaction();
+        assert!(!again.sealed_log_path().exists());
+        drop(again);
+
+        // And a plain restart after all of it, the ordinary way.
+        let plain = QmdbNodeState::new(chain, &dir);
+        plain.initialize((10, hashes[10])).unwrap();
+        assert_eq!(plain.state_root(), roots[10]);
+        assert_eq!(plain.head(), Some((10, hashes[10])));
     }
 
     /// A crash can cut the log in half. The last record is then partly there,

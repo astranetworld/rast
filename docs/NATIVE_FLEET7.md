@@ -1432,6 +1432,59 @@ reader/writer split). Until then the flag stays off; the 275,839 baseline stands
 loop114 measured exactly that: the S legs stop hanging, and the contention alone
 costs 6-7 blocks a window (233-244k against 266k).
 
+**loop118 (2026-09-10 16:05-16:32 EDT): the QMDB checkpoint off the forest lock.** Plan v3's
+phase B starts where loop117 left the cycle: window 1 read 49 blocks on both arms, so the
+followers' chain is the cycle. Before cutting the follower's import, `scripts/fleet7-cycles.py`
+(new: the body-to-body interval over every leader, per window, mean against median, the excess
+over 700 ms in blocks, and the leader's own lines for every long cycle) says where a window's
+blocks actually go: loop117 S1's window 1 has a *median* cycle of 537-550 ms but a *mean* of
+601-608 -- the difference is ~3.3 blocks a window of two shapes. (1) The QMDB checkpoint: every
+10-50 blocks `on_canonical` rewrote `forest.bin` from the live forest -- `move_to(head)`, which
+reverts the on-seal build in flight, then a clone of the 300-800 MB tree, both under the forest
+lock, then serialise and write on the canonical follower's tokio task; on those blocks the
+leader's own import read 245-571 ms and its build 713-1029, four or five stalls a window of
+0.3-0.5 s. (2) Tenure changes (three a window at `F7_LEADER_TENURE=16`): the incoming leader's
+build starts only after its import of the parent, forkchoice 92-202 + build 360-387, a 950 ms
+cycle. And the straggler grace (`F7_STRAGGLER_GRACE_MS=600`) makes the cycle the *slowest*
+follower's import + push ~35 + commit ~10 + seal/encode ~20, not the quorum's.
+
+The checkpoint is now compacted from the files on a plain thread (`node_state.rs`): when the
+log has outgrown the checkpoint, `forest.log` is renamed `forest.log.sealed`, the thread
+replays checkpoint + segment (the restart's own replay) into a new checkpoint, writes it and
+deletes the segment; new deltas go to a fresh log meanwhile and the forest lock is never taken.
+A restart with a segment present replays checkpoint, segment, log and resumes the compaction;
+a delta the checkpoint already covers is skipped, so a crash between the checkpoint's rename
+and the segment's deletion is harmless. `N42_QMDB_CHECKPOINT_SYNC=1` is the old path,
+`N42_QMDB_CHECKPOINT_RATIO` (default 1) the threshold. W K1 S1 T1 K2 S2, K = background
+(the new default), S = synchronous, T = background + `F7_LEADER_TENURE=64`:
+
+    leg  win1              win2     win3     round     w1 mean/median  >700 ms  same-leader stalls  follower w1
+    K1   271,650 (50)      222,695  195,425  20.70M    585 / 557       1.7 blk  3                   352-379
+    S1   266,224 (49)      200,907  190,099  19.72M    607 / 549       3.1 blk  7                   333-355
+    K2   277,001 (51)      206,408  190,036  20.21M    582 / 549       2.1 blk  2                   350-363
+    S2   270,787 (50)      206,396  200,966  20.35M    594 / 536       3.0 blk  6                   336-354
+    T1   void: funding never mined (below)
+
+Read per block, the change does what it was built for: the same-leader stalls fall from 6-7 a
+window to 2-3, the excess over 700 ms from ~3 blocks to ~2, and the mean cycle from 594-607 to
+582-585 -- one block a window on each bookended pair (50/51 against 49/50), 277,001 the best
+window 1 of the campaign (loop111 B2 was 275,839), and K1's 20,701,000 the best round
+(loop117 S1 was 20,371,170). The price is on the median: the followers' import in window 1
+reads 350-379 ms on the K legs against 333-355 on the S legs, ~15 ms a block, the compaction's
+read-replay-write (342 MB in 4.9 s, 745 MB in 11.4 s, 1.17 GB in ~15 s, thirteen of them a leg
+since the log outgrows a young checkpoint every 1-3 blocks at the start) sharing the node's
+cores and page cache with the import; the two remaining same-leader stalls are builds of
+687-874 ms with a normal own import, on the blocks right after a compaction. Round totals
+(20.70 / 20.21 against 19.72 / 20.35) are within the run-to-run spread and say nothing either
+way. Adopted as the default; the next two cuts are free: the compaction thread at nice 10
+(`N42_QMDB_COMPACT_NICE`, coded after this round) and a ratio above 1 so a leg compacts four
+or five times instead of thirteen.
+
+T1 died in the flood's funding: with `F7_NO_TX_GOSSIP=1` a pool holds only what was sent to
+it, the funding went to node0's RPC alone, and at tenure 64 node1 then node2 led for 29 s
+each -- node0's turn came at view 448, after the 120 s wait. Not a tenure problem: the flood
+now sends every funding batch to every node's RPC (`fund_others`), and the T legs run again.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

@@ -8223,6 +8223,7 @@ dependencies = [
  "alloy-rpc-types-engine 2.4.1",
  "bincode",
  "eyre",
+ "libc",
  "n42-h2-consensus",
  "n42-h2-primitives",
  "n42-qmdb-state",

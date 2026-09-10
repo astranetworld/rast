@@ -251,6 +251,25 @@ in the same round order, alternating, so neither waits on the other.
 
 ### Phase B -- the followers' chain (once `waited` reads ~0)
 
+*Status 2026-09-10 16:45 EDT -- started, with the tail first. `waited` read 0 on loop117's S
+legs, so this phase opened; but before cutting the import, `scripts/fleet7-cycles.py` (new)
+showed window 1's blocks are lost to a tail, not to the median: median cycle 537-550, mean
+601-608, ~3.3 blocks a window in cycles of 0.7-1.1 s -- the QMDB checkpoint (the tree cloned
+under the forest lock, four or five stalls a window) and the three tenure changes (the
+incoming leader's forkchoice + build after its import, ~950 ms). loop118 took the checkpoint
+off the lock (a background compaction from the files; NATIVE_FLEET7 loop118): same-leader
+stalls 6-7 -> 2-3 a window, one block a window on both bookended pairs, 277,001 the best
+window 1 and 20,701,000 the best round; adopted. Its background cost shows on the median
+(followers' import +15 ms): nice 10 and a checkpoint ratio > 1 are the next zero-risk cuts.
+B0 (new): the tenure change -- measured next with `F7_LEADER_TENURE=64` (the T leg, void in
+loop118 because the funding reached only node0; fixed in the flood), then the incoming leader
+building on its own imported post-state without the forkchoice. B1 has a cause: the Ed25519
+sender cache is direct-mapped (`fixed-cache` evicts on collision), 4M entries, and the queue
+holds ~360k transactions ahead of the chain, so ~13% of a block's senders are evicted before
+the follower imports it (22k batch-verified again, senders 37 ms instead of ~5); the
+predicted eviction 1 - exp(-520k/4M) = 12% matches. loop119 runs 16M entries (~1 GB a node)
+against 4M, judged by `senders_cached` first.*
+
 B1. **Converged pools**: make `F7_INGEST_ALL=1` actually converge so a
     follower's senders phase is a lookup (38 -> ~3 ms) and its mined-removal
     is real; judged by `cache_hits` on the followers before TPS.
