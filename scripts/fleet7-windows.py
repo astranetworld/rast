@@ -7,8 +7,8 @@
 
 `fleet7-leader.py` reads the leader's chain and `fleet7-phases.py` the
 followers', each over a whole leg. This prints the two side by side per
-window -- the leader's build phases from `builds-node0.log`, every follower's
-import (`engine_ms` of `raw newPayload`) from `builds-node{1..6}.log` -- and
+window -- the leader's build phases from every `builds-node*.log` (the leader
+rotates), every node's imports (`engine_ms` of `raw newPayload`) -- and
 beside them the box's counters from the launcher's 5 s samples
 (`mem-<tag>.txt`: fleet major faults, MemAvailable, one execution layer's
 RSS), because the same leg can lose window 1 to the leader's chain and
@@ -82,13 +82,21 @@ def main():
         tag = os.path.basename(bench).replace('bench-', '')
         for cand in glob.glob(os.path.expanduser(f'~/.claude/jobs/*/tmp/mem-{tag}.txt')):
             mem_path = cand
-    builds = [(t, d) for t, d in rows(f'{bench}/builds-node0.log', 'payload build phases') if d.get('txs', 0) >= FULL]
+    # The leader rotates (F7_LEADER_TENURE), so the builds come from every
+    # node's log, and every node is a follower for the blocks it did not
+    # build: one column per node, node0 included.
+    builds = sorted(
+        (t, d)
+        for path in glob.glob(f'{bench}/builds-node[0-9].log')
+        for t, d in rows(path, 'payload build phases')
+        if d.get('txs', 0) >= FULL
+    )
     if not builds:
         print('no full builds in', bench)
         return
     t0 = builds[0][0]
     followers = {}
-    for path in sorted(glob.glob(f'{bench}/builds-node[1-9].log')):
+    for path in sorted(glob.glob(f'{bench}/builds-node[0-9].log')):
         node = os.path.basename(path)[len('builds-'):-len('.log')]
         followers[node] = [(t, d) for t, d in rows(path, 'raw newPayload') if d.get('txs', 0) >= FULL]
     samples = mem_samples(mem_path, 0)
@@ -130,7 +138,7 @@ def main():
             line += ' |          -        -      -'
         print(line)
     print()
-    print('leader: builder phases (ms, median of full builds on node0); followers: engine_ms of raw newPayload per node')
+    print('leader: builder phases (ms, median of full builds, whichever node led); followers: engine_ms of raw newPayload per node')
     print('box: fleet major faults within the window, MemAvailable and one EL RSS (medians) from the launcher\'s samples'
           + ('' if samples else ' -- no sample file found; pass it as the second argument'))
 

@@ -1513,6 +1513,40 @@ table. Recorded, not scheduled: it is worth a block only once the tail is gone. 
 read 277,088 / 277,078 = 51 blocks, the same number as loop118 K2: the record configuration
 now reads 277k on window 1 repeatably.
 
+**loop120 (2026-09-10 17:06-17:37 EDT): the tenure change measured, the compaction ratio, and
+282,517.** Same binary as loop118-119 plus the compaction thread at nice 10 (all legs) and the
+flood funding through every node's RPC (so a 64-view tenure can start). W R1 K1 T1 R2 K2 T2:
+K = ratio 1 (loop118's arm plus the nice), R = `N42_QMDB_CHECKPOINT_RATIO=4`, T = ratio 4 +
+`F7_LEADER_TENURE=64`. The per-window table (`fleet7-windows.py`, which now follows the
+rotating leader and prints every node's imports) and the cycle table:
+
+    leg  win1          win2     win3     round    w1 mean/median  >700 ms  same-leader  tenure changes w1/w2  follower w1
+    R1   277,087 (51)  211,692  161,798  19.53M   578 / 541       1.7 blk  4            3 / 3                 345-368
+    K1   275,606 (51)  206,412  189,991  20.17M   575 / 545       1.5 blk  3            3 / 3                 331-361
+    T1   282,173 (52)  213,021  188,850  20.53M   564 / 539       0.6 blk  3            1 / 0                 337-364
+    R2   271,656 (51)  211,830  195,529  20.38M   581 / 553       1.4 blk  0            3 / 3                 342-372
+    K2   271,654 (51)  211,821  179,249  19.89M   584 / 560       1.8 blk  2            3 / 3                 345-372
+    T2   282,517 (52)  208,088  188,861  20.39M   568 / 545       1.1 blk  2            1 / 0                 343-368
+
+The tenure change is worth what the cycle table said it was: one change a window instead of
+three, the excess over 700 ms down to 0.6-1.1 blocks, the mean cycle 564-568 against 575-584,
+and both T legs read 52 blocks -- **282,517 and 282,173, the two best windows of the campaign**
+-- with window 2 at 43-44 blocks against 40-43. Adopted for the bench: `F7_LEADER_TENURE=64`
+joins the launchers' R set (it is a chain rule, derived into the bench genesis; a production
+chain that wants a short tenure gets the same number back from B0's code form, the incoming
+leader building on its own imported post-state without the forkchoice). Ratio 4 against 1 is
+a tie to the block (277,087 / 271,656 against 275,606 / 271,654): five compactions a leg
+instead of thirteen, but each larger and all seven nodes at the same second (868 MB in 16 s
+each at block ~216), and R1's window 3 lost a view timeout right there. The default stays 1.
+The nice is kept (it costs nothing; the median follower import is 331-372 on every leg, the
+same as loop118-119's K legs).
+
+What window 1 is now: 52 blocks at a median cycle of ~540 ms = the slowest follower's import
+(~360 ms: decode 10, convert 37, senders 37, execution 92, root 56, hashed 23, carry 21,
+engine 28, transport 23) + push ~35 + commit ~10 + seal/encode ~20, and the tail is gone. The
+round is three windows, and windows 2-3 (43 and 35-36 blocks) are now the larger loss:
+plan v3 phase M.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

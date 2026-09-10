@@ -23,9 +23,11 @@ shape a real chain would produce, and record what the ceiling is made of.
   (88k accounts per 163k transactions), BNB (46k), Polygon (11k) and Tron
   (173k): ours is conservative, close to Tron's.
 - **Throughput at that shape.** 244-253k TPS on window 1 at a 0.64-0.67 s
-  cycle; 16.8-18.2M transactions per round. **Best window 1: loop118 K2,
-  277,001 at 51 blocks, and best round: loop118 K1, 271,650 / 222,695 / 195,425 =
-  20,701,000** (2026-09-10, the QMDB checkpoint compacted on a background thread instead
+  cycle; 16.8-18.2M transactions per round. **Best window 1: loop120 T2, 282,517 at
+  52 blocks** (2026-09-10 evening, leader tenure 64 on top of the background compaction:
+  one tenure change a window instead of three; T1 282,173; NATIVE_FLEET7 loop120), and
+  **best round: loop118 K1, 271,650 / 222,695 / 195,425 = 20,701,000**; before them loop118 K2
+  277,001 at 51 blocks (2026-09-10, the QMDB checkpoint compacted on a background thread instead
   of cloned under the forest lock; bookended K 271,650 / 277,001 against S 266,224 /
   270,787 -- one block a window from the stalls it removes; NATIVE_FLEET7 loop118).
   Before it: loop111 B2, 275,839 at 51 blocks (2026-09-09 night, the round-43 configuration with

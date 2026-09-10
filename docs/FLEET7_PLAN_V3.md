@@ -272,8 +272,15 @@ against 4M: the senders phase 37 -> 17 ms as computed (157k of 163k cached), and
 lost a block a window and 0.5-1M a round to the memory (EL RSS +1.5 GB, major faults 3.5-4.8x
 in window 1, six same-leader stalls against two). Kept at 4M; the 20 ms needs a form that
 costs no memory (a shallower queue, a 16-byte tag, or a set-associative table) and is worth
-a block only once the tail is gone. loop120 (armed): the compaction at nice 10 and
-`N42_QMDB_CHECKPOINT_RATIO=4`, and the tenure-64 legs.*
+a block only once the tail is gone. loop120: the tenure change measured -- `F7_LEADER_TENURE=64`
+reads 282,173 / 282,517 (52 blocks, the two best windows) against 271-277k at tenure 16, the
+excess over 700 ms down to 0.6-1.1 blocks, one change a window; adopted for the bench (B0's
+code form, the incoming leader building on its imported post-state without the forkchoice,
+is what gives a short-tenure chain the same number). Ratio 4 against 1: a tie, and the
+seven simultaneous 868 MB compactions cost R1 a window-3 timeout; default stays 1. The nice
+is kept. **Window 1's tail is gone; what remains there is the slowest follower's import
+(~360 ms) plus ~65 ms of fixed cost. The round's larger loss is windows 2-3 (43 and 35-36
+blocks against 52): phase M is next, then B2/B3.***
 
 B1. **Converged pools**: make `F7_INGEST_ALL=1` actually converge so a
     follower's senders phase is a lookup (38 -> ~3 ms) and its mined-removal
