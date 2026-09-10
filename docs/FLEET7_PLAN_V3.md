@@ -267,8 +267,13 @@ building on its own imported post-state without the forkchoice. B1 has a cause: 
 sender cache is direct-mapped (`fixed-cache` evicts on collision), 4M entries, and the queue
 holds ~360k transactions ahead of the chain, so ~13% of a block's senders are evicted before
 the follower imports it (22k batch-verified again, senders 37 ms instead of ~5); the
-predicted eviction 1 - exp(-520k/4M) = 12% matches. loop119 runs 16M entries (~1 GB a node)
-against 4M, judged by `senders_cached` first.*
+predicted eviction 1 - exp(-520k/4M) = 12% matches. loop119 ran 16M entries (~1 GB a node)
+against 4M: the senders phase 37 -> 17 ms as computed (157k of 163k cached), and the fleet
+lost a block a window and 0.5-1M a round to the memory (EL RSS +1.5 GB, major faults 3.5-4.8x
+in window 1, six same-leader stalls against two). Kept at 4M; the 20 ms needs a form that
+costs no memory (a shallower queue, a 16-byte tag, or a set-associative table) and is worth
+a block only once the tail is gone. loop120 (armed): the compaction at nice 10 and
+`N42_QMDB_CHECKPOINT_RATIO=4`, and the tenure-64 legs.*
 
 B1. **Converged pools**: make `F7_INGEST_ALL=1` actually converge so a
     follower's senders phase is a lookup (38 -> ~3 ms) and its mined-removal

@@ -1485,6 +1485,34 @@ it, the funding went to node0's RPC alone, and at tenure 64 node1 then node2 led
 each -- node0's turn came at view 448, after the 120 s wait. Not a tenure problem: the flood
 now sends every funding batch to every node's RPC (`fund_others`), and the T legs run again.
 
+**loop119 (2026-09-10 16:36-16:57 EDT): the Ed25519 sender cache, four times larger, and the
+memory it costs.** Plan v3 B1 had a cause before it had a round: a follower's senders phase
+reads 37 ms because 22,000 of a block's 163,000 senders (13.5%) are not in the shared Ed25519
+cache when the block arrives and are batch-verified again. The cache is `fixed-cache`, a
+direct-mapped table that evicts on collision, at 4M entries (`N42_ALTSIG_SENDER_CACHE`), and
+the queue holds ~360,000 transactions ahead of the chain; the eviction a transaction suffers
+between its admission and its block is 1 - exp(-520k / 4M) = 12%, which is the measured miss.
+C legs ran 16M entries, A legs the record 4M, same binary as loop118's K arm:
+
+    leg  cache  win1          win2     win3     round    w1 mean/median  stalls  follower w1  senders  cached   EL RSS  majflt w1
+    C1   16M    266,554 (50)  200,910  179,247  19.41M   588 / 547       6       322-354      15-20    157k     9.07    144,975
+    A1    4M    277,088 (51)  206,400  195,495  20.38M   578 / 542       2       342-367      36-40    141k     7.68     40,394
+    C2   16M    271,223 (51)  195,542  184,643  19.55M   584 / 547       6       314-341      15-20    157k     9.23    194,553
+    A2    4M    277,078 (51)  206,401  179,225  19.89M   581 / 548       2       346-371      36-40    141k     7.63     61,706
+
+The cut is real and exactly as computed: 157,000 of 163,000 cached (96.4%; the formula says
+96.8%), the senders phase 37 -> 17 ms, the follower's import 15-25 ms shorter in window 1.
+And the fleet reads it as a loss on every window: the table is 1 GB a node instead of 256 MB
+(EL RSS +1.4-1.6 GB), the fleet's major faults in window 1 go 3.5-4.8x, the same-leader stalls
+6 against 2 (builds slowed under the faults), and the C legs lose a block in window 1 and
+0.5-1M transactions a round. Kept at 4M. The 20 ms has to be bought without memory: a
+shallower queue (fewer inserts between a sender's admission and its block; the gate's high
+water is `N42_TX_INGEST_HIGH_WATER`, 90,000 today, and the builder needs one block plus margin),
+a smaller entry (a 16-byte tag of the hash instead of the 32-byte key), or a set-associative
+table. Recorded, not scheduled: it is worth a block only once the tail is gone. The two A legs
+read 277,088 / 277,078 = 51 blocks, the same number as loop118 K2: the record configuration
+now reads 277k on window 1 repeatably.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
