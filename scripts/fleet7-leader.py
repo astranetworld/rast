@@ -55,6 +55,10 @@ def main():
                 continue
             t = datetime.fromisoformat(m.group(1)).timestamp()
             d = {a: int(b) for a, b in FIELD.findall(line)}
+            # `ahead=true|false` on the proposal line: whether it found a
+            # build prepared ahead or built on the critical path.
+            if kind == 'propose':
+                d['ahead'] = 0 if 'ahead=false' in line else 1
             rows.append((t, kind, d))
     rows.sort(key=lambda r: r[0])
     full = [t for t, k, d in rows if k == 'prepared' and d.get('bytes', 0) > BIG_BODY]
@@ -68,14 +72,19 @@ def main():
         return (f'{st.median(v):.0f}', len(v)) if v else ('-', 0)
 
     print(f'--- leader chain ({ROOT}), full blocks, 30 s windows from the first full body ---')
-    print(f'{"win":5s} {"bodies":>6s} {"own_rt":>6s} {"fcu":>5s} {"build":>5s} {"waited":>6s} {"n":>3s} {"commit->body":>12s} {"cycle":>6s} {"encode":>6s} {"fsync":>6s}')
+    print(f'{"win":5s} {"bodies":>6s} {"own_rt":>6s} {"fcu":>5s} {"build":>5s} {"waited":>6s} {"n":>3s} {"now":>4s} {"now_ms":>6s} {"commit->body":>12s} {"cycle":>6s} {"encode":>6s} {"fsync":>6s}')
     for i in range(6):
         a, b = t0 + 30 * i, t0 + 30 * (i + 1)
         rs = [r for r in rows if a <= r[0] < b]
         bodies = sum(1 for _, k, d in rs if k == 'prepared' and d.get('bytes', 0) > BIG_BODY)
         if not bodies:
             continue
-        waited, n = med(rs, 'propose', 'fcu_ms')
+        # A proposal that found its build ahead waited for it (`fcu_ms` on
+        # that line is the wait); one that did not (`ahead=0`) built on the
+        # critical path, and its fcu/build belong in their own column.
+        waited, n = med(rs, 'propose', 'fcu_ms', lambda d: d.get('ahead', 1) == 1)
+        built_now = [d for _, k, d in rs if k == 'propose' and d.get('ahead', 1) == 0]
+        now_ms = f"{st.median([d.get('fcu_ms', 0) + d.get('build_ms', 0) for d in built_now]):.0f}" if built_now else '-'
         ev = [(t, k, d) for t, k, d in rs if k == 'commit' or (k == 'prepared' and d.get('bytes', 0) > BIG_BODY)]
         gaps, cyc, last_c, last_p = [], [], None, None
         for t, k, d in ev:
@@ -89,12 +98,13 @@ def main():
             last_p = t
         fs, fsn = med(rs, 'fsync', 'sync_ms')
         print(f'{"win" + str(i + 1):5s} {bodies:6d} {med(rs, "own", "round_trip_ms")[0]:>6s} {med(rs, "ahead", "fcu_ms")[0]:>5s} '
-              f'{med(rs, "ahead", "build_ms")[0]:>5s} {waited:>6s} {n:3d} '
+              f'{med(rs, "ahead", "build_ms")[0]:>5s} {waited:>6s} {n:3d} {len(built_now):4d} {now_ms:>6s} '
               f'{(f"{st.median(gaps):.0f}" if gaps else "-"):>12s} {(f"{st.median(cyc):.0f}" if cyc else "-"):>6s} '
               f'{med(rs, "prepared", "encode_ms", lambda d: d.get("bytes", 0) > BIG_BODY)[0]:>6s} {fs + "x" + str(fsn):>6s}')
     print()
     print('own_rt  = own block imported by header, round trip ms      fcu/build = the build ahead: forkchoice round trip, then the payload job')
-    print('waited  = ms the leader waited for its build ahead AFTER holding the quorum (n = blocks that had a build ahead)')
+    print('waited  = ms the leader waited for its build ahead AFTER holding the quorum (n = proposals that had one)')
+    print('now     = proposals with NO build ahead, built on the critical path; now_ms = their forkchoice + build')
     print('commit->body = leader commit of the parent -> next full body prepared      cycle = full body to full body on the leader')
 
 
