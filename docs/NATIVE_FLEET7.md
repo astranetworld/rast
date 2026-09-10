@@ -1327,8 +1327,75 @@ against 446-578 -- the forest-lock contention, now the whole of the difference. 
 window (8 blocks) is the round-43 memory stall (views 237-238 timed out with "the votes
 did not arrive"), which the B legs also draw one leg in two; not the arm's.
 
-What this settles: build-on-seal removes the 130 ms of plumbing it was meant to
-(`own_rt` and `fcu` leave the chain, `waited` reads 0), and gives it back, with
+**loop115 (2026-09-10 06:16-06:38 EDT): the forest no longer moves for persistence, and
+build-on-seal reaches parity.** `compute` now captures each block's delta from its parent
+(the appended slots, read in parallel, and the slots its undo names), `insert` files it,
+`on_canonical` takes the chain of deltas from the persisted head and appends them to the
+log without touching the tree, and `set_canonical` moves the tree only when it does not
+already stand past the head (e7b60c513; the measured `delta_since` remains for a branch
+switch or a restored forest). Both arms carry it -- W S1 B1 S2 B2 after gov5's overnight
+run, release build at 06:12:
+
+    W   211,384 / 184,686 / 173,760  (warm-up, not read)
+    S1  266,216 / 127,584 /  52,029      B1  260,789 / 195,539 / 173,817
+    S2  260,744 / 217,227 / 184,670      B2  265,985 / 200,822 / 190,063
+
+Window 1 is now the same on both arms (260-266k, 48-49 blocks). The on-seal chain reads as
+designed on every window of S2: `fcu` 0, `waited` 0, `commit->body` 103-128 against the B
+legs' 152-265; the direct build 379 ms median in window 1 (was 428-438), `rename` 0 median
+(p90 113, was 172-357), the own import's hand-off 47/134 (was 58/193-376). S2's windows 2-3
+are the best of the campaign (217k / 185k against the B legs' 196-201k / 174-190k), and
+its round, 19,884,000, is the best round yet (the previous best 18,388,500, loop104 A2);
+B2's 19,706,000 also passes it. S1's windows 2-3 collapsed (127k, 52k) with every
+follower's import unchanged (315-383 ms), no memory storm (faults tiny, 57 GB available)
+and only the startup view timing out: the flood's send rate fell from 163k/s to 121k/s as
+its per-node RPC replies went from 0.85 to 2 s, and the leader's builds waited 618 ms for
+the queue (`pool_ms`) -- a supply-side stall the S2 leg did not reproduce (its replies stayed
+under 1.04 s and every window was full); one leg, unexplained, on the list.
+
+The cost of the capture: the assembler's QMDB root phase reads 76-105 ms on the B legs
+against ~60 before (147,000 appended entries cloned per block, on every compute --
+builds and follower imports alike), and B1/B2's window 1 is 260-266k against loop114's
+266k twice: within a block, but the capture is not free and could be lazy (the appended
+range is immutable until a descendant flips a slot, which the descendant's undo records).
+loop116 (armed) repeats the round on the same binaries.
+
+**loop116 (2026-09-10 06:42-07:04 EDT): the repeat, and the S arm's collapse explained.**
+Same binaries, W S1 B1 S2 B2:
+
+    W   260,790 / 200,970 / 179,246  (warm-up, the box already warm)
+    S1  248,774 / 211,787 / 206,361  = 20,007,660, the best round yet
+    B1  263,638 / 195,474 / 190,111  = 19,476,690
+    S2  233,626 /  33,982 /     267  (collapsed)
+    B2  262,225 / 190,098 / 179,247  = 18,947,100
+
+The shape of loop115 repeats: on window 1 the S arm reads 2-3 blocks under the B arm
+(248-261k against 262-266k), on windows 2-3 it reads ~16k over it (212k / 206k against
+190-201k / 174-190k), and its rounds are the campaign's best -- when the leg survives.
+Two of the four S legs of loop115-116 did not, and S2's full logs (every node's `el.log`
+and `v.log`, captured before the next leg wiped them) say why. At block 154 the own
+block's hand-off waited 491 ms on the forest lock (a QMDB checkpoint: `snapshot()`
+clones the whole tree under the lock, ~0.5 s, every 15-20 full blocks). By the time that
+import completed, block 155 was sealed and 156's on-seal build was running; the import's
+completion asked `prepare_build_on(154)` as it always has, the driver found a prepared
+build on a different parent, aborted it and started a forkchoice build on 154 -- and a
+`forkchoiceUpdated` whose head is two blocks behind the chain is, to reth, a reorg: it
+unwound 155-156 ("Changeset cache MISS in range, falling back to aggregate DB-based
+computation start_block=147 end_block=149"), the engine thread was gone for 11 s (the
+own-block import of 155 reports `total_ms=11101`), the validator's HTTP request timed
+out and it logged its own block as rejected, block 156 rebuilt on the unwound state
+executed with gas 0 (loop106's symptom, the hashed state and the database disagreeing)
+and was refused as invalid, an own block at that height "was not the one committed"
+and its 163,000 transactions went back to the queue (566k queued), and the flood's
+replies went from 0.6 s to 7 s to none. The B arm cannot do this: its import always
+completes before the next block is sealed. Fix (e2 in the driver): a build-ahead request
+for a parent older than the build already prepared is ignored (`AheadBuild::is_newer_than`,
+by the attributes' `slot_number`, which on this chain is the block number). loop117
+carries it. After that the checkpoint itself is the next cut: its clone of the tree
+under the forest lock and its `move_to(head)`, which reverts the pending build.
+
+What loop110-114 settled: build-on-seal removes the 130 ms of plumbing it was meant to
+(`own_rt` and `fcu` leave the chain, `waited` reads 0), and gave it back, with
 interest, in forest-lock contention -- the direct build must not touch the forest
 while the parent is being handed off: compute the root on the tree under the
 builder's own hash (no rename on the build path; the hand-off renames later), and

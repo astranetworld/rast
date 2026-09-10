@@ -189,11 +189,20 @@ Fixed so far: taken builds stay findable (`find_kept`), a refused on-seal build 
 replaced by the import's forkchoice build, on-seal only for own blocks, the QMDB root
 job on its own thread. loop114 (2026-09-10 01:06) measured them: no hang, 0 refusals, 0
 critical-path builds, and the S legs still 233,620 / 244,491 against B legs 266,225 /
-266,222 -- the contention alone is 6-7 blocks a window. A1/A2 pays only once the direct build
-does not touch the forest while the parent is handed off: compute the root on the tree
-under the builder's own hash (no rename on the build path) and take persistence off the
-forest lock (a snapshot for `compute`, or a reader/writer split). Until then the flag
-stays off.*
+266,222 -- the contention alone is 6-7 blocks a window. That contention was the
+forest moving its one tree for persistence (`set_canonical`/`delta_since` stood the tree
+at the head, reverting the next block's build for the next computation to replay);
+e7b60c513 captures each block's delta at compute time and persistence consumes it without
+moving the tree. loop115 (06:38): S 266,216 / 260,744 against B 260,789 / 265,985 on
+window 1 -- parity -- and S2's windows 2-3 the best of the campaign (217k / 185k, round
+19,884,000, the best round yet); one S leg's windows 2-3 collapsed on the supply side
+(flood replies 2 s, builds waiting 618 ms for the queue), unexplained. loop116 repeats
+the round: loop116 S1 248,774 / 211,787 / 206,361 = 20,007,660 (the best round), B1/B2 19.5M /
+18.9M, and S2 collapsed -- a stale build-ahead request after a slow hand-off became a reorg
+(NATIVE_FLEET7 loop116); the guard is in loop117. The flag stays off by default until an
+S-B-S-B round has no collapse; the capture's own cost
+(the assembler's root phase 76-105 ms against ~60) is the next cut -- a lazy appended
+range.*
 
 A1/A2. **Measure build-on-seal** with loop110 as written (S-B-S-B, pacing
     450, grace 600, rayon 16). Pass criteria, in order: on-seal builds appear
