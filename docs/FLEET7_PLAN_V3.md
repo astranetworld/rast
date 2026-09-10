@@ -233,9 +233,12 @@ growth (4.6 -> 9.7 -> 11.7 GB a leg) is the QMDB tree kept in memory by `QmdbCom
 a slot, 147,000 new slots a block, 90% dead within ten blocks), the forest's 64 retained
 block records (~2 GB), the parallel executor's bundles until persistence (1.3 GB) and the
 leader's builds (1.8 GB). Not reth's chain, not the sender cache, not the queue. M2a =
-`N42_QMDB_RETAIN_DEPTH` (loop122, D 16 against A 64); M2b = tombstone dead entries in the
-compat tree (a checkpoint format version); M2c = the value arena / prefix index `TwigTree`
-already has. M3 (heap policy) after those.*
+`N42_QMDB_RETAIN_DEPTH` -- loop122: 16 against 64 ends the leg 3.7 GB smaller per execution
+layer, halves window 2's major faults and gives window 2 four or five blocks on the chain's
+clock (46 against 41-42); adopted in the bench R set. M2b/M2c are superseded by the entry
+log (`docs/QMDB_ENTRY_LOG.md`): step 1 (the entries in an append-only file behind
+`N42_QMDB_ENTRY_FILE=1`) is built and loop123 measures it; steps 3-5 (formats v2, restart
+from the file, dead-twig trimming) follow. M3 (heap policy) after those.*
 
 M1. **Attribute the growth.** One profiling leg with `fleet7-profile.sh
     --alloc` on the leader *and* one follower during window 2, plus

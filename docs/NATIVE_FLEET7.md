@@ -1590,6 +1590,27 @@ full entry, since it is live then). gov5's portable export needs full dead entri
 have to run on a node started with them kept. (M2c) The value arena and 16-byte prefix index
 that `TwigTree` in `twig-core/lib.rs` already has, for the compat tree.
 
+**loop122 (2026-09-10 18:40-19:02 EDT, plan v3 M2a): the forest's record retention.** D legs
+`N42_QMDB_RETAIN_DEPTH=16`, A legs the default 64, record configuration + tenure 64 (the
+launchers' R set carries `F7_LEADER_TENURE=64` from here on):
+
+    leg  win1 (flood)   win2     win3     round    blocks/window (chain, from the first full body)  w2 median cycle  w2 follower  w2 majflt  EL RSS end  MemAvail end
+    D1   285,737 (53)   197,040  181,595  19.94M   54 / 46 / 35                                      625 ms           366-420      679k       11.3 GB     43 GB
+    A1   283,916 (52)   201,792  183,377  20.08M   54 / 42 / 35                                      702 ms           405-432      1.30M      15.0 GB     21 GB
+    D2   283,888 (52)   208,038  174,806  20.02M   54 / 46 / 38                                      637 ms           372-408      642k       11.4 GB     47 GB
+    A2   281,855 (52)   202,159  200,398  20.54M   54 / 41 / 35                                      704 ms           427-467      1.43M      11.8 GB     44 GB
+
+Read on the chain's side the cut does what loop121 said it would: one execution layer ends
+the leg 3.7 GB smaller (A1's 15.0 against D1's 11.3), the fleet's major faults in window 2
+halve (0.64-0.68M against 1.30-1.43M), the followers' window-2 import is 40-60 ms shorter and
+the window-2 cycle 65-80 ms shorter -- 46 blocks against 41-42, four or five blocks, on both
+pairs. The flood's own window totals do not show it (its windows are cut from the flood's
+clock, and a block that lands across a window edge moves 163,000 transactions between
+them); the round totals are within the run-to-run spread. Adopted for the bench:
+`N42_QMDB_RETAIN_DEPTH=16` joins the launchers' R set (the code's default stays 64 until the
+entry log's step 3 makes the records cheap regardless). Window 1 read 52-53 blocks on all
+four legs (285,737 the best window 1 so far).
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
