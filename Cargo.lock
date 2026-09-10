@@ -8348,6 +8348,7 @@ dependencies = [
  "bincode",
  "blake3",
  "hex",
+ "memmap2",
  "rand 0.9.5",
  "rayon",
  "serde",

@@ -8,6 +8,7 @@
 
 use std::{collections::HashMap, io::Read};
 
+use crate::entry_store::Entries;
 use crate::{Hash, NULL_HASH, TWIG_HEIGHT, TWIG_SIZE, hash_leaf, hash_node, null_level};
 
 const BITS_PREFIX: u8 = 0x03;
@@ -86,6 +87,9 @@ pub struct QmdbOperation {
 pub enum QmdbOperationError {
     #[error("QMDB block mutation contains duplicate key {0:?}")]
     DuplicateKey(Hash),
+    /// The entry file could not be written.
+    #[error("QMDB entry store: {0}")]
+    Store(String),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -749,13 +753,6 @@ fn read_bytes<'a>(
 }
 
 #[derive(Clone)]
-struct Entry {
-    key: Hash,
-    value: Vec<u8>,
-    active: bool,
-}
-
-#[derive(Clone)]
 struct Twig {
     nodes: Box<[Hash; 2 * TWIG_SIZE]>,
     bits: [u8; BITS_BYTES],
@@ -870,17 +867,14 @@ fn held_slots(index: &KeyIndex, operations: &[QmdbOperation]) -> Vec<Option<u64>
 /// Retires every slot `held` names: the entries' active flags and the twigs'
 /// bits, each entry and each twig checking a bitmap of the slots on the
 /// worker pool; the twigs touched are marked for a bit-set rehash.
-fn retire_slots(entries: &mut [Entry], twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[Option<u64>]) {
+fn retire_twigs(slots: usize, twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[Option<u64>]) {
     const WORDS_PER_TWIG: usize = TWIG_SIZE / 64;
-    // The index only ever names active slots (`set` retires the old slot as
-    // it inserts the new one, `delete` removes the key, an undo revives and
-    // re-indexes together), so no entry needs reading here: reading 133,000
-    // of them at random was the cost this pass exists to avoid.
-    let mut bits = vec![0u64; entries.len().div_ceil(64)];
+    // The entries' flags are cleared by `Entries::retire`; here the twigs'
+    // bit sets, each twig checking a bitmap of the slots on the worker pool.
+    let mut bits = vec![0u64; slots.div_ceil(64)];
     let mut any = false;
     for slot in held.iter().flatten() {
         let slot = *slot as usize;
-        debug_assert!(entries[slot].active, "the index named an inactive slot");
         bits[slot / 64] |= 1 << (slot % 64);
         any = true;
     }
@@ -890,15 +884,6 @@ fn retire_slots(entries: &mut [Entry], twigs: &mut [Twig], dirty: &mut Vec<u8>, 
     if dirty.len() < twigs.len() {
         dirty.resize(twigs.len(), 0);
     }
-    let clear_entries = |(chunk, word): (&mut [Entry], &u64)| {
-        if *word != 0 {
-            for (i, entry) in chunk.iter_mut().enumerate() {
-                if (*word >> i) & 1 == 1 {
-                    entry.active = false;
-                }
-            }
-        }
-    };
     let clear_twig = |(twig_id, (twig, mark)): (usize, (&mut Twig, &mut u8))| {
         let from = (twig_id * WORDS_PER_TWIG).min(bits.len());
         let to = ((twig_id + 1) * WORDS_PER_TWIG).min(bits.len());
@@ -923,21 +908,19 @@ fn retire_slots(entries: &mut [Entry], twigs: &mut [Twig], dirty: &mut Vec<u8>, 
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        entries.par_chunks_mut(64).zip(bits.par_iter()).for_each(clear_entries);
         twigs.par_iter_mut().zip(dirty[..n].par_iter_mut()).enumerate().for_each(clear_twig);
     }
     #[cfg(not(feature = "rayon"))]
     {
-        entries.chunks_mut(64).zip(bits.iter()).for_each(clear_entries);
         twigs.iter_mut().zip(dirty[..n].iter_mut()).enumerate().for_each(clear_twig);
     }
 }
 
 /// The undo entries for the slots `held` names: what each holds now.
-fn undo_entries(entries: &[Entry], held: &[Option<u64>]) -> Vec<UndoEntry> {
+fn undo_entries(entries: &Entries, held: &[Option<u64>]) -> Vec<UndoEntry> {
     let entry = |slot: &u64| {
-        let e = &entries[*slot as usize];
-        UndoEntry { slot: *slot, key: e.key, value: e.value.clone() }
+        let e = entries.entry(*slot as usize);
+        UndoEntry { slot: *slot, key: e.key, value: e.value }
     };
     #[cfg(feature = "rayon")]
     {
@@ -1056,6 +1039,9 @@ pub enum QmdbUndoError {
     /// A block is being recorded; reverting under it would corrupt the record.
     #[error("cannot apply an undo record while undo recording is active")]
     RecordingActive,
+    /// The entry file could not be shortened.
+    #[error("QMDB entry store: {0}")]
+    Store(String),
     /// A revived slot's entry disagrees with the record — the record does not
     /// belong to this tree's history.
     #[error("undo entry for slot {slot} does not match the tree's entry")]
@@ -1170,9 +1156,8 @@ impl std::hash::Hasher for KeyPrefixHasher {
 /// It deliberately rebuilds the small upper tree on root reads. gov5's
 /// incremental upper-tree and eviction optimizations can be added after this
 /// representation has complete replay-v2 vectors.
-#[derive(Clone)]
 pub struct QmdbCompatTree {
-    entries: Vec<Entry>,
+    entries: Entries,
     index: KeyIndex,
     twigs: Vec<Twig>,
     next_slot: u64,
@@ -1200,15 +1185,57 @@ impl Default for QmdbCompatTree {
     }
 }
 
+impl Clone for QmdbCompatTree {
+    /// A file-backed tree clones as a second handle on the same file; see
+    /// `FileEntries::duplicate` for what a clone may and may not do.
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.try_clone().expect("the entry file could not be reopened for a clone"),
+            index: self.index.clone(),
+            twigs: self.twigs.clone(),
+            next_slot: self.next_slot,
+            recording: self.recording.clone(),
+        }
+    }
+}
+
 impl QmdbCompatTree {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Entries::Heap(Vec::new()),
             index: KeyIndex::default(),
             twigs: Vec::new(),
             next_slot: 0,
             recording: None,
         }
+    }
+
+    /// Moves the entries into the append-only file at `path` (created, or
+    /// truncated), and appends there from now on. `docs/QMDB_ENTRY_LOG.md`.
+    /// The whole entry set is written once; a tree restored from a
+    /// checkpoint pays that at startup.
+    pub fn set_entry_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut file = crate::entry_store::FileEntries::create(path)?;
+        file.reserve(self.entries.len());
+        for slot in 0..self.entries.len() {
+            file.push(&self.entries.key(slot), self.entries.value(slot))?;
+            if !self.entries.is_active(slot) {
+                file.set_active(slot, false);
+            }
+        }
+        file.sync()?;
+        self.entries = Entries::File(file);
+        Ok(())
+    }
+
+    /// Where the entries live on disk, if they do.
+    pub fn entry_file(&self) -> Option<&std::path::Path> {
+        self.entries.file_path()
+    }
+
+    /// Makes the entry file's appends durable (nothing to do in the heap).
+    pub fn sync_entries(&mut self) -> std::io::Result<()> {
+        self.entries.sync()
     }
 
     pub fn next_slot(&self) -> u64 {
@@ -1226,7 +1253,7 @@ impl QmdbCompatTree {
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {
         self.index
             .get(key)
-            .map(|slot| self.entries[*slot as usize].value.as_slice())
+            .map(|slot| self.entries.value(*slot as usize))
     }
 
     /// Generate a gov5-compatible membership proof for an active key.
@@ -1260,7 +1287,7 @@ impl QmdbCompatTree {
 
         Some(QmdbProof {
             key: *key,
-            value: self.entries[slot as usize].value.clone(),
+            value: self.entries.value(slot as usize).to_vec(),
             slot,
             twig_path,
             active_bits: twig.bits,
@@ -1284,11 +1311,10 @@ impl QmdbCompatTree {
         self.ensure_twig(twig_id);
         self.twigs[twig_id].set_leaf(local, hash_leaf(&key, &value));
         self.twigs[twig_id].set_active(local, true);
-        self.entries.push(Entry {
-            key,
-            value,
-            active: true,
-        });
+        // A write the entry file refuses is a node that has lost its state;
+        // the block path (`apply_sorted_ops`) reports it, this one-at-a-time
+        // path is the genesis, the tests and the vectors.
+        self.entries.push(key, value).expect("the QMDB entry file could not be written");
         self.index.insert(key, slot);
     }
 
@@ -1366,8 +1392,8 @@ impl QmdbCompatTree {
         // Revivals below the cursor must name what the slot actually holds:
         // a record from another history would otherwise revive the wrong key.
         for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
-            let held = &self.entries[entry.slot as usize];
-            if held.key != entry.key || held.value != entry.value {
+            let slot = entry.slot as usize;
+            if self.entries.key(slot) != entry.key || self.entries.value(slot) != entry.value.as_slice() {
                 return Err(QmdbUndoError::EntryMismatch { slot: entry.slot });
             }
         }
@@ -1377,9 +1403,11 @@ impl QmdbCompatTree {
         // 1. Truncate the block's appends: drop their index mappings, clear
         //    their bits, null their leaves.
         for slot in prev..self.next_slot {
-            let entry = &self.entries[slot as usize];
-            if entry.active && self.index.get(&entry.key) == Some(&slot) {
-                self.index.remove(&entry.key);
+            if self.entries.is_active(slot as usize) {
+                let key = self.entries.key(slot as usize);
+                if self.index.get(&key) == Some(&slot) {
+                    self.index.remove(&key);
+                }
             }
             let twig_id = (slot as usize) / TWIG_SIZE;
             let local = (slot as usize) % TWIG_SIZE;
@@ -1388,7 +1416,7 @@ impl QmdbCompatTree {
             twig.bits[local / 8] &= !(1 << (local % 8));
             touched_twigs.insert(twig_id);
         }
-        self.entries.truncate(prev as usize);
+        self.entries.truncate(prev as usize).map_err(|e| QmdbUndoError::Store(e.to_string()))?;
         self.next_slot = prev;
 
         // 2. Drop twigs the truncation emptied entirely. The boundary twig,
@@ -1406,7 +1434,7 @@ impl QmdbCompatTree {
         //    the truncation.
         for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
             let slot = entry.slot;
-            self.entries[slot as usize].active = true;
+            self.entries.set_active(slot as usize, true);
             self.index.insert(entry.key, slot);
             let twig_id = (slot as usize) / TWIG_SIZE;
             let local = (slot as usize) % TWIG_SIZE;
@@ -1422,15 +1450,17 @@ impl QmdbCompatTree {
 
     /// Captures a slot's pre-deactivation state into the active record.
     fn record_deactivation(&mut self, slot: u64) {
-        let Some(record) = self.recording.as_mut() else {
+        if self.recording.is_none() {
             return;
-        };
-        let entry = &self.entries[slot as usize];
-        record.entries.push(UndoEntry {
-            slot,
-            key: entry.key,
-            value: entry.value.clone(),
-        });
+        }
+        let entry = self.entries.entry(slot as usize);
+        if let Some(record) = self.recording.as_mut() {
+            record.entries.push(UndoEntry {
+                slot,
+                key: entry.key,
+                value: entry.value,
+            });
+        }
     }
 
     /// Apply one block's mutations in the exact deterministic order used by gov5. Duplicates are
@@ -1502,7 +1532,8 @@ impl QmdbCompatTree {
         // The slots the block retires, cleared on the worker pool: every
         // entry and every twig checks its own against a bitmap, instead of
         // 133,000 random writes in sequence.
-        retire_slots(&mut self.entries, &mut self.twigs, &mut dirty, &held);
+        self.entries.retire(&held);
+        retire_twigs(self.entries.len(), &mut self.twigs, &mut dirty, &held);
         phases.retire_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         // The appends' index entries, inserted per shard afterwards; the
@@ -1511,7 +1542,7 @@ impl QmdbCompatTree {
         for ((operation, leaf), old_slot) in operations.into_iter().zip(leaves).zip(held) {
             match (operation.value, leaf) {
                 (Some(value), Some(leaf)) => {
-                    let slot = self.append_deferred(operation.key, value, leaf, &mut dirty);
+                    let slot = self.append_deferred(operation.key, value, leaf, &mut dirty)?;
                     appended.push((operation.key, slot));
                 }
                 _ => {
@@ -1534,7 +1565,7 @@ impl QmdbCompatTree {
     /// `set` for the block apply: the slot the key held already retired and
     /// recorded, the twig's hashing left to [`rehash_dirty`], the index
     /// insert left to the caller. Returns the slot appended.
-    fn append_deferred(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, dirty: &mut Vec<u8>) -> u64 {
+    fn append_deferred(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, dirty: &mut Vec<u8>) -> Result<u64, QmdbOperationError> {
         if let Some(record) = self.recording.as_mut() {
             record.appended_keys.push(key);
         }
@@ -1547,12 +1578,8 @@ impl QmdbCompatTree {
         twig.nodes[TWIG_SIZE + local] = leaf;
         twig.bits[local / 8] |= 1 << (local % 8);
         mark_dirty(dirty, twig_id, DIRTY_LEAVES);
-        self.entries.push(Entry {
-            key,
-            value,
-            active: true,
-        });
-        slot
+        self.entries.push(key, value).map_err(|e| QmdbOperationError::Store(e.to_string()))?;
+        Ok(slot)
     }
 
     pub fn root(&self) -> Hash {
@@ -1579,10 +1606,14 @@ impl QmdbCompatTree {
     /// cost of persisting a block is the size of the block rather than the size
     /// of the state.
     pub fn entry_at(&self, slot: u64) -> Option<QmdbEntrySnapshot> {
-        let entry = self.entries.get(usize::try_from(slot).ok()?)?;
+        let slot = usize::try_from(slot).ok()?;
+        if slot >= self.entries.len() {
+            return None;
+        }
+        let entry = self.entries.entry(slot);
         Some(QmdbEntrySnapshot {
             key: entry.key,
-            value: entry.value.clone(),
+            value: entry.value,
             active: entry.active,
         })
     }
@@ -1590,13 +1621,14 @@ impl QmdbCompatTree {
     pub fn snapshot(&self) -> QmdbSnapshot {
         QmdbSnapshot {
             next_slot: self.next_slot,
-            entries: self
-                .entries
-                .iter()
-                .map(|entry| QmdbEntrySnapshot {
-                    key: entry.key,
-                    value: entry.value.clone(),
-                    active: entry.active,
+            entries: (0..self.entries.len())
+                .map(|slot| {
+                    let entry = self.entries.entry(slot);
+                    QmdbEntrySnapshot {
+                        key: entry.key,
+                        value: entry.value,
+                        active: entry.active,
+                    }
                 })
                 .collect(),
         }
@@ -1622,11 +1654,12 @@ impl QmdbCompatTree {
                 }
                 tree.twigs[twig_id].set_active(local, true);
             }
-            tree.entries.push(Entry {
-                key: entry.key,
-                value: entry.value.clone(),
-                active: entry.active,
-            });
+            // A fresh tree keeps its entries in the heap, where a push
+            // cannot fail; `set_entry_file` moves them afterwards.
+            tree.entries.push(entry.key, entry.value.clone()).expect("a heap push cannot fail");
+            if !entry.active {
+                tree.entries.set_active(slot, false);
+            }
         }
         for twig in &mut tree.twigs {
             twig.recompute();
@@ -1674,11 +1707,10 @@ impl QmdbCompatTree {
     }
 
     fn deactivate(&mut self, slot: u64) {
-        let entry = &mut self.entries[slot as usize];
-        if !entry.active {
+        if !self.entries.is_active(slot as usize) {
             return;
         }
-        entry.active = false;
+        self.entries.set_active(slot as usize, false);
         let twig_id = (slot as usize) / TWIG_SIZE;
         let local = (slot as usize) % TWIG_SIZE;
         self.twigs[twig_id].set_active(local, false);

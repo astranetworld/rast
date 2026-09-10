@@ -166,6 +166,17 @@ fn with_configured_retention(forest: QmdbForest) -> QmdbForest {
     }
 }
 
+/// `N42_QMDB_ENTRY_FILE=1`: the tree's entries live in `qmdb/entries.log`
+/// instead of the heap (`docs/QMDB_ENTRY_LOG.md`, step 1). Off until a round
+/// reads it. The file is recreated from the checkpoint and the log at every
+/// start, so it is state the node can lose.
+fn entry_file_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_ENTRY_FILE").is_ok_and(|v| v == "1"))
+}
+
+const ENTRY_FILE: &str = "entries.log";
+
 /// Why the node's QMDB state could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeStateError {
@@ -456,8 +467,26 @@ impl QmdbNodeState {
                 return Err(NodeStateError::NoSnapshot { path, head_number });
             }
         };
-        *guard = Some(with_configured_retention(forest));
+        *guard = Some(self.configured(forest)?);
         Ok(())
+    }
+
+    /// The forest as the node's configuration wants it: the record
+    /// retention, and the entries in the file when asked.
+    fn configured(&self, forest: QmdbForest) -> Result<QmdbForest, NodeStateError> {
+        let forest = with_configured_retention(forest);
+        if !entry_file_enabled() {
+            return Ok(forest);
+        }
+        let path = self.inner.dir.join(ENTRY_FILE);
+        let started = std::time::Instant::now();
+        let forest = forest.with_entry_file(&path)?;
+        info!(
+            target: "n42.qmdb",
+            path = %path.display(), total_ms = started.elapsed().as_millis() as u64,
+            "moved the QMDB entries into the entry file",
+        );
+        Ok(forest)
     }
 
     /// Restores the forest from a cross-client portable snapshot — gov5's
@@ -511,7 +540,7 @@ impl QmdbNodeState {
             compacting: false,
         };
         info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
-        *self.lock() = Some(with_configured_retention(forest));
+        *self.lock() = Some(self.configured(forest)?);
         Ok(())
     }
 

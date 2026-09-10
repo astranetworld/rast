@@ -10,6 +10,7 @@
 //! Ported from gov5 `lib/qmdb` (Go); P1 is scalar + all-in-DRAM (no SSD entry-log,
 //! no eviction tiers, no compaction yet — those are P2+).
 
+pub mod entry_store;
 mod flat;
 pub mod qmdb_compat;
 mod simd;

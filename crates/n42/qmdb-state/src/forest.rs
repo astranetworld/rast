@@ -253,6 +253,16 @@ impl QmdbForest {
         Self::at(number, hash, tree)
     }
 
+    /// Moves the tree's entries into the append-only file at `path` and
+    /// appends there from now on (`docs/QMDB_ENTRY_LOG.md`): the heap then
+    /// holds an offset and a bit per slot instead of the entry. The file is
+    /// rebuilt from the checkpoint and the log at every start, so it needs
+    /// no durability of its own.
+    pub fn with_entry_file(mut self, path: &std::path::Path) -> Result<Self, StateError> {
+        self.tree.set_entry_file(path).map_err(|e| StateError::Undo(format!("entry file {}: {e}", path.display())))?;
+        Ok(self)
+    }
+
     fn at(number: u64, hash: B256, tree: QmdbCompatTree) -> Self {
         let root = B256::from(tree.root());
         let next_slot = tree.next_slot();

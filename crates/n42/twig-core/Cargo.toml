@@ -16,6 +16,7 @@ description = "QMDB-style twig engine (all-DRAM AlDBaran variant) — ported fro
 
 [dependencies]
 blake3.workspace = true
+memmap2.workspace = true
 # "std" as well as "derive": the workspace pins serde with default-features
 # off, so a crate that serialises a Vec has to ask for it. Without this the
 # crate builds only when something else in the graph happens to enable it,
