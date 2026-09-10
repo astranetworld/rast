@@ -140,6 +140,32 @@ fn apply_compact_nice() {
     }
 }
 
+/// `N42_QMDB_RETAIN_DEPTH`: how many blocks below the head the forest keeps
+/// its records for (the sorted operations to re-apply a block after a move,
+/// and the undo record with the entries it deactivated). The default is the
+/// forest's own (64). At the bench tier a record is ~35 MB, so 64 of them
+/// are ~2 GB a node (loop121's heap profile); HotStuff-2 finality is two
+/// views and the persisted head lags the canonical one by a block or two, so
+/// a much shallower window is safe -- it must only exceed that lag, since
+/// persistence walks the records from the persisted head to the block.
+fn retain_depth() -> Option<u64> {
+    static DEPTH: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("N42_QMDB_RETAIN_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n >= 2)
+    })
+}
+
+/// The forest with the configured record retention.
+fn with_configured_retention(forest: QmdbForest) -> QmdbForest {
+    match retain_depth() {
+        Some(depth) => forest.with_retain_depth(depth),
+        None => forest,
+    }
+}
+
 /// Why the node's QMDB state could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeStateError {
@@ -430,7 +456,7 @@ impl QmdbNodeState {
                 return Err(NodeStateError::NoSnapshot { path, head_number });
             }
         };
-        *guard = Some(forest);
+        *guard = Some(with_configured_retention(forest));
         Ok(())
     }
 
@@ -485,7 +511,7 @@ impl QmdbNodeState {
             compacting: false,
         };
         info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
-        *self.lock() = Some(forest);
+        *self.lock() = Some(with_configured_retention(forest));
         Ok(())
     }
 

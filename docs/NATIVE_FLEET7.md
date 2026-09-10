@@ -1547,6 +1547,49 @@ engine 28, transport 23) + push ~35 + commit ~10 + seal/encode ~20, and the tail
 round is three windows, and windows 2-3 (43 and 35-36 blocks) are now the larger loss:
 plan v3 phase M.
 
+**loop121 (2026-09-10 17:49-17:53 EDT, plan v3 M1): what the execution layer's 12 GB is.** One
+leg on the profiling build with jemalloc's heap profiler (`--features jemalloc-prof`,
+`MALLOC_CONF=...,prof:true,prof_active:true,lg_prof_interval:33,prof_prefix:...`, a dump per
+8 GB allocated -- every 1.5 s, the execution layer allocates ~5 GB/s), record configuration +
+tenure 64, its TPS not read (279,439 / 201,347 / 190,016). The box's anonymous memory over the
+leg: 9.6 -> 77 -> 81 -> 92 -> 109 GB, MemAvailable 119 -> 20 GB. The dumps nearest each window
+boundary, read with jeprof (`--cum`) for a follower (node5) and the window-2 leader (node2):
+
+    node5 live heap   start 4.6 GB   w1 end 9.7 GB   w2 end 11.7 GB          node2 w2 end 12.7 GB
+
+    at w2's end, by cumulative bytes (node5 / node2):
+      QMDB tree entries  (compute_operations -> apply_sorted_ops -> Vec grow, Entry::new)   4.2 / 4.2 GB
+      forest block records (the sorted ops + undo kept for 64 blocks, ::new / with_capacity)  ~2.0 / ~2.0 GB
+      twig-core append_deferred                                                              1.4 / 1.4 GB
+      a hash map's resize (prepare_resize / resize_inner)                                    1.3 / 1.4 GB
+      box_new_uninit (twig node arrays)                                                      1.4 / 1.5 GB
+      execute_transfers (the parallel executor's bundles until persistence)                  1.3 / --
+      default_n42_payload (the leader's builds)                                              -- / 1.8 GB
+
+So the growth is the QMDB state itself, in memory, as `QmdbCompatTree` keeps it: an
+`Entry { key, value: Vec<u8>, active }` per slot (a heap allocation per value) plus the twig's
+node array, ~220 B a slot, and every one of a block's 147,000 changed entries is a new slot
+(QMDB appends; an update deactivates the old slot, whose frozen leaf stays in the twig) --
+~33 MB a block, 3.3 GB after 100 blocks with the Vec's doubling on top, and 90% of those
+slots are dead within ten blocks (132,000 updates a block on ~1-2M accounts). The genesis
+alloc is 14 accounts; all of it is the flood's state. Behind it the forest's `BlockRecord`s
+(`DEFAULT_RETAIN_DEPTH` 64: the sorted operations to re-apply a block after a move, and the
+undo record with the deactivated entries' old values, ~35 MB a block) hold ~2 GB a node for
+blocks that HotStuff finalised two views after they were made. Seven nodes: ~80 MB a block
+each in the tree and the records, ~560 MB a block fleet-wide, ~30 GB a window, which is the
+page cache windows 2-3 lose (round 43's "block-200 stall", plan v3 section 1.3).
+
+The cuts, in order: (M2a) `N42_QMDB_RETAIN_DEPTH` (new; the default stays 64) -- 16 keeps
+~0.5 GB instead of 2, safe because persistence walks the records only from the persisted head
+(a block or two behind) to the tip; loop122 measures it D-A-D-A. (M2b) Tombstone the dead
+entries: after deactivation the compat tree needs a slot's key and value only to serialise
+the checkpoint and the deltas (the leaf hash is already frozen in the twig), so a dead slot
+can drop both -- ~90% of the tree's entry bytes -- with the local checkpoint carrying
+hash-only dead slots (a format version; the delta captured at compute time still has the
+full entry, since it is live then). gov5's portable export needs full dead entries and would
+have to run on a node started with them kept. (M2c) The value arena and 16-byte prefix index
+that `TwigTree` in `twig-core/lib.rs` already has, for the compat tree.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

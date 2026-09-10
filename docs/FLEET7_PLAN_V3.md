@@ -227,6 +227,16 @@ A5. **The zero-code round** from v2 (`N42_PARALLEL_BUILD_THREADS=32` under
 
 ### Phase M -- the box's memory (windows 2-3; new)
 
+*Status 2026-09-10 18:30 EDT -- M1 done (loop121, NATIVE_FLEET7): the execution layer's
+growth (4.6 -> 9.7 -> 11.7 GB a leg) is the QMDB tree kept in memory by `QmdbCompatTree`
+(~4.2 GB at 100 blocks: an `Entry` with a heap `Vec<u8>` per slot plus the twig nodes, ~220 B
+a slot, 147,000 new slots a block, 90% dead within ten blocks), the forest's 64 retained
+block records (~2 GB), the parallel executor's bundles until persistence (1.3 GB) and the
+leader's builds (1.8 GB). Not reth's chain, not the sender cache, not the queue. M2a =
+`N42_QMDB_RETAIN_DEPTH` (loop122, D 16 against A 64); M2b = tombstone dead entries in the
+compat tree (a checkpoint format version); M2c = the value arena / prefix index `TwigTree`
+already has. M3 (heap policy) after those.*
+
 M1. **Attribute the growth.** One profiling leg with `fleet7-profile.sh
     --alloc` on the leader *and* one follower during window 2, plus
     `AnonHugePages` and RSS per process per window from `fleet7-windows.py`.
