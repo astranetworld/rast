@@ -221,48 +221,64 @@ where
         let tx_root_ms = std::sync::atomic::AtomicU64::new(0);
         let qmdb_ms = std::sync::atomic::AtomicU64::new(0);
         let bloom_ms = std::sync::atomic::AtomicU64::new(0);
-        let (transactions_root, (receipts_root, bloom)) = rayon::join(
-            || {
-                rayon::join(
-                    || {
+        // The QMDB root on a thread of its own, never as a rayon job. The
+        // forest's mutex is held for the whole computation, whose hashing
+        // waits on the worker pool -- and a rayon worker that waits steals
+        // other jobs. With two assemblies in flight (a build on the sealed
+        // block beside the payload service's, loop113's stack dump) the worker
+        // holding the lock stole the other assembly's root job, which then
+        // waited for the lock its own thread held: the "finishing" hang. A
+        // plain thread that waits on the pool injects its work and blocks; it
+        // steals nothing, so nothing it holds can be wanted by what it runs.
+        let (transactions_root, (receipts_root, bloom)) = std::thread::scope(|scope| {
+            let qmdb = self.qmdb.as_ref().map(|job| {
+                let qmdb_ms = &qmdb_ms;
+                std::thread::Builder::new()
+                    .name("qmdb-root".into())
+                    .spawn_scoped(scope, move || {
                         let at = std::time::Instant::now();
-                        let root = parallel_transaction_root(&input.transactions);
-                        tx_root_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-                        root
-                    },
-                    || {
-                        if let Some(job) = &self.qmdb {
-                            let at = std::time::Instant::now();
-                            let prepared = if parallel_state_commit() {
-                                let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle, job.prague);
-                                job.state.compute_operations(job.parent, ops).map_err(|e| e.to_string())
-                            } else {
-                                let changes = n42_qmdb_reth::changes_from_execution(bundle, job.prague);
-                                job.state.compute(job.parent, &changes).map_err(|e| e.to_string())
-                            };
-                            *job.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(prepared);
-                            qmdb_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    },
-                )
-                .0
-            },
-            || {
-                let at = std::time::Instant::now();
-                let bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
-                bloom_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-                // Replaced by gov5's keccak-of-receipts in the payload builder;
-                // a placeholder here is never seen by anyone.
-                let root = if hotstuff {
-                    B256::ZERO
-                } else {
-                    calculate_receipt_root(
-                        &receipts.iter().map(|r| r.with_bloom_ref()).collect::<Vec<_>>(),
-                    )
-                };
-                (root, bloom)
-            },
-        );
+                        let prepared = if parallel_state_commit() {
+                            let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle, job.prague);
+                            job.state.compute_operations(job.parent, ops).map_err(|e| e.to_string())
+                        } else {
+                            let changes = n42_qmdb_reth::changes_from_execution(bundle, job.prague);
+                            job.state.compute(job.parent, &changes).map_err(|e| e.to_string())
+                        };
+                        *job.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(prepared);
+                        qmdb_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                    })
+                    .expect("a thread for the QMDB root")
+            });
+            let roots = rayon::join(
+                || {
+                    let at = std::time::Instant::now();
+                    let root = parallel_transaction_root(&input.transactions);
+                    tx_root_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                    root
+                },
+                || {
+                    let at = std::time::Instant::now();
+                    let bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
+                    bloom_ms.store(at.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Replaced by gov5's keccak-of-receipts in the payload builder;
+                    // a placeholder here is never seen by anyone.
+                    let root = if hotstuff {
+                        B256::ZERO
+                    } else {
+                        calculate_receipt_root(
+                            &receipts.iter().map(|r| r.with_bloom_ref()).collect::<Vec<_>>(),
+                        )
+                    };
+                    (root, bloom)
+                },
+            );
+            if let Some(handle) = qmdb {
+                // A panic in the root job surfaces where the builder reads
+                // `job.out` (still `None`): it is reported there, not here.
+                let _ = handle.join();
+            }
+            roots
+        });
         let roots_ms = assembling.elapsed().as_millis() as u64;
         let tx_count = input.transactions.len();
         let block = self.inner.assemble_block(input, Some(transactions_root), Some(receipts_root), Some(bloom));

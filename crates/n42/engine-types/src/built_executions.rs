@@ -72,9 +72,40 @@ pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, ga
 /// [`find`], taking the build out of the store: the caller becomes the
 /// block's only holder and can move it instead of cloning its body.
 pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> Option<(B256, BuiltExecution)> {
-    let mut store = store().lock().unwrap_or_else(|p| p.into_inner());
-    let at = store.iter().rposition(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used))?;
-    store.remove(at)
+    let taken = {
+        let mut store = store().lock().unwrap_or_else(|p| p.into_inner());
+        let at = store.iter().rposition(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used))?;
+        store.remove(at)?
+    };
+    // Kept a little longer for the build on the sealed block: the own-block
+    // import that takes the build and that build leave the validator in the
+    // same breath on separate connections, and the import wins the race more
+    // often than not (loop110 S1: 49 of 52 on-seal builds refused, silently).
+    // The execution is four `Arc`s, so the copy costs nothing; the budget is
+    // the store's.
+    let mut handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+    handed.retain(|(hash, _)| *hash != taken.0);
+    while handed.len() >= KEEP {
+        handed.pop_front();
+    }
+    handed.push_back(taken.clone());
+    Some(taken)
+}
+
+/// Builds [`take`] handed to the engine, still findable by [`find_kept`].
+fn handed() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
+    static HANDED: OnceLock<Mutex<VecDeque<(B256, BuiltExecution)>>> = OnceLock::new();
+    HANDED.get_or_init(|| Mutex::new(VecDeque::with_capacity(KEEP)))
+}
+
+/// [`find`], also among the builds already taken by the engine's import --
+/// what a build on the sealed block wants, whichever of the two requests the
+/// execution layer served first.
+pub fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> Option<(B256, BuiltExecution)> {
+    find(parent, number, state_root, receipts_root, gas_used).or_else(|| {
+        let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+        handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used)).cloned()
+    })
 }
 
 fn matches_build(built: &BuiltExecution, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> bool {

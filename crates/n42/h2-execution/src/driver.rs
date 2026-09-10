@@ -142,6 +142,21 @@ struct AheadBuild {
     parent: B256,
     attrs: PayloadAttributes,
     task: tokio::task::JoinHandle<Result<BuiltBlock, ElError>>,
+    /// Set by a build on the sealed block that the execution layer refused:
+    /// this entry then counts as *no* build ahead, so the request that
+    /// follows the own import replaces it with a forkchoice build instead of
+    /// finding it "already prepared" (loop110 S1: a forkchoice sent before
+    /// the import had landed was answered SYNCING and the leader built on
+    /// its critical path 38 times).
+    refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AheadBuild {
+    fn covers(&self, parent: B256, attrs: &PayloadAttributes) -> bool {
+        self.parent == parent
+            && self.attrs == *attrs
+            && !self.refused.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// Drives an [`ExecutionLayer`] on behalf of the consensus engine.
@@ -276,11 +291,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         parent: B256,
         attrs: PayloadAttributes,
     ) -> Result<(), ElError> {
-        if self
-            .prepared
-            .as_ref()
-            .is_some_and(|ahead| ahead.parent == parent && ahead.attrs == attrs)
-        {
+        if self.prepared.as_ref().is_some_and(|ahead| ahead.covers(parent, &attrs)) {
             return Ok(());
         }
         if let Some(stale) = self.prepared.take() {
@@ -320,7 +331,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             );
             Ok(built)
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task });
+        self.prepared = Some(AheadBuild { parent, attrs, task, refused: Default::default() });
         Ok(())
     }
 
@@ -340,23 +351,20 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         header: alloy_consensus::Header,
         attrs: PayloadAttributes,
     ) -> Result<(), ElError> {
-        if self
-            .prepared
-            .as_ref()
-            .is_some_and(|ahead| ahead.parent == parent && ahead.attrs == attrs)
-        {
+        if self.prepared.as_ref().is_some_and(|ahead| ahead.covers(parent, &attrs)) {
             return Ok(());
         }
         if let Some(stale) = self.prepared.take() {
             stale.task.abort();
         }
         let el = std::sync::Arc::clone(&self.el);
-        let state = self.forkchoice(parent);
         let task_attrs = attrs.clone();
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark_refused = std::sync::Arc::clone(&refused);
         info!(target: "n42.h2.el", ?parent, "starting a build ahead on the sealed block");
         let task = tokio::spawn(async move {
             let started = std::time::Instant::now();
-            match el.build_on_own_block(&header, task_attrs.clone()).await {
+            match el.build_on_own_block(&header, task_attrs).await {
                 Some(Ok(built)) => {
                     // The same line the forkchoice path logs, so the leader
                     // analysis reads both; `fcu_ms` is zero here by design.
@@ -369,20 +377,29 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                         on_seal = true,
                         "built a block ahead of leading"
                     );
-                    return Ok(built);
+                    Ok(built)
                 }
+                // No forkchoice fallback here: the parent's import is still in
+                // flight, and a forkchoice on a block the engine has not seen
+                // is answered SYNCING. Marked refused instead, so the request
+                // the own import makes afterwards builds ahead the ordinary
+                // way, on a parent the engine then knows.
                 Some(Err(err)) => {
-                    warn!(target: "n42.h2.el", %err, ?parent, "the build on the sealed block failed; building ahead the ordinary way");
+                    mark_refused.store(true, std::sync::atomic::Ordering::Release);
+                    warn!(target: "n42.h2.el", %err, ?parent, "the build on the sealed block failed; the own import will build ahead");
+                    Err(err)
                 }
                 None => {
-                    debug!(target: "n42.h2.el", ?parent, "no build on the sealed block; building ahead the ordinary way");
+                    mark_refused.store(true, std::sync::atomic::Ordering::Release);
+                    info!(target: "n42.h2.el", ?parent, "no build on the sealed block; the own import will build ahead");
+                    Err(ElError::new("build on the sealed block refused"))
                 }
             }
-            build_ahead_by_forkchoice(el, state, task_attrs, parent).await
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task });
+        self.prepared = Some(AheadBuild { parent, attrs, task, refused });
         Ok(())
     }
+
     /// Leader path: builds a block on top of the current head.
     ///
     /// Returns the built block *and* caches its payload, so the subsequent
@@ -454,6 +471,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // failed is reported and replaced, not propagated: the proposal is
         // worth more than the shortcut.
         let ahead = match self.prepared.take() {
+            // A build on the sealed block the execution layer refused, and
+            // that nothing replaced: the same as no build ahead.
+            Some(prepared) if prepared.refused.load(std::sync::atomic::Ordering::Acquire) => {
+                prepared.task.abort();
+                None
+            }
             Some(prepared) if prepared.parent == parent && prepared.attrs == attrs => {
                 match prepared.task.await {
                     Ok(Ok(built)) => Some(built),
@@ -787,40 +810,4 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             },
         }
     }
-}
-
-/// The build ahead by the Engine API's own steps: a forkchoice with
-/// attributes that starts the payload job, then a resolve that waits for
-/// it. What [`ExecutionDriver::prepare_build_on`] does; the fallback of
-/// [`ExecutionDriver::prepare_build_on_sealed`].
-async fn build_ahead_by_forkchoice<E: ExecutionLayer>(
-    el: std::sync::Arc<E>,
-    state: ForkchoiceState,
-    attrs: PayloadAttributes,
-    parent: B256,
-) -> Result<BuiltBlock, ElError> {
-    let started = std::time::Instant::now();
-    let updated = el
-        .fork_choice_updated_with_attrs_for(ExecutionPath::LIVE_SEQUENTIAL, state, attrs)
-        .await?;
-    let id = updated.payload_id.ok_or_else(|| {
-        ElError::new(format!(
-            "forkchoiceUpdated started no build ahead of leading (status {:?})",
-            updated.payload_status.status
-        ))
-    })?;
-    let after_fcu = started.elapsed();
-    let built = el
-        .resolve_payload_for(ExecutionPath::LIVE_SEQUENTIAL, id, ResolveKind::WaitForPending)
-        .await
-        .ok_or_else(|| ElError::new(format!("no payload build for id {id}")))??;
-    info!(
-        target: "n42.h2.el",
-        ?parent,
-        number = built.number,
-        fcu_ms = after_fcu.as_millis() as u64,
-        build_ms = (started.elapsed() - after_fcu).as_millis() as u64,
-        "built a block ahead of leading"
-    );
-    Ok(built)
 }

@@ -99,3 +99,87 @@ where
         Ok(Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, vec![executed.clone()])) as StateProviderBox)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! The hazard of building on a block the engine has not imported: a state
+    //! read that misses the parent's bundle and answers from the grandparent
+    //! (a nonce one block stale refuses every transaction of that sender in
+    //! the block being built), or a `BLOCKHASH` that answers the builder's
+    //! hash instead of the one consensus sealed. A round lost to either would
+    //! be the first on-seal block refusing 163,000 transactions.
+    use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::{Address, U256};
+    use n42_tx_types::{Block, BlockBody};
+    use reth_execution_types::BlockExecutionOutput;
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_storage_api::{AccountReader, BlockHashReader};
+    use reth_trie::{updates::TrieUpdates, HashedPostState};
+    use revm::{database::BundleState, state::AccountInfo};
+
+    fn execution_of(header: &Header, bundle: BundleState) -> BuiltExecution {
+        let block = Block { header: header.clone(), body: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: Some(Vec::new().into()) } };
+        BuiltExecution {
+            block: Arc::new(RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), Vec::new())),
+            execution_output: Arc::new(BlockExecutionOutput { result: Default::default(), state: bundle }),
+            hashed_state: Arc::new(HashedPostState::default()),
+            trie_updates: Arc::new(TrieUpdates::default()),
+        }
+    }
+
+    #[test]
+    fn the_parent_state_is_its_bundle_over_the_grandparent_under_the_sealed_hash() {
+        let sender = Address::with_last_byte(1);
+        let created = Address::with_last_byte(2);
+        let untouched = Address::with_last_byte(3);
+        let grandparent = B256::with_last_byte(9);
+
+        // The chain's state at the grandparent: the sender at nonce 0, an
+        // account the parent never touches, and no `created` yet.
+        let client = MockEthProvider::default();
+        client.add_account(sender, ExtendedAccount::new(0, U256::from(100)));
+        client.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+
+        // The parent as the builder executed it: the sender moved to nonce 5,
+        // `created` came into being.
+        let bundle = BundleState::builder(11..=11)
+            .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(50), ..Default::default() })
+            .state_present_account_info(created, AccountInfo { nonce: 0, balance: U256::from(7), ..Default::default() })
+            .build();
+        let header = Header { number: 11, parent_hash: grandparent, gas_used: 21_000, ..Default::default() };
+        let execution = execution_of(&header, bundle);
+        let built_hash = execution.block.hash();
+
+        // Consensus seals the header (the view and the signature go into
+        // `extra_data`), so the hash the chain knows is not the builder's.
+        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 7".as_slice().into(), ..header.clone() });
+        assert_ne!(sealed.hash(), built_hash);
+
+        // The registry finds the build by what a seal cannot change.
+        crate::built_executions::remember(built_hash, execution.clone());
+        let (found, _) = crate::built_executions::find(grandparent, 11, header.state_root, header.receipts_root, 21_000)
+            .expect("the build is found under the sealed header's parent, number, roots and gas");
+        assert_eq!(found, built_hash);
+        // The own-block import takes the build; the build on the sealed block
+        // must still find it, whichever request the execution layer served first.
+        let (taken, _) = crate::built_executions::take(grandparent, 11, header.state_root, header.receipts_root, 21_000).expect("taken");
+        assert_eq!(taken, built_hash);
+        assert!(crate::built_executions::find(grandparent, 11, header.state_root, header.receipts_root, 21_000).is_none());
+        let (kept, _) = crate::built_executions::find_kept(grandparent, 11, header.state_root, header.receipts_root, 21_000)
+            .expect("a taken build is still there for the build on the sealed block");
+        assert_eq!(kept, built_hash);
+
+        let executed = executed_under_seal(&sealed, &execution);
+        assert_eq!(executed.recovered_block.hash(), sealed.hash(), "the overlay's block carries the sealed hash");
+        assert_eq!(executed.recovered_block.header().number, 11);
+
+        let state = opener_on_built_parent(client, grandparent, executed)().expect("the parent's state opens");
+        let account = |a: &Address| state.basic_account(a).expect("read");
+        assert_eq!(account(&sender).map(|a| a.nonce), Some(5), "the sender's nonce is the parent's, not the grandparent's");
+        assert_eq!(account(&sender).map(|a| a.balance), Some(U256::from(50)));
+        assert_eq!(account(&created).map(|a| a.balance), Some(U256::from(7)), "an account the parent created exists");
+        assert_eq!(account(&untouched).map(|a| a.nonce), Some(4), "an untouched account reads through to the grandparent");
+        assert_eq!(state.block_hash(11).expect("read"), Some(sealed.hash()), "BLOCKHASH of the parent is the sealed hash");
+    }
+}

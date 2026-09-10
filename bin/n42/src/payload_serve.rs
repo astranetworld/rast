@@ -384,13 +384,31 @@ where
         // carries; the payload path does.
         return Err("unknown build: block access list".to_owned());
     }
-    let (built_hash, built) = n42_engine_types::built_executions::take(
-        header.parent_hash,
-        header.number,
-        header.state_root,
-        header.receipts_root,
-        header.gas_used,
-    )
+    // Taken out of the registry, so the hand-off can move the body instead
+    // of cloning it -- unless the validator builds on seal: then a
+    // `BUILD_ON_OWN` for this same block is on another connection at this
+    // very moment and must still find it (loop110 S1: taking it here won
+    // the race on 383 of 384 blocks, every build on seal was refused, and the
+    // leader fell back to building on its critical path). Left in place, the
+    // registry's own bound (two builds) retires it two blocks later; the
+    // hand-off clones the body once (~10 ms, beside the leader's chain now).
+    let (built_hash, built) = if build_on_seal() {
+        n42_engine_types::built_executions::find(
+            header.parent_hash,
+            header.number,
+            header.state_root,
+            header.receipts_root,
+            header.gas_used,
+        )
+    } else {
+        n42_engine_types::built_executions::take(
+            header.parent_hash,
+            header.number,
+            header.state_root,
+            header.receipts_root,
+            header.gas_used,
+        )
+    }
     .ok_or("unknown build")?;
     let sealed_hash = header.hash_slow();
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
@@ -454,7 +472,7 @@ async fn build_on_own_block(
     }
     let mut times = BuildOnOwnTimes::default();
     let at = std::time::Instant::now();
-    let (built_hash, built) = n42_engine_types::built_executions::find(
+    let (built_hash, built) = n42_engine_types::built_executions::find_kept(
         header.parent_hash,
         header.number,
         header.state_root,
@@ -584,6 +602,15 @@ fn sealed_header_from_fields(
         }
     }
     None
+}
+
+/// Whether the validators build on seal (`N42_BUILD_ON_SEAL`, the same
+/// variable the validator reads; the fleet launcher sets it for both). It
+/// decides whether the header-only import may take the build out of the
+/// registry or must leave it for the `BUILD_ON_OWN` racing it.
+fn build_on_seal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"))
 }
 
 /// `N42_RAW_SHARED_DECODE`, read once.
@@ -722,7 +749,7 @@ where
                     );
                 }
                 Err(message) => {
-                    debug!(target: "n42.payload_serve", %message, "build on own block refused");
+                    info!(target: "n42.payload_serve", %message, "build on own block refused");
                     out.push(2);
                     out.extend_from_slice(&(message.len() as u32).to_le_bytes());
                     out.extend_from_slice(message.as_bytes());

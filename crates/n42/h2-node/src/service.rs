@@ -1620,11 +1620,21 @@ impl<E: ExecutionLayer> H2Service<E> {
     async fn flush_prepare(&mut self) {
         let Some(parent) = self.prepare_on.take() else { return };
         if self.prepare_ahead {
-            self.prepare_next_build(parent).await;
+            // The import's completion: an own block's on-seal build, when it
+            // was refused, is replaced here by the forkchoice build (the
+            // driver treats a refused build as none); a peer's block goes
+            // this way from the start.
+            self.prepare_next_build(parent, false).await;
         }
     }
 
-    async fn prepare_next_build(&mut self, parent: B256) {
+    /// `on_seal`: `parent` is a block this node built and sealed a moment ago,
+    /// so the build may start on the builder's own post-state (`N42_BUILD_ON_SEAL`).
+    /// A block imported from a peer -- the parent at a tenure change -- has no
+    /// such build to start from, and asking for one only earns a refusal and a
+    /// proposal built on the critical path (loop111 S2: 2-3 a window, 410-670
+    /// ms each); that parent takes the forkchoice path directly.
+    async fn prepare_next_build(&mut self, parent: B256, on_seal: bool) {
         let Some(build_attributes) = self.payload_attributes.as_ref() else {
             return;
         };
@@ -1650,8 +1660,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             info!(target: "n42.h2.node", ?parent, next, "no build ahead: the attributes builder declined");
             return;
         };
-        info!(target: "n42.h2.node", ?parent, next, on_seal = self.build_on_seal, "build ahead requested");
-        let started = if self.build_on_seal {
+        let on_seal = on_seal && self.build_on_seal;
+        info!(target: "n42.h2.node", ?parent, next, on_seal, "build ahead requested");
+        let started = if on_seal {
             self.driver.prepare_build_on_sealed(parent, header, attrs).await
         } else {
             self.driver.prepare_build_on(parent, attrs).await
@@ -1834,17 +1845,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // executed like any other, and that request finds it already in
                 // the tree.
                 self.flush_outbox(events);
-                self.driver.spawn_import_own_block(&built);
                 // Build-on-seal: the next build starts here, on this block's
-                // own post-state, while the import above is still in flight.
+                // own post-state, before the import below is even sent.
                 // Without it the build waits for the import's answer and a
                 // forkchoice on the block -- 62 + 72 ms of the leader's
                 // chain at the bench tier, with the leader then waiting for
                 // its own build on nearly every block (loop108). The import's
-                // completion asks again and finds this build prepared.
+                // completion asks again and finds this build prepared; if the
+                // execution layer refused it, that later request builds ahead
+                // the ordinary way on a parent the engine then knows.
                 if self.build_on_seal {
-                    self.prepare_next_build(built.hash).await;
+                    self.prepare_next_build(built.hash, true).await;
                 }
+                self.driver.spawn_import_own_block(&built);
             }
             Err(err) => {
                 // The view will time out and move on; that is the correct
