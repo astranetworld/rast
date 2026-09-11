@@ -158,8 +158,17 @@ fn retain_depth() -> Option<u64> {
     })
 }
 
-/// The forest with the configured record retention.
+/// `N42_QMDB_TRIM_TWIGS=0` keeps every twig's leaf nodes; by default a twig
+/// whose slots are all dead for longer than the retention window keeps only
+/// its root (`docs/QMDB_ENTRY_LOG.md`, step 5).
+fn trim_twigs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_TRIM_TWIGS").map_or(true, |v| v != "0"))
+}
+
+/// The forest with the configured record retention and twig trimming.
 fn with_configured_retention(forest: QmdbForest) -> QmdbForest {
+    let forest = forest.with_twig_trimming(trim_twigs());
     match retain_depth() {
         Some(depth) => forest.with_retain_depth(depth),
         None => forest,

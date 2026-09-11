@@ -760,10 +760,19 @@ fn read_bytes<'a>(
 
 #[derive(Clone)]
 struct Twig {
-    nodes: Box<[Hash; 2 * TWIG_SIZE]>,
+    /// The leaf merkle tree: `None` once the twig is trimmed (every slot
+    /// dead for longer than the retention window, `trim_dead_twigs`), when
+    /// only `leaf_root` is kept -- 32 B instead of 128 KB.
+    nodes: Option<Box<[Hash; 2 * TWIG_SIZE]>>,
+    /// `nodes[1]`, kept when the nodes are not.
+    leaf_root: Hash,
     bits: [u8; BITS_BYTES],
     bits_root: Hash,
     root: Hash,
+    /// The tree's append cursor when a slot of this twig was last
+    /// deactivated: a twig whose last retirement lies before the retention
+    /// window's oldest cursor cannot be revived by any undo still held.
+    last_retired_at: u64,
 }
 
 impl Twig {
@@ -775,22 +784,34 @@ impl Twig {
         }
         let bits = [0u8; BITS_BYTES];
         let bits_root = hash_bits(&bits);
-        let root = hash_node(&nodes[1], &bits_root);
+        let leaf_root = nodes[1];
+        let root = hash_node(&leaf_root, &bits_root);
         Self {
-            nodes,
+            nodes: Some(nodes),
+            leaf_root,
             bits,
             bits_root,
             root,
+            last_retired_at: 0,
         }
+    }
+
+    /// The leaf nodes; a trimmed twig is never written or proved from (the
+    /// trimming rule keeps every twig an undo or a proof can reach), so
+    /// reaching one here is a broken invariant, not a recoverable state.
+    fn nodes_mut(&mut self) -> &mut [Hash; 2 * TWIG_SIZE] {
+        self.nodes.as_mut().expect("a trimmed QMDB twig was written or proved from")
     }
 
     fn set_leaf(&mut self, local: usize, leaf: Hash) {
         let mut node = TWIG_SIZE + local;
-        self.nodes[node] = leaf;
+        let nodes = self.nodes_mut();
+        nodes[node] = leaf;
         while node > 1 {
             node >>= 1;
-            self.nodes[node] = hash_node(&self.nodes[node * 2], &self.nodes[node * 2 + 1]);
+            nodes[node] = hash_node(&nodes[node * 2], &nodes[node * 2 + 1]);
         }
+        self.leaf_root = nodes[1];
         self.refresh_root();
     }
 
@@ -807,19 +828,26 @@ impl Twig {
     }
 
     fn set_leaf_unchecked(&mut self, local: usize, leaf: Hash) {
-        self.nodes[TWIG_SIZE + local] = leaf;
+        self.nodes_mut()[TWIG_SIZE + local] = leaf;
     }
 
     fn recompute(&mut self) {
+        let nodes = self.nodes_mut();
         for start in (1..TWIG_SIZE).rev() {
-            self.nodes[start] = hash_node(&self.nodes[start * 2], &self.nodes[start * 2 + 1]);
+            nodes[start] = hash_node(&nodes[start * 2], &nodes[start * 2 + 1]);
         }
+        self.leaf_root = nodes[1];
         self.bits_root = hash_bits(&self.bits);
         self.refresh_root();
     }
 
     fn refresh_root(&mut self) {
-        self.root = hash_node(&self.nodes[1], &self.bits_root);
+        self.root = hash_node(&self.leaf_root, &self.bits_root);
+    }
+
+    /// Whether no slot of this twig is live.
+    fn is_dead(&self) -> bool {
+        self.bits.iter().all(|byte| *byte == 0)
     }
 
     /// The bit set and root, after bits changed and leaves did not.
@@ -874,6 +902,7 @@ fn held_slots(index: &KeyIndex, operations: &[QmdbOperation]) -> Vec<Option<u64>
 /// bits, each entry and each twig checking a bitmap of the slots on the
 /// worker pool; the twigs touched are marked for a bit-set rehash.
 fn retire_twigs(slots: usize, twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[Option<u64>]) {
+    let cursor = slots as u64;
     const WORDS_PER_TWIG: usize = TWIG_SIZE / 64;
     // The entries' flags are cleared by `Entries::retire`; here the twigs'
     // bit sets, each twig checking a bitmap of the slots on the worker pool.
@@ -908,6 +937,7 @@ fn retire_twigs(slots: usize, twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[O
         }
         if touched {
             *mark = (*mark).max(DIRTY_BITS);
+            twig.last_retired_at = cursor;
         }
     };
     let n = twigs.len();
@@ -1336,10 +1366,11 @@ impl QmdbCompatTree {
         let local = slot as usize % TWIG_SIZE;
         let twig = &self.twigs[twig_id];
 
+        let nodes = twig.nodes.as_ref().expect("an active slot's twig is never trimmed");
         let mut twig_path = [NULL_HASH; TWIG_HEIGHT];
         let mut node = TWIG_SIZE + local;
         for sibling in &mut twig_path {
-            *sibling = twig.nodes[node ^ 1];
+            *sibling = nodes[node ^ 1];
             node >>= 1;
         }
 
@@ -1672,7 +1703,7 @@ impl QmdbCompatTree {
         let local = (slot as usize) % TWIG_SIZE;
         self.ensure_twig(twig_id);
         let twig = &mut self.twigs[twig_id];
-        twig.nodes[TWIG_SIZE + local] = leaf;
+        twig.nodes_mut()[TWIG_SIZE + local] = leaf;
         twig.bits[local / 8] |= 1 << (local % 8);
         mark_dirty(dirty, twig_id, DIRTY_LEAVES);
         self.entries.push(key, value).map_err(|e| QmdbOperationError::Store(e.to_string()))?;
@@ -1811,6 +1842,40 @@ impl QmdbCompatTree {
         let twig_id = (slot as usize) / TWIG_SIZE;
         let local = (slot as usize) % TWIG_SIZE;
         self.twigs[twig_id].set_active(local, false);
+        self.twigs[twig_id].last_retired_at = self.next_slot;
+    }
+
+    /// Drops the leaf nodes of every twig that no undo still held can touch
+    /// and no proof can reach: every slot dead, every slot appended before
+    /// `retired_before` (the retention window's oldest cursor, so no undo
+    /// can truncate into it) and the last retirement before it too (so no
+    /// undo can revive a slot in it). Only the twig's root and bits remain,
+    /// which is all the world root needs. Returns how many were trimmed by
+    /// this call.
+    pub fn trim_dead_twigs(&mut self, retired_before: u64) -> usize {
+        let mut trimmed = 0;
+        for (twig_id, twig) in self.twigs.iter_mut().enumerate() {
+            let last_slot = ((twig_id + 1) * TWIG_SIZE) as u64;
+            if twig.nodes.is_none() || last_slot > retired_before || twig.last_retired_at >= retired_before {
+                continue;
+            }
+            if !twig.is_dead() {
+                continue;
+            }
+            twig.nodes = None;
+            trimmed += 1;
+        }
+        trimmed
+    }
+
+    /// How many twigs hold only their root.
+    pub fn trimmed_twigs(&self) -> usize {
+        self.twigs.iter().filter(|twig| twig.nodes.is_none()).count()
+    }
+
+    /// How many twigs the tree has.
+    pub fn twig_count(&self) -> usize {
+        self.twigs.len()
     }
 }
 

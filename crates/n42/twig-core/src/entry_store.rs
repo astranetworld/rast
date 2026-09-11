@@ -671,4 +671,54 @@ mod tests {
         assert_eq!(copy.snapshot(), file.snapshot());
         assert_eq!(copy.prove(&key(800)), heap.prove(&key(800)));
     }
+
+    /// Trimming a twig keeps the world root and every proof of a live key,
+    /// never touches a twig within the window, and a tree keeps working
+    /// (new blocks, snapshots) with trimmed twigs in it.
+    #[test]
+    fn trimmed_twigs_keep_the_root_and_the_proofs_of_live_keys() {
+        use crate::qmdb_compat::{QmdbCompatTree, QmdbOperation};
+        use crate::TWIG_SIZE;
+        let key = |n: u64| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&n.to_le_bytes());
+            k
+        };
+        let block = |base: u64, n: u64, tag: u8| -> Vec<QmdbOperation> {
+            let mut ops: Vec<QmdbOperation> =
+                (base..base + n).map(|i| QmdbOperation { key: key(i), value: Some(vec![tag; 20]) }).collect();
+            ops.sort_unstable_by_key(|op| op.key);
+            ops
+        };
+        let mut tree = QmdbCompatTree::new();
+        // Three twigs' worth of keys, then every one of them rewritten: the
+        // first three twigs are all dead, the last ones live.
+        let n = 3 * TWIG_SIZE as u64;
+        tree.apply_sorted_ops(block(0, n, 1)).unwrap();
+        let cursor_after_first = tree.next_slot();
+        tree.apply_sorted_ops(block(0, n, 2)).unwrap();
+        let root = tree.root();
+        let proof = tree.prove(&key(5)).unwrap();
+        assert_eq!(tree.trimmed_twigs(), 0);
+        // Nothing before the first block's cursor was retired before it.
+        assert_eq!(tree.trim_dead_twigs(cursor_after_first), 0, "the retirements are at the second block's cursor");
+        // With the window past the second block, the three dead twigs go.
+        let trimmed = tree.trim_dead_twigs(tree.next_slot() + 1);
+        assert_eq!(trimmed, 3);
+        assert_eq!(tree.trimmed_twigs(), 3);
+        assert_eq!(tree.root(), root);
+        assert_eq!(tree.prove(&key(5)), Some(proof));
+        let snap = tree.snapshot();
+        assert_eq!(snap.entries.len() as u64, 2 * n);
+        // Life goes on: another block, and the root still matches a tree
+        // that was never trimmed.
+        let mut untrimmed = QmdbCompatTree::from_snapshot(&snap).unwrap();
+        let ops = block(10, 100, 3);
+        assert_eq!(tree.apply_sorted_ops(ops.clone()).unwrap(), untrimmed.apply_sorted_ops(ops).unwrap());
+        // A file-backed tree trims the same way.
+        let mut file = QmdbCompatTree::from_snapshot(&snap).unwrap();
+        file.set_entry_file(&scratch("trim")).unwrap();
+        assert_eq!(file.trim_dead_twigs(file.next_slot() + 1), 3);
+        assert_eq!(file.root(), root);
+    }
 }

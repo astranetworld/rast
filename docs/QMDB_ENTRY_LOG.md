@@ -133,8 +133,13 @@ faults per window on a D-A-D-A round, then by windows 2-3.
 - Steps 3b and 4 done (the file as the persistence): `forest.ckpt` = cursor + active bits, the
   delta's appended range by its bounds, `sync` before the delta, restart by hashing the file's
   records and rebuilding twigs and index from the bits, a torn tail dropped, the version-1
-  checkpoint migrated once, the portable export from the file. loop126 measures it. Step 5
-  (long-dead twigs keep only their root) is next.
+  checkpoint migrated once, the portable export from the file. loop126 measures it (with the
+  appends buffered and written in one call, `05c7d984c`: the per-record write syscalls were
+  the file store's remaining root-phase cost, loop125).
+- Step 5 done: a twig whose slots are all dead, all appended before the retention window's
+  oldest cursor and last retired before it too keeps only its root and bits (`trim_dead_twigs`,
+  called by the forest on every head move; `N42_QMDB_TRIM_TWIGS=0` turns it off). loop127
+  measures it in file mode against the same without trimming.
 
 ## 8. Implementation order
 
