@@ -192,10 +192,14 @@ pub struct ExecutionDriver<E> {
     head: B256,
     /// Last block consensus committed.
     finalized: B256,
-    /// A commit that arrived before the block's import finished (a follower
+    /// The block `execute` is importing right now, if any.
+    executing: Option<B256>,
+    /// A commit that arrived while that import was in flight (a follower
     /// that voted before importing, `N42_VOTE_BEFORE_IMPORT=1`): the
     /// forkchoice waits for the import, since the engine would answer
-    /// SYNCING for a block it has not seen.
+    /// SYNCING for a block it has not seen. Only an import in flight defers
+    /// a commit -- a block imported by another path (the leader's own block
+    /// by header, a synced range) commits at once, as before.
     pending_commit: Option<B256>,
     /// Bounds `payloads` so a peer cannot make us buffer without limit.
     max_cached_payloads: usize,
@@ -219,6 +223,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             payloads: HashMap::new(),
             head: genesis,
             finalized: genesis,
+            executing: None,
             pending_commit: None,
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
@@ -769,10 +774,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         };
         let txs = payload.payload.as_v1().transactions.len();
         let started = std::time::Instant::now();
+        self.executing = Some(block_hash);
         let outcome = self
             .el
             .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload)
             .await;
+        self.executing = None;
         if txs >= 10_000 {
             info!(
                 target: "n42.h2.el",
@@ -814,9 +821,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// Commit path: makes a committed block the head and the finalised block.
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
-        if self.head != block_hash && self.payloads.contains_key(&block_hash) {
-            // Still importing (or not yet asked to): the forkchoice follows
-            // the import's success.
+        if self.executing == Some(block_hash) {
+            // Still importing: the forkchoice follows the import's success.
             self.pending_commit = Some(block_hash);
             return DriverAction::Ignored;
         }
