@@ -1751,6 +1751,35 @@ the code's default flips once the leg-start storm is attributed. The entry log i
 designed (`docs/QMDB_ENTRY_LOG.md`): entries in the file, a checkpoint of bits, the delta by
 bounds and flags, restart from the file, trimming by the retention window.
 
+**loop128 (2026-09-11 03:03-03:25 EDT): the vote before the import, first form -- void, and
+the reason it could not work.** `N42_VOTE_BEFORE_IMPORT=1` (`68d8c8453`): under the H2-v4
+profile the follower votes on a verified proposal at once and imports afterwards, to bound
+what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would give the cycle. Its first
+launch stalled in the decay phase: the driver's commit deferral (a forkchoice for a block still
+importing must wait) matched the leader's own block too, which is imported by header and never
+through `execute`, so the leader never finalised (`cce893446` narrows it to an import in
+flight). The relaunch, V = the flag, F = as adopted, all file mode:
+
+    leg  win1          win2     win3     round    Cached at start  R1_collect  leader on-seal build
+    V1   233,498 (45)  222,606  189,877  19.38M   22.1 GB          499 ms      612 ms
+    F1   250,707 (46)  193,159  184,666  18.86M   20.3 GB
+    V2   244,438       204,557   97,271  16.40M   19.8 GB
+    F2   249,879       170,855  162,952  17.52M   21.8 GB
+
+Two findings, neither about the protocol. The round is void: every leg started with 20-22 GB
+cached and a 36-38 GB huge-page pool (the clean legs of loop127: 9.6-10.5 GB and 44-53 GB),
+right after a gov5 run; F1 read 250k on the configuration that read 298k in loop127. The
+bench now also drops gov5's datadir pages before a leg (`631f10420`) -- which, measured
+afterwards, freed nothing: the residual 9 GB of clean file pages that survive the drop are
+not theirs and not ours, and the tmpfs (Shmem) has grown to 10.1 GB. And the flag did not do
+what it says: the validator's loop awaits the import inline (`driver.handle_output(ExecuteBlock)`
+in `service.rs`), so a proposal that arrives during an import is not seen -- let alone voted
+on -- until the import returns; V1's votes were collected in 499 ms, the import's time, and
+the leader's on-seal build lengthened to 612 ms beside them. The measurement needs the import
+off the loop: the driver now runs a follower's import on a task when the flag is set (imports
+one at a time, in order, the rest queued; the verdict comes back on a channel the loop selects
+on, and a commit that arrived meanwhile runs its forkchoice then). loop129 runs that.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
