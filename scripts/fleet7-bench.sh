@@ -305,7 +305,11 @@ if [[ "$(pgrep -fc 'n4[2] node')" == 0 ]]; then
   sync
 fi
 if [ "$F7_DROP_CACHE" = 1 ]; then
-  python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" 2>&1 | tail -1
+  # gov5's datadirs too (qs-node*, 83 GB each): a round right after theirs
+  # started with 20-30 GB cached and a 36-38 GB pool, and read the slow mode
+  # on every leg (loop128). Clean pages of a fleet that is down; theirs is
+  # never running when this gate has passed.
+  python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" /data/blockchain/qs-node* 2>&1 | tail -1
 fi
 if [ "$F7_HUGEPREP" != 0 ]; then
   # Working set 30 GB (what the box can collapse whole), two passes, repeated
