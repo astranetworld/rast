@@ -317,6 +317,12 @@ cache. Each removes a pass from both chains at once. Target ~300 ms a side,
 
 ### Phase D -- the protocol (a decision, not a round)
 
+*Status 2026-09-10 night: written up as `docs/PHASE_D_DEFERRED_EXECUTION.md` -- the header of N
+carries the execution of N-1, the vote certifies N-1's execution and N's includability, the
+cycle becomes max(build, import, network); with the component table, the "execution cannot
+fail a block" rule, the bench-only measurement that bounds the gain before any header changes,
+and the open questions for gov5.*
+
 Everything above keeps "a follower executes the block before it votes". The
 fixed ~100 ms and the execute-then-vote coupling are then the wall: at
 ~300 ms a side the cycle is ~400, not 300. The known way past it is
