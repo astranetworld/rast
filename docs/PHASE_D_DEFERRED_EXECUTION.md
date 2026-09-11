@@ -118,6 +118,15 @@ phase A3's build cuts pay 1:1 again). If it reads ~65 blocks a window against 56
 proposal is worth the cross-client work; if the leader's build or the network floor caps it
 lower, the number says so before anyone changes a header profile.
 
+**Measured (loop129, 2026-09-11):** with the import off the loop, the followers' votes are
+collected in 5-40 ms instead of ~500, the commit follows within ~10 ms, and the leader's next
+proposal comes at the bench's pacing: the cycle became the pacing (450 ms, 62-66 blocks a
+window against 54-55) -- the coupling is exactly the difference the model predicts. What the
+bench could not show is the TPS at that cadence: the box's ingest, sharing its cores with
+seven followers now executing off the loop, supplied 130-150k transactions a second and the
+blocks emptied (4.4M transactions over 62 blocks). The protocol's gain at full blocks is a
+seven-machine measurement, or one with a supply that does not share the fleet's cores.
+
 ## 7. Open questions for the gov5 side
 
 1. Header layout: reuse the existing fields with the shifted meaning (EIP-7862 style, no new

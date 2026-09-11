@@ -1795,6 +1795,32 @@ are supply-bound (small blocks with a low `pool_ms`... a chain at 60+ blocks a w
 ~330k transactions a second, near what the ingest gives) -- if they are, the cycle is the
 number, not the TPS.
 
+**loop129, clean run (2026-09-11 03:49-04:08 EDT): with the vote off the import, the cycle is
+the pacing -- and this box cannot feed it.** The same legs on a quiet box (pool 63 GB, Cached
+10.5-12 GB), V = `N42_VOTE_BEFORE_IMPORT=1` with the import on a task, F = as adopted:
+
+    leg  win1          win2     win3     blocks/window   votes collected (R1)   leader queue
+    V1   146,987 (62)   95,989   99,736  62 / 41 / 46    5-40 ms                drains to 5-80k
+    F1   293,390 (54)  202,111  179,067  54 / 38 / 34    ~500 ms (the import)   ~300k, steady
+    V2   128,560 (54)  101,039   52,884  54 / 46 / 60    5-40 ms                saw-tooth 5k-245k
+    F2   297,139 (55)  190,170  121,333  55 / 36 / 34
+
+On the V legs a proposal is voted for within 5-40 ms of its arrival and committed within ~10 ms
+more; the leader's next proposal follows at the bench's pacing, 450 ms after the previous one
+(views 87-90 in V1: preambles 450 ms apart, commits 10 ms after each). The cycle is no longer
+import + fixed; it is `max(build, import, pacing)` = the pacing, 62-66 blocks a window. But
+the blocks are not full: the leader's queue saw-tooths between ~245k and ~5k, four full blocks
+drain it and the next four are 1-120k transactions built in 1-27 ms, and the round's supply
+averages 130-150k transactions a second -- below the 170-230k the ingest gives beside an
+import-gated fleet, because seven followers now execute off the loop while the ingest's
+recovery slots and the flood want the same cores. So on one box the bound deferred execution
+gives is *the supply*, not the chain: the protocol reaches the pacing floor and the flood
+cannot fill 60+ blocks a window. That is the measurement plan v3 section 5 asked for, with its
+answer: the mechanism is real (the vote's coupling is the whole difference between 55 and 62+
+blocks), and the number it is worth at full blocks is a seven-machine number, where each
+node's ingest has its own cores. loop130 tries the supply side of this box (32 recovery
+slots, 96 flood connections, pacing 300) to see how far the ingest can be pushed.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
