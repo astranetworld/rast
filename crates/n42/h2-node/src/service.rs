@@ -181,7 +181,7 @@ pub struct H2Service<E> {
     own_imports: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
     /// Verdicts of follower imports the driver ran on a task (bench only,
     /// `N42_VOTE_BEFORE_IMPORT=1`).
-    foreign_imports: Option<tokio::sync::mpsc::UnboundedReceiver<(B256, Result<(), String>)>>,
+    foreign_imports: Option<tokio::sync::mpsc::UnboundedReceiver<n42_h2_execution::ImportReport>>,
     outputs: mpsc::Receiver<EngineOutput>,
     identity: H2V4ChainIdentity,
     /// The size the signer bitmaps on the wire are read against. A message
@@ -904,8 +904,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             } => {
                 // A follower import that ran on a task: the same action an
                 // awaited import returns, applied now.
-                if let Some((block_hash, verdict)) = verdict {
-                    for action in self.driver.finish_execute(block_hash, verdict).await {
+                if let Some(report) = verdict {
+                    for action in self.driver.finish_execute(report).await {
                         self.apply_driver_action(action, &mut events)?;
                     }
                 }
@@ -1902,6 +1902,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                         self.note_imported(header.number);
                     }
                     self.prepare_on = Some(*block_hash);
+                }
+                // A checked block (deferred execution) is voted for on the
+                // same extends rule; it is not imported yet, so nothing else
+                // moves.
+                if let ConsensusEvent::BlockChecked(block_hash) = event.as_ref() {
+                    if let Some(header) = self.block_headers.get(block_hash) {
+                        self.engine.remember_parent(*block_hash, header.parent_hash);
+                    }
                 }
                 if let Err(err) = self.engine.process_event(*event) {
                     debug!(target: "n42.h2.node", %err, "engine rejected an execution event");

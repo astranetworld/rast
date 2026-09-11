@@ -50,7 +50,7 @@ use alloy_rpc_types_engine::{
     ForkchoiceUpdated,
     PayloadAttributes, PayloadId, PayloadStatus, PraguePayloadFields,
 };
-use n42_h2_execution::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ResolveKind};
+use n42_h2_execution::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ExecutionPath, ResolveKind};
 use serde_json::{json, Value};
 use tracing::debug;
 
@@ -505,6 +505,26 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         self.call(method, params).await.map_err(ElError::new)
     }
 
+    async fn new_payload_checked(
+        &self,
+        path: ExecutionPath,
+        payload: ExecutionData,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+    ) -> Result<PayloadStatus, ElError> {
+        if !path.uses_current_engine_api() {
+            return Err(ElError::new(format!(
+                "execution path {} is not implemented by the canonical Engine API adapter",
+                path.label()
+            )));
+        }
+        // The channel carries the check; JSON does not, and the vote then
+        // waits for the import.
+        if let Some(status) = self.new_payload_over_channel_checked(&payload, checked).await {
+            return Ok(status);
+        }
+        self.new_payload_for(path, payload).await
+    }
+
     async fn fork_choice_updated(
         &self,
         state: ForkchoiceState,
@@ -824,6 +844,98 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             Err(err) => {
                 debug!(target: "n42.h2.el", %err, "build on the sealed block failed on the channel; building ahead the ordinary way");
                 channel.stream = None;
+                None
+            }
+        }
+    }
+
+    /// [`Self::new_payload_over_channel`] with the `CHECKED` frame delivered
+    /// on `checked` as it arrives, and the connection held by this request
+    /// alone rather than under the channel's lock: under deferred execution
+    /// the next block's request goes out while this one executes (the
+    /// execution layer orders them by parent), so each takes a connection
+    /// of its own when the shared one is busy.
+    async fn new_payload_over_channel_checked(
+        &self,
+        payload: &ExecutionData,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+    ) -> Option<PayloadStatus> {
+        use n42_h2_execution::raw_engine::reply;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, taken) = {
+            let mut channel = self.raw_import.lock().await;
+            let addr = self.raw_endpoint(&mut channel).await?;
+            (addr, channel.stream.take())
+        };
+        let started = std::time::Instant::now();
+        let frame = n42_h2_execution::raw_engine::encode_execution_data(payload);
+        let mut checked = Some(checked);
+        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            conn.write_u8(n42_h2_execution::raw_engine::request::NEW_PAYLOAD).await?;
+            conn.write_u32_le(frame.len() as u32).await?;
+            conn.write_all(&frame).await?;
+            loop {
+                let kind = conn.read_u8().await?;
+                let len = conn.read_u32_le().await? as usize;
+                let mut buf = vec![0u8; len];
+                conn.read_exact(&mut buf).await?;
+                match kind {
+                    reply::CHECKED | reply::VALUE => {
+                        let status = n42_h2_execution::raw_engine::decode_payload_status(&buf)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        if kind == reply::VALUE {
+                            return Ok((status, conn));
+                        }
+                        if let Some(sender) = checked.take() {
+                            debug!(
+                                target: "n42.h2.el",
+                                check_ms = started.elapsed().as_millis() as u64,
+                                status = ?status.status,
+                                "raw newPayload: checked"
+                            );
+                            let _ = sender.send(status);
+                        }
+                    }
+                    reply::ERROR => {
+                        return Err(std::io::Error::other(String::from_utf8_lossy(&buf).into_owned()));
+                    }
+                    other => {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}")));
+                    }
+                }
+            }
+        }
+        .await;
+        match attempt {
+            Ok((status, conn)) => {
+                // Back into the shared slot when it is free; a second
+                // connection this request opened beside a busy one is
+                // simply closed.
+                let mut channel = self.raw_import.lock().await;
+                if channel.stream.is_none() {
+                    channel.stream = Some(conn);
+                }
+                if frame.len() > 1_000_000 {
+                    debug!(
+                        target: "n42.h2.el",
+                        bytes = frame.len(),
+                        round_trip_ms = started.elapsed().as_millis() as u64,
+                        status = ?status.status,
+                        "raw newPayload (checked)"
+                    );
+                }
+                Some(status)
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.el", %err, "raw newPayload channel failed; using JSON for this block");
                 None
             }
         }

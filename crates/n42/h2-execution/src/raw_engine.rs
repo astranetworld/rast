@@ -50,6 +50,24 @@ pub mod request {
     pub const BUILD_ON_OWN: u8 = 4;
 }
 
+/// Reply kinds on the channel.
+pub mod reply {
+    /// The answer follows: `u32` length and the encoded value.
+    pub const VALUE: u8 = 1;
+    /// An error follows: `u32` length and the message.
+    pub const ERROR: u8 = 2;
+    /// `NEW_PAYLOAD` only, under deferred execution
+    /// (docs/PHASE_D_DEFERRED_EXECUTION.md): the block was *checked* -- its
+    /// header's execution fields match this execution layer's result for the
+    /// parent and its transactions are includable on the parent's state --
+    /// and is now executing. `u32` length and an encoded
+    /// [`super::PayloadStatus`] (VALID) follow, then the final answer as a
+    /// [`VALUE`] or [`ERROR`] frame once the block is imported. A block
+    /// before the fork, or one this execution layer does not check ahead,
+    /// gets no such frame.
+    pub const CHECKED: u8 = 3;
+}
+
 struct Writer(Vec<u8>);
 impl Writer {
     fn u8(&mut self, v: u8) { self.0.push(v); }

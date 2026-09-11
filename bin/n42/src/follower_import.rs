@@ -29,7 +29,7 @@ use reth_revm::database::StateProviderDatabase;
 use reth_provider::HashedPostStateProvider;
 use reth_revm::cached::CachedReads;
 use reth_trie::updates::TrieUpdates;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 /// The read cache carried from one direct import to the next: the previous
 /// block's post-state (its senders above all -- every sender of the next
@@ -44,6 +44,156 @@ pub static IMPORT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 /// Names the stages of [`IMPORT_STAGE`].
 pub const IMPORT_STAGES: [&str; 8] = ["idle", "header", "senders", "execution", "checks", "carry", "qmdb-root", "hashed-state"];
+
+/// Bumped every time a block lands in the engine here (a direct import, the
+/// leader's own block), for [`wait_for_parent`]: under deferred execution
+/// the next block's check starts the moment its parent is in.
+static IMPORT_LANDED: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Says a block has landed in the engine (see [`IMPORT_LANDED`]).
+pub fn note_import_landed() {
+    let (count, landed) = &IMPORT_LANDED;
+    *count.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+    landed.notify_all();
+}
+
+/// How long a check waits for the block's parent to land before giving the
+/// block up to the engine's ordinary path (which answers SYNCING).
+const PARENT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The parent's sealed header once the parent is in: known to the provider
+/// and, under deferred execution, executed here (its result recorded), so
+/// the header's fields can be checked and the transactions read against its
+/// post-state. Blocks arrive in order but their imports overlap from the
+/// fork on, so the parent of the block being checked may still be
+/// executing; this waits for it, up to [`PARENT_WAIT`].
+fn wait_for_parent<Provider>(
+    provider: &Provider,
+    parent_hash: B256,
+    genesis: &alloy_genesis::Genesis,
+    deferred: bool,
+) -> Result<reth_primitives_traits::SealedHeader, String>
+where
+    Provider: HeaderProvider<Header = alloy_consensus::Header>,
+{
+    let deadline = std::time::Instant::now() + PARENT_WAIT;
+    let (count, landed) = &IMPORT_LANDED;
+    let mut seen = *count.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        if let Some(parent) = provider
+            .sealed_header_by_hash(parent_hash)
+            .map_err(|err| format!("parent header: {err}"))?
+        {
+            // A parent before the fork carries its own result in its header;
+            // one past it has its result recorded here once executed.
+            let executed_here = deferred
+                && parent.number > 0
+                && reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp);
+            if !executed_here || n42_engine_types::executed_fields::get(&parent_hash).is_some() {
+                return Ok(parent);
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(format!("parent {parent_hash} not imported within {PARENT_WAIT:?}"));
+        }
+        // A landing bumps the count; a block that arrives by the engine's
+        // own path bumps nothing, so the wait is also a poll.
+        let guard = count.lock().unwrap_or_else(|p| p.into_inner());
+        let (guard, _) = landed
+            .wait_timeout_while(guard, (deadline - now).min(std::time::Duration::from_millis(20)), |c| *c == seen)
+            .unwrap_or_else(|p| p.into_inner());
+        seen = *guard;
+    }
+}
+
+/// The includability of a block's transactions on its parent's post-state
+/// (docs/PHASE_D_DEFERRED_EXECUTION.md, section 8.4): what a follower's
+/// vote attests under deferred execution, since the block's execution is
+/// checked only by the next header. Per sender, one account read: the
+/// nonces contiguous from the account's, the balance covering every
+/// transaction's value and gas at its fee cap; per transaction, the chain
+/// id, the fee cap against the block's base fee, the priority fee under the
+/// cap, a gas limit at least a transfer's; for the block, the gas limits
+/// within the header's. Senders are read on the worker pool, each chunk on
+/// a state provider of its own.
+fn check_includable<Provider>(
+    provider: &Provider,
+    parent_hash: B256,
+    block: &RecoveredBlock<Block>,
+    chain_id: u64,
+) -> Result<(), String>
+where
+    Provider: StateProviderFactory + Sync,
+{
+    use alloy_consensus::Transaction as _;
+    use rayon::prelude::*;
+    use reth_provider::AccountReader as _;
+    use std::collections::HashMap;
+
+    let header = block.header();
+    let base_fee = u128::from(header.base_fee_per_gas.unwrap_or(0));
+    let mut gas_total: u64 = 0;
+    let mut by_sender: HashMap<Address, Vec<usize>> = HashMap::new();
+    for (index, (sender, tx)) in block.transactions_with_sender().enumerate() {
+        if let Some(id) = tx.chain_id() {
+            if id != chain_id {
+                return Err(format!("transaction {index}: chain id {id}, the chain's is {chain_id}"));
+            }
+        }
+        let cap = tx.max_fee_per_gas();
+        if cap < base_fee {
+            return Err(format!("transaction {index}: fee cap {cap} under the base fee {base_fee}"));
+        }
+        if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > cap) {
+            return Err(format!("transaction {index}: priority fee over the fee cap"));
+        }
+        if tx.gas_limit() < 21_000 {
+            return Err(format!("transaction {index}: gas limit {} under a transfer's", tx.gas_limit()));
+        }
+        if tx.authorization_list().is_some_and(|list| list.is_empty()) {
+            return Err(format!("transaction {index}: empty authorization list"));
+        }
+        gas_total = gas_total.saturating_add(tx.gas_limit());
+        by_sender.entry(*sender).or_default().push(index);
+    }
+    if gas_total > header.gas_limit {
+        return Err(format!("gas limits sum to {gas_total}, over the block's {}", header.gas_limit));
+    }
+    let txs: Vec<&TransactionSigned> = block.body().transactions().collect();
+    let groups: Vec<(Address, Vec<usize>)> = by_sender.into_iter().collect();
+    let chunk = groups.len().div_ceil(32).max(1);
+    let checked: Vec<Result<(), String>> = groups
+        .par_chunks(chunk)
+        .map(|chunk| {
+            let state = provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}"))?;
+            for (sender, indexes) in chunk {
+                let account = state
+                    .basic_account(sender)
+                    .map_err(|err| format!("account {sender}: {err}"))?
+                    .unwrap_or_default();
+                let mut nonce = account.nonce;
+                let mut cost = alloy_primitives::U256::ZERO;
+                for &index in indexes {
+                    let tx = txs[index];
+                    if tx.nonce() != nonce {
+                        return Err(format!("transaction {index}: nonce {}, {sender} is at {nonce}", tx.nonce()));
+                    }
+                    nonce += 1;
+                    let gas = alloy_primitives::U256::from(tx.gas_limit()) * alloy_primitives::U256::from(tx.max_fee_per_gas());
+                    let blobs = alloy_primitives::U256::from(tx.blob_gas_used().unwrap_or(0))
+                        * alloy_primitives::U256::from(tx.max_fee_per_blob_gas().unwrap_or(0));
+                    cost = cost.saturating_add(tx.value()).saturating_add(gas).saturating_add(blobs);
+                }
+                if cost > account.balance {
+                    return Err(format!("{sender}: {} transactions cost {cost} of a balance of {}", indexes.len(), account.balance));
+                }
+            }
+            Ok(())
+        })
+        .collect();
+    checked.into_iter().collect()
+}
 
 struct ImportStage(u64);
 
@@ -69,6 +219,13 @@ const CARRY_CAP: usize = 1_000_000;
 /// Returns the executed block and the phase timings in milliseconds:
 /// header checks, senders, execution, the post-execution checks, state root,
 /// hashed state; then the number of senders the recovery cache held.
+///
+/// Under deferred execution (a block stamped at or past the chain's
+/// `deferredExecutionTime`) the block is *checked* first -- its header's
+/// execution fields against this node's result for the parent, its
+/// transactions' includability on the parent's post-state -- and `checked`
+/// is told so before the execution starts: that is the follower's vote. A
+/// block before the fork sends nothing on it.
 #[allow(clippy::too_many_arguments)]
 pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     sealed: SealedBlock<Block>,
@@ -79,6 +236,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
+    checked: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 9]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
@@ -96,15 +254,10 @@ where
     let number = sealed.number;
     let block_hash = sealed.hash();
 
-    // The header and body, by the consensus rules the engine would apply.
-    let parent = provider
-        .sealed_header_by_hash(parent_hash)
-        .map_err(|err| format!("parent header: {err}"))?
-        .ok_or_else(|| format!("parent {parent_hash} unknown"))?;
+    let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), sealed.timestamp);
+    // The header and body, by the consensus rules the engine would apply;
+    // what needs no parent first, so it overlaps the parent's import.
     consensus.validate_header(sealed.sealed_header()).map_err(|err| format!("header: {err}"))?;
-    consensus
-        .validate_header_against_parent(sealed.sealed_header(), &parent)
-        .map_err(|err| format!("header against parent: {err}"))?;
     // The transactions root was computed and matched against the sealed hash
     // by the payload's conversion; the body check takes it as known.
     consensus
@@ -168,6 +321,27 @@ where
     let cache_hits = cache_hits.into_inner();
     let recovered = RecoveredBlock::new_sealed(sealed, senders);
     let senders_ms = senders_at.elapsed().as_millis() as u64;
+
+    // The parent: in, and under deferred execution executed here, since the
+    // header's fields are checked against its result and the transactions
+    // against its post-state.
+    let parent = wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+    consensus
+        .validate_header_against_parent(recovered.sealed_header(), &parent)
+        .map_err(|err| format!("header against parent: {err}"))?;
+    if deferred {
+        let check_at = std::time::Instant::now();
+        check_includable(provider, parent_hash, &recovered, chain_spec.chain().id())?;
+        tracing::debug!(
+            target: "n42.follower_import",
+            number,
+            check_ms = check_at.elapsed().as_millis() as u64,
+            "checked: the header carries the parent's result and the transactions are includable"
+        );
+        if let Some(checked) = checked {
+            let _ = checked.send(());
+        }
+    }
 
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header.
@@ -249,7 +423,6 @@ where
     // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_PARALLEL=1` puts
     // them on the worker pool together.
     let bundle = &output.state;
-    let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), recovered.timestamp);
     let root_job = || -> Result<B256, String> {
         if deferred {
             // The header carries the parent's root (checked against the

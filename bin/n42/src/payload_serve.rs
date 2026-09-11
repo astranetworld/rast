@@ -163,6 +163,7 @@ pub struct OwnBlockReuse {
 /// parent-state lookup.
 pub type ForeignImport = dyn Fn(
         SealedBlock<n42_tx_types::Block>,
+        Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<
         (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 9]),
         String,
@@ -328,6 +329,7 @@ where
     let handed = tokio::time::timeout(std::time::Duration::from_secs(2), handed).await;
     match handed {
         Ok(Ok(true)) => {
+            crate::follower_import::note_import_landed();
             if let (Some(prune), Some(hashes)) = (reuse.prune_pool.clone(), pool_prune_hashes) {
                 let count = hashes.len();
                 let pruned_at = std::time::Instant::now();
@@ -828,6 +830,10 @@ where
                         let payload = data.clone();
                         let fast = direct_fast_answer();
                         let started = std::time::Instant::now();
+                        // Under deferred execution the import says when the
+                        // block is checked, and the validator hears it on a
+                        // CHECKED frame before the import's answer.
+                        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel::<()>();
                         let handed = tokio::task::spawn_blocking(move || {
                             let sealed = <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
                                 .map_err(|err| format!("conversion: {err}"))?;
@@ -843,10 +849,39 @@ where
                             if !fast {
                                 n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
                             }
-                            let (executed, phases) = import(sealed)?;
+                            let (executed, phases) = import(sealed, Some(checked_tx))?;
                             Ok::<_, String>((executed, phases, converted))
-                        })
-                        .await
+                        });
+                        tokio::pin!(handed);
+                        let mut finished = None;
+                        tokio::select! {
+                            checked = checked_rx => {
+                                if checked.is_ok() {
+                                    let status = alloy_rpc_types_engine::PayloadStatus::from_status(
+                                        alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                                    )
+                                    .with_latest_valid_hash(data.payload.block_hash());
+                                    let encoded = raw_engine::encode_payload_status(&status);
+                                    let mut frame = Vec::with_capacity(encoded.len() + 5);
+                                    frame.push(raw_engine::reply::CHECKED);
+                                    frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                                    frame.extend_from_slice(&encoded);
+                                    stream.write_all(&frame).await?;
+                                    info!(
+                                        target: "n42.payload_serve",
+                                        number,
+                                        txs,
+                                        checked_ms = started.elapsed().as_millis() as u64,
+                                        "checked: answered before the execution"
+                                    );
+                                }
+                            }
+                            done = &mut handed => finished = Some(done),
+                        }
+                        let handed = match finished {
+                            Some(done) => done,
+                            None => handed.await,
+                        }
                         .map_err(|err| err.to_string())
                         .and_then(|r| r);
                         match handed {
@@ -931,6 +966,7 @@ where
                                 let landed = sent
                                     && matches!(tokio::time::timeout(std::time::Duration::from_secs(2), handed).await, Ok(Ok(true)));
                                 if landed {
+                                    crate::follower_import::note_import_landed();
                                     direct_ms = Some([
                                         converted,
                                         phases[0],

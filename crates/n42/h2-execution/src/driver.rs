@@ -35,6 +35,20 @@ use crate::{
 /// Not `Clone`/`PartialEq`: [`ConsensusEvent`] is neither, and wrapping it in
 /// something that is would mean cloning payloads on a path that never needs to.
 /// Tests use the accessors below.
+/// What a follower import running on a task reports to the loop, through
+/// the channel [`ExecutionDriver::take_foreign_imports`] hands out.
+#[derive(Debug)]
+pub enum ImportReport {
+    /// Under deferred execution: the execution layer checked the block
+    /// (header fields against its result for the parent, transactions
+    /// includable on the parent's state) and is executing it -- the vote
+    /// may go out.
+    Checked(B256),
+    /// The import finished, with the verdict an awaited import would have
+    /// returned.
+    Done(B256, Result<(), String>),
+}
+
 #[derive(Debug)]
 pub enum DriverAction {
     /// Feed this back into [`n42_h2_consensus::ConsensusEngine::process_event`].
@@ -191,10 +205,18 @@ pub struct ExecutionDriver<E> {
     /// execution would give the cycle. Imports still run one at a time, in
     /// order; the rest queue.
     spawn_imports: bool,
-    /// Where a spawned import reports its verdict.
-    foreign_imports: tokio::sync::mpsc::UnboundedSender<(B256, Result<(), String>)>,
+    /// The chain's `deferredExecutionTime`
+    /// (docs/PHASE_D_DEFERRED_EXECUTION.md), if it has one: a block stamped
+    /// at or past it is *checked* before it is executed, the check releases
+    /// the vote ([`ImportReport::Checked`]), and the import runs on a task
+    /// beside the loop and beside the next block's check -- the execution
+    /// layer orders them by parent. Blocks before the fork take the path
+    /// above.
+    deferred_execution_time: Option<u64>,
+    /// Where a spawned import reports.
+    foreign_imports: tokio::sync::mpsc::UnboundedSender<ImportReport>,
     /// The receiving end, until the loop takes it.
-    foreign_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(B256, Result<(), String>)>>,
+    foreign_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ImportReport>>,
     /// Blocks waiting for the import in flight to finish (spawned mode).
     import_queue: std::collections::VecDeque<B256>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
@@ -204,15 +226,16 @@ pub struct ExecutionDriver<E> {
     head: B256,
     /// Last block consensus committed.
     finalized: B256,
-    /// The block `execute` is importing right now, if any.
-    executing: Option<B256>,
-    /// A commit that arrived while that import was in flight (a follower
-    /// that voted before importing, `N42_VOTE_BEFORE_IMPORT=1`): the
-    /// forkchoice waits for the import, since the engine would answer
-    /// SYNCING for a block it has not seen. Only an import in flight defers
-    /// a commit -- a block imported by another path (the leader's own block
-    /// by header, a synced range) commits at once, as before.
-    pending_commit: Option<B256>,
+    /// The blocks `execute` is importing right now: one on the awaited and
+    /// the queued paths, any number under deferred execution.
+    executing: std::collections::HashSet<B256>,
+    /// Commits that arrived while their import was in flight (a follower
+    /// that voted before importing): the forkchoice waits for the import,
+    /// since the engine would answer SYNCING for a block it has not seen.
+    /// Only an import in flight defers a commit -- a block imported by
+    /// another path (the leader's own block by header, a synced range)
+    /// commits at once, as before.
+    pending_commits: std::collections::HashSet<B256>,
     /// Bounds `payloads` so a peer cannot make us buffer without limit.
     max_cached_payloads: usize,
     /// Insertion order, for evicting the oldest cached payload.
@@ -234,14 +257,15 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
             spawn_imports: false,
+            deferred_execution_time: None,
             foreign_imports: foreign_tx,
             foreign_imports_rx: Some(foreign_rx),
             import_queue: std::collections::VecDeque::new(),
             payloads: HashMap::new(),
             head: genesis,
             finalized: genesis,
-            executing: None,
-            pending_commit: None,
+            executing: std::collections::HashSet::new(),
+            pending_commits: std::collections::HashSet::new(),
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
         }
@@ -705,9 +729,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     }
 
     /// The channel a spawned follower import reports on, once.
-    pub fn take_foreign_imports(
-        &mut self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<(B256, Result<(), String>)>> {
+    pub fn take_foreign_imports(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<ImportReport>> {
         self.foreign_imports_rx.take()
     }
 
@@ -716,15 +738,79 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.spawn_imports = on;
     }
 
+    /// The chain's `deferredExecutionTime` (see the field); `None` keeps
+    /// every block on the import-gated path.
+    pub fn set_deferred_execution_time(&mut self, at: Option<u64>) {
+        self.deferred_execution_time = at;
+    }
+
+    /// Whether a block stamped `timestamp` is under deferred execution.
+    fn deferred_at(&self, timestamp: u64) -> bool {
+        self.deferred_execution_time.is_some_and(|at| timestamp >= at)
+    }
+
+    /// Deferred execution: sends the block to the execution layer on a task
+    /// at once -- no queue; the execution layer checks it against the
+    /// parent's result as soon as the parent is in, and executes it after --
+    /// and reports the check and then the import on the channel.
+    fn spawn_execute_deferred(&mut self, block_hash: B256) -> DriverAction {
+        if self.executing.contains(&block_hash) {
+            return DriverAction::Ignored;
+        }
+        let Some(payload) = self.payloads.get(&block_hash).cloned() else {
+            return DriverAction::PayloadMissing { block_hash };
+        };
+        self.executing.insert(block_hash);
+        let el = std::sync::Arc::clone(&self.el);
+        let report = self.foreign_imports.clone();
+        let txs = payload.payload.as_v1().transactions.len();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+            let import = el.new_payload_checked(ExecutionPath::LIVE_SEQUENTIAL, payload, checked_tx);
+            tokio::pin!(import);
+            // The check, when the execution layer offers one, arrives while
+            // the import is still running; a dropped sender means it does
+            // not, and the vote waits for the import as before.
+            let outcome = tokio::select! {
+                checked = checked_rx => {
+                    if let Ok(status) = checked {
+                        if matches!(status.status, PayloadStatusEnum::Valid) {
+                            if txs >= 10_000 {
+                                info!(target: "n42.h2.el", block = ?block_hash, txs, check_ms = started.elapsed().as_millis() as u64, "checked a block; executing");
+                            }
+                            let _ = report.send(ImportReport::Checked(block_hash));
+                        }
+                    }
+                    import.await
+                }
+                outcome = &mut import => outcome,
+            };
+            if txs >= 10_000 {
+                info!(target: "n42.h2.el", block = ?block_hash, txs, import_ms = started.elapsed().as_millis() as u64, "imported a block");
+            }
+            let verdict = match outcome {
+                Ok(status) => match status.status {
+                    PayloadStatusEnum::Valid => Ok(()),
+                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Err("not executed (syncing)".to_string()),
+                    PayloadStatusEnum::Invalid { validation_error } => Err(validation_error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = report.send(ImportReport::Done(block_hash, verdict));
+        });
+        DriverAction::Ignored
+    }
+
     /// Starts `block_hash`'s import on a task, or queues it behind the one in
     /// flight. The verdict arrives on the channel and goes through
     /// [`Self::finish_execute`].
     fn spawn_execute(&mut self, block_hash: B256) -> DriverAction {
-        if self.executing == Some(block_hash) {
+        if self.executing.contains(&block_hash) {
             // Asked again for the block in flight: its verdict is coming.
             return DriverAction::Ignored;
         }
-        if self.executing.is_some() {
+        if !self.executing.is_empty() {
             if !self.import_queue.contains(&block_hash) {
                 self.import_queue.push_back(block_hash);
             }
@@ -733,7 +819,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let Some(payload) = self.payloads.get(&block_hash).cloned() else {
             return DriverAction::PayloadMissing { block_hash };
         };
-        self.executing = Some(block_hash);
+        self.executing.insert(block_hash);
         let el = std::sync::Arc::clone(&self.el);
         let report = self.foreign_imports.clone();
         let txs = payload.payload.as_v1().transactions.len();
@@ -751,27 +837,31 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 },
                 Err(error) => Err(error.to_string()),
             };
-            let _ = report.send((block_hash, verdict));
+            let _ = report.send(ImportReport::Done(block_hash, verdict));
         });
         DriverAction::Ignored
     }
 
-    /// A spawned import's verdict: the head moves, a commit that waited runs
-    /// its forkchoice, the next queued import starts, and the loop gets the
-    /// same action an awaited import would have returned -- plus, when the
-    /// next queued block's payload is gone from the cache, the
-    /// `PayloadMissing` that makes the loop fetch it (dropping that would
-    /// leave the block unimported for good).
-    pub async fn finish_execute(&mut self, block_hash: B256, verdict: Result<(), String>) -> Vec<DriverAction> {
-        if self.executing == Some(block_hash) {
-            self.executing = None;
-        }
+    /// A spawned import's report. A check releases the vote and nothing
+    /// else. A verdict: the head moves, a commit that waited runs its
+    /// forkchoice, the next queued import starts, and the loop gets the same
+    /// action an awaited import would have returned -- plus, when the next
+    /// queued block's payload is gone from the cache, the `PayloadMissing`
+    /// that makes the loop fetch it (dropping that would leave the block
+    /// unimported for good).
+    pub async fn finish_execute(&mut self, report: ImportReport) -> Vec<DriverAction> {
+        let (block_hash, verdict) = match report {
+            ImportReport::Checked(block_hash) => {
+                return vec![DriverAction::Consensus(Box::new(ConsensusEvent::BlockChecked(block_hash)))];
+            }
+            ImportReport::Done(block_hash, verdict) => (block_hash, verdict),
+        };
+        self.executing.remove(&block_hash);
         let mut actions = Vec::with_capacity(2);
         actions.push(match verdict {
             Ok(()) => {
                 self.head = block_hash;
-                if self.pending_commit == Some(block_hash) {
-                    self.pending_commit = None;
+                if self.pending_commits.remove(&block_hash) {
                     let _ = self.commit(block_hash).await;
                 }
                 DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
@@ -869,6 +959,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Follower path: executes a proposed block and, on acceptance, produces the
     /// event that releases the import-gated vote.
     async fn execute(&mut self, block_hash: B256) -> DriverAction {
+        if let Some(timestamp) = self.payloads.get(&block_hash).map(|p| p.payload.timestamp()) {
+            if self.deferred_at(timestamp) {
+                return self.spawn_execute_deferred(block_hash);
+            }
+        }
         if self.spawn_imports {
             return self.spawn_execute(block_hash);
         }
@@ -877,12 +972,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         };
         let txs = payload.payload.as_v1().transactions.len();
         let started = std::time::Instant::now();
-        self.executing = Some(block_hash);
+        self.executing.insert(block_hash);
         let outcome = self
             .el
             .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload)
             .await;
-        self.executing = None;
+        self.executing.remove(&block_hash);
         if txs >= 10_000 {
             info!(
                 target: "n42.h2.el",
@@ -896,8 +991,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     self.head = block_hash;
-                    if self.pending_commit == Some(block_hash) {
-                        self.pending_commit = None;
+                    if self.pending_commits.remove(&block_hash) {
                         // The commit that waited for this import; its own
                         // action is a log line the node does nothing with.
                         let _ = self.commit(block_hash).await;
@@ -924,9 +1018,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// Commit path: makes a committed block the head and the finalised block.
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
-        if self.executing == Some(block_hash) {
+        if self.executing.contains(&block_hash) {
             // Still importing: the forkchoice follows the import's success.
-            self.pending_commit = Some(block_hash);
+            self.pending_commits.insert(block_hash);
             return DriverAction::Ignored;
         }
         self.finalized = block_hash;

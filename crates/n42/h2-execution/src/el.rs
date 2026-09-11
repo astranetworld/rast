@@ -228,6 +228,25 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         result
     }
 
+    /// [`Self::new_payload_for`] with the block's *check* reported ahead of
+    /// its execution, under deferred execution
+    /// (docs/PHASE_D_DEFERRED_EXECUTION.md): `checked` receives VALID once
+    /// the execution layer has found the header's execution fields equal to
+    /// its own result for the parent and the transactions includable on the
+    /// parent's post-state -- what a follower's vote attests -- and the
+    /// returned status is the import, as before. An execution layer without
+    /// the early answer drops `checked` unused, and the caller votes on the
+    /// import instead; this default is that.
+    async fn new_payload_checked(
+        &self,
+        path: ExecutionPath,
+        payload: ExecutionData,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+    ) -> Result<PayloadStatus, ElError> {
+        drop(checked);
+        self.new_payload_for(path, payload).await
+    }
+
     /// Engine-API `forkchoiceUpdated` without attributes — the finalise and
     /// import path.
     async fn fork_choice_updated(

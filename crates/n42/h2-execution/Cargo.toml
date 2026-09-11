@@ -21,7 +21,7 @@ thiserror.workspace = true
 tracing.workspace = true
 metrics.workspace = true
 # For handing a leader's own import to a task rather than awaiting it.
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }

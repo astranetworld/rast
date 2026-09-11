@@ -136,6 +136,14 @@ pub enum ConsensusEvent {
     /// Block data has been imported into the execution layer (follower path).
     /// Triggers the deferred vote for the pending proposal.
     BlockImported(B256),
+    /// Under deferred execution (docs/PHASE_D_DEFERRED_EXECUTION.md) the
+    /// execution layer has *checked* the block -- its header's execution
+    /// fields equal this node's result for the parent, its transactions are
+    /// includable on the parent's post-state -- and is executing it. That is
+    /// what the vote attests from the fork on, so this releases the pending
+    /// vote exactly as [`Self::BlockImported`] does; the import itself
+    /// follows, and moves the execution layer's head.
+    BlockChecked(B256),
 }
 
 /// A vote message whose single-validator BLS signature was verified by the
@@ -953,6 +961,7 @@ impl ConsensusEngine {
             ConsensusEvent::Message(_) => "message",
             ConsensusEvent::BlockReady(..) => "block_ready",
             ConsensusEvent::BlockImported(_) => "block_imported",
+            ConsensusEvent::BlockChecked(_) => "block_checked",
         };
         let _span = tracing::info_span!(
             target: "n42.cl.consensus.event",
@@ -966,7 +975,9 @@ impl ConsensusEngine {
             ConsensusEvent::BlockReady(block_hash, tx_root_hash) => {
                 self.on_block_ready(block_hash, tx_root_hash)
             }
-            ConsensusEvent::BlockImported(block_hash) => self.on_block_imported(block_hash),
+            ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) => {
+                self.on_block_imported(block_hash)
+            }
         }
     }
 

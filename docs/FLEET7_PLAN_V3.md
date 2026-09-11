@@ -334,7 +334,11 @@ empty; more recovery slots and flood connections do not change it. The TPS defer
 is worth at full blocks is a measurement for a fleet whose ingest has cores of its own. The
 gov5 side agreed (reuse the fields 7862-style, a timestamp fork, pipeline depth 1) and the Rust
 side's stage 1 -- the header semantics behind `config.deferredExecutionTime`, with the
-executed-fields registry and the dev-chain fork test -- is in; stage 2 is the vote flow.*
+executed-fields registry and the dev-chain fork test -- is in, with the cross-client vector
+(`n42-testing/testdata/deferred_execution_vectors.json`); stage 2 -- check, vote, import,
+with the next block's check overlapping this block's import (proposal section 11) -- is
+built and is measured by loop132 (`n42_fleet7_bench_deferred.json` against the bench genesis
+on the same binary).*
 
 Everything above keeps "a follower executes the block before it votes". The
 fixed ~100 ms and the execute-then-vote coupling are then the wall: at

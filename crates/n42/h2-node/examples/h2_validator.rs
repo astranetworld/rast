@@ -172,10 +172,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Everything about the fleet from one file, when there is one.
     let mut hotstuff_config: Option<n42_qmdb_reth::HotStuffGenesisConfig> = None;
+    // The chain's `deferredExecutionTime`, when it has one.
+    let mut deferred_execution_time: Option<u64> = None;
     let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
         Some(path) => {
             use reth_cli::chainspec::ChainSpecParser as _;
             let spec = n42_qmdb_reth::N42ChainSpecParser::parse(path)?;
+            deferred_execution_time = n42_qmdb_reth::deferred_execution_time(&spec.genesis);
             let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis)?;
             base_timeout_ms.get_or_insert(hotstuff.base_timeout);
             max_timeout_ms.get_or_insert(hotstuff.max_timeout);
@@ -426,6 +429,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the import, the import must not hold the loop either.
         if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {
             driver.set_spawn_imports(true);
+        }
+        // Deferred execution (docs/PHASE_D_DEFERRED_EXECUTION.md): from the
+        // fork on, a block is checked against the parent's result, voted
+        // for, and imported beside the loop.
+        if let Some(at) = deferred_execution_time {
+            driver.set_deferred_execution_time(Some(at));
+            println!("deferred     : execution deferred from timestamp {at}; a block is checked, voted for, then imported beside the loop");
         }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);

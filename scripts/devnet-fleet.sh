@@ -19,8 +19,10 @@ F=${N42_FLEET_DIR:-/tmp/n42-fleet}
 TAG=${1:-run}; SECS=${2:-60}; shift 2 || true
 WITH_GOV5=; KEEP=
 for arg in "$@"; do case $arg in --gov5) WITH_GOV5=1;; --keep) KEEP=1;; esac; done
-GENESIS=$REPO/crates/chainspec/res/genesis/n42_devnet.json
-BIN=$REPO/target/debug
+# Both overridable: a genesis with a rule switched on (`deferredExecutionTime`),
+# a release build in a target directory of its own.
+GENESIS=${DEVNET_GENESIS:-$REPO/crates/chainspec/res/genesis/n42_devnet.json}
+BIN=${DEVNET_BIN:-$REPO/target/debug}
 mkdir -p $F
 [ -f $F/jwt.hex ] || openssl rand -hex 32 > $F/jwt.hex
 if [ ! -d $F/keys ]; then

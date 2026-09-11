@@ -242,7 +242,45 @@ deferred_execution_active_at}`):
   produced. Keys and timestamps are fixed, so the document is reproducible; the test
   compares every run with it (`N42_WRITE_VECTORS=1` rewrites it).
 
-Stage 2 is the vote: a follower votes on N once the parent is imported, N's fields match the
-parent's result and N's transactions pass the includability check, then executes N off the
-loop (the machinery of `N42_VOTE_BEFORE_IMPORT=1`, now under the gate and safe).
+## 11. Rust side, stage 2 (2026-09-11): the vote before the import
+
+From the fork on a follower's block goes through *check, vote, import* instead of *import,
+vote*, and the next block's check overlaps this block's import:
+
+- **Execution layer** (`bin/n42`, the direct import behind `N42_FOLLOWER_DIRECT_IMPORT=1`):
+  a gated block is first checked without its parent -- header rules, body, sender recovery
+  (the ingest's caches, the Ed25519 batches) -- then waits for the parent to land (a
+  condvar bumped by every landing, polled every 20 ms for blocks the engine's own path
+  imports, 10 s at most), checks its header's four fields against the parent's recorded
+  result (`validate_header_against_parent` under the gate) and its transactions'
+  includability on the parent's post-state (section 8.4's pass: per sender one account
+  read on the worker pool, nonces contiguous, balance over value + gas at the fee cap,
+  chain id, fee cap over the base fee, priority under the cap, a transfer's gas at least,
+  the block's gas limits within the header's), and only then executes. The raw payload
+  channel answers the check on a `CHECKED` frame (`raw_engine::reply::CHECKED`, an
+  encoded VALID status) before the import's final answer on the same request; a block
+  before the fork gets no such frame. Each request holds its own connection, so the next
+  block's request goes out while this one executes.
+- **Driver** (`n42-h2-execution`): `set_deferred_execution_time` from the genesis; a gated
+  block is sent at once on a task, no queue -- the execution layer orders by parent -- and
+  the task reports `ImportReport::Checked` when the frame arrives and `ImportReport::Done`
+  with the import's verdict. Imports in flight and deferred commits are sets now. The
+  execution-layer seam is `ExecutionLayer::new_payload_checked` (a oneshot for the check;
+  the default drops it and the vote waits for the import, so an execution layer without
+  the frame is safe, just unpipelined).
+- **Consensus** (`n42-h2-consensus`): `ConsensusEvent::BlockChecked` releases the pending
+  import-gated vote exactly as `BlockImported` does (the parent is remembered for the
+  extends rule); the import event still follows and moves the node's head and build-ahead
+  parent. `N42_VOTE_BEFORE_IMPORT=1` stays a bench flag for pre-fork chains.
+- What a vote now attests: the parent's result as this node computed it, and that the block
+  can execute on it. A block whose execution then fails here (an intrinsic-gas or
+  state-dependent failure the includability pass does not see, EIP-8037's state gas among
+  them) leaves this node without a recorded result for it, so it refuses to vote on the
+  child (section 8.3's semantic shift), as an invalid block would be refused today.
+- Cycle: the follower's serial chain per block becomes the includability pass plus the
+  execution (the stateless half of the check overlaps the previous import), and the leader
+  gets the QC while the followers execute; the idle gap between a follower's import and the
+  next body is gone. Measured by loop132 (`n42_fleet7_bench_deferred.json` =
+  the bench genesis with `deferredExecutionTime: 0`, against the same binary on the
+  ungated genesis).
 
