@@ -363,6 +363,12 @@ impl QmdbForest {
         self.tree.sync_entries().map_err(|e| StateError::EntryFile(e.to_string()))
     }
 
+    /// Writes the entry file's pending appends and returns a handle to
+    /// fsync outside the forest's lock; `None` without an entry file.
+    pub fn flush_entries_for_sync(&mut self) -> Result<Option<std::fs::File>, StateError> {
+        self.tree.flush_entries_for_sync().map_err(|e| StateError::EntryFile(e.to_string()))
+    }
+
     /// The canonical head as a file-mode checkpoint: the cursor and the
     /// active bits, with the tree stood at the head.
     pub fn checkpoint(&mut self) -> Result<ForestCheckpoint, StateError> {

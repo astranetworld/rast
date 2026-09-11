@@ -921,12 +921,19 @@ impl QmdbNodeState {
     }
 
     /// In file mode, the entry file's appends are made durable before the
-    /// delta that names them is written.
+    /// delta that names them is written: the write of the pending bytes
+    /// under the forest lock (milliseconds), the fsync on a second handle
+    /// outside it (tens of milliseconds, which under the lock stalled every
+    /// block's build and import, loop126).
     fn sync_entries_if_file(&self) -> Result<(), NodeStateError> {
         if !self.inner.entry_file {
             return Ok(());
         }
-        self.with_forest(|forest| forest.sync_entries())
+        let handle = self.with_forest(|forest| forest.flush_entries_for_sync())?;
+        if let Some(handle) = handle {
+            handle.sync_data().map_err(|source| NodeStateError::Io { path: self.entry_file_path(), source })?;
+        }
+        Ok(())
     }
 
     /// The checkpoint, rewritten at `block_hash` = the log's head: from the

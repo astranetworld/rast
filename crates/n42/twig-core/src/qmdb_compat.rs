@@ -1341,6 +1341,13 @@ impl QmdbCompatTree {
         self.entries.sync()
     }
 
+    /// Writes the entry file's pending appends and returns a handle whose
+    /// `sync_data` makes them durable, for a caller that will fsync outside
+    /// the lock this tree lives under; `None` in the heap.
+    pub fn flush_entries_for_sync(&mut self) -> std::io::Result<Option<std::fs::File>> {
+        self.entries.flush_for_sync()
+    }
+
     pub fn next_slot(&self) -> u64 {
         self.next_slot
     }

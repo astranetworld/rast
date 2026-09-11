@@ -304,6 +304,16 @@ impl FileEntries {
         self.file.sync_data()
     }
 
+    /// Writes what the tail still holds and hands back a second handle on
+    /// the file, so the caller can `sync_data` it without holding whatever
+    /// lock guards this store: the fsync of a block's ~20 MB is tens of
+    /// milliseconds, and under the forest lock it stalled the builder and
+    /// the importer on every block (loop126).
+    pub(crate) fn flush_for_sync(&mut self) -> io::Result<File> {
+        self.flush()?;
+        self.file.try_clone()
+    }
+
     /// Drops every slot from `len` on, and shortens the file to match.
     pub(crate) fn truncate(&mut self, len: usize) -> io::Result<()> {
         if len >= self.offsets.len() {
@@ -513,6 +523,15 @@ impl Entries {
         match self {
             Self::Heap(_) => Ok(()),
             Self::File(file) => file.sync(),
+        }
+    }
+
+    /// Writes the file's pending appends and returns a handle to fsync
+    /// later, outside the tree's lock; `None` for the heap.
+    pub(crate) fn flush_for_sync(&mut self) -> io::Result<Option<File>> {
+        match self {
+            Self::Heap(_) => Ok(None),
+            Self::File(file) => file.flush_for_sync().map(Some),
         }
     }
 
