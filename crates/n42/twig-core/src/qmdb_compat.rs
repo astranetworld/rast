@@ -132,6 +132,9 @@ pub enum QmdbSnapshotError {
     DuplicateActiveKey(Hash),
     #[error("QMDB slot log is not contiguous: expected slot {expected}, got {got}")]
     NonContiguousSlotLog { expected: u64, got: u64 },
+    /// The entry file could not be opened or read.
+    #[error("QMDB entry file: {0}")]
+    EntryFile(String),
 }
 
 /// Cross-client QMDB bootstrap metadata plus its complete positional slot log.
@@ -495,6 +498,9 @@ impl QmdbPortableSnapshot {
                     QmdbPortableError::NonContiguousSlotLog { expected, got }
                 }
                 QmdbSnapshotError::DuplicateActiveKey(_) => QmdbPortableError::RootMismatch,
+                // A slot snapshot is built in the heap; the entry file is not
+                // involved, so this arm is unreachable in practice.
+                QmdbSnapshotError::EntryFile(_) => QmdbPortableError::RootMismatch,
             })?;
         if tree.root() != self.root {
             return Err(QmdbPortableError::RootMismatch);
@@ -1237,6 +1243,67 @@ impl QmdbCompatTree {
     /// Where the entries live on disk, if they do.
     pub fn entry_file(&self) -> Option<&std::path::Path> {
         self.entries.file_path()
+    }
+
+    /// The active bits, one per slot, 64 to a word: with `next_slot` and the
+    /// entry file, everything a restart needs (`from_entry_file`).
+    pub fn active_bits(&self) -> Vec<u64> {
+        self.entries.active_bits()
+    }
+
+    /// Rebuilds the tree from the entry file at `path`, keeping at most
+    /// `next_slot` records (a torn or surplus tail is dropped and the file
+    /// shortened), with `active` saying which slots are live. Every record
+    /// is hashed once, on the worker pool when the `rayon` feature is on;
+    /// the twigs and the key index follow. Returns the tree and the number
+    /// of slots it holds (less than `next_slot` only if the file was short).
+    pub fn from_entry_file(
+        path: &std::path::Path,
+        next_slot: u64,
+        active: &[u64],
+    ) -> Result<(Self, u64), QmdbSnapshotError> {
+        let (file, kept) = crate::entry_store::FileEntries::open_existing(path, next_slot, active)
+            .map_err(|e| QmdbSnapshotError::EntryFile(e.to_string()))?;
+        let entries = Entries::File(file);
+        let n = kept as usize;
+        // The leaf hashes, from the records.
+        let leaf = |slot: usize| hash_leaf(&entries.key(slot), entries.value(slot));
+        let leaves: Vec<Hash> = {
+            #[cfg(feature = "rayon")]
+            {
+                use rayon::prelude::*;
+                (0..n).into_par_iter().map(leaf).collect()
+            }
+            #[cfg(not(feature = "rayon"))]
+            {
+                (0..n).map(leaf).collect()
+            }
+        };
+        let mut tree = Self {
+            entries,
+            index: KeyIndex::default(),
+            twigs: Vec::new(),
+            next_slot: kept,
+            recording: None,
+        };
+        if n > 0 {
+            tree.ensure_twig((n - 1) / TWIG_SIZE);
+        }
+        for (slot, leaf) in leaves.into_iter().enumerate() {
+            let twig_id = slot / TWIG_SIZE;
+            let local = slot % TWIG_SIZE;
+            tree.twigs[twig_id].set_leaf_unchecked(local, leaf);
+            if tree.entries.is_active(slot) {
+                tree.twigs[twig_id].set_active(local, true);
+                if tree.index.insert(tree.entries.key(slot), slot as u64).is_some() {
+                    return Err(QmdbSnapshotError::DuplicateActiveKey(tree.entries.key(slot)));
+                }
+            }
+        }
+        for twig in &mut tree.twigs {
+            twig.recompute();
+        }
+        Ok((tree, kept))
     }
 
     /// Makes the entry file's appends durable (nothing to do in the heap).

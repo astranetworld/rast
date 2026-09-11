@@ -46,8 +46,7 @@ pub mod forest;
 
 use alloy_primitives::{Address, B256, U256};
 pub use alloc::changes_from_alloc;
-pub use forest::{
-    ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, StateProofProvider,
+pub use forest::{ForestCheckpoint, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, StateProofProvider,
     DEFAULT_RETAIN_DEPTH,
 };
 use n42_twig_core::qmdb_compat::{
@@ -196,6 +195,9 @@ impl BlockChanges {
 /// Why a block could not be applied.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    /// The entry file could not be created, written, read or reopened.
+    #[error("QMDB entry file: {0}")]
+    EntryFile(String),
     /// Two operations named the same leaf. Applying either would leave the tree
     /// in a state that depends on which one won, so neither is applied.
     #[error("state change produced a duplicate leaf key: {0}")]

@@ -103,6 +103,91 @@ impl FileEntries {
         })
     }
 
+    /// Opens the file at `path` as it was left, keeping at most `slots`
+    /// records: the records are walked in order, a torn or surplus tail
+    /// (records past `slots`, or a record cut short) is dropped and the
+    /// file shortened to match, and `active` says which slots are live
+    /// (missing bits read as dead). Returns the store and how many records
+    /// it holds.
+    pub(crate) fn open_existing(path: &Path, slots: u64, active: &[u64]) -> io::Result<(Self, u64)> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let len = file.metadata()?.len();
+        // Walk the record headers: a scan of the whole file's bytes, in
+        // 64 MB pieces so the tree's rebuild does not hold the file twice.
+        use std::io::Read;
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut at = 0u64;
+        let mut header = [0u8; KEY_LEN + LEN_LEN];
+        file.seek(io::SeekFrom::Start(0))?;
+        let mut reader = std::io::BufReader::with_capacity(8 << 20, &mut file);
+        while (offsets.len() as u64) < slots && at + (KEY_LEN + LEN_LEN) as u64 <= len {
+            reader.read_exact(&mut header)?;
+            let value_len = u32::from_le_bytes([header[32], header[33], header[34], header[35]]) as u64;
+            let end = at + (KEY_LEN + LEN_LEN) as u64 + value_len;
+            if end > len {
+                break; // torn tail
+            }
+            offsets.push(at);
+            // Skip the value.
+            std::io::copy(&mut reader.by_ref().take(value_len), &mut std::io::sink())?;
+            at = end;
+        }
+        drop(reader);
+        let kept = offsets.len() as u64;
+        let len_bytes = at;
+        file.set_len(len_bytes)?;
+        let mut store = Self {
+            path: path.to_path_buf(),
+            file,
+            chunks: Vec::new(),
+            sealed_len: 0,
+            tail: Vec::new(),
+            len_bytes,
+            offsets,
+            active: vec![0u64; (kept as usize).div_ceil(64)],
+        };
+        for (word, bits) in store.active.iter_mut().zip(active) {
+            *word = *bits;
+        }
+        // Bits past the kept slots are cleared.
+        for slot in kept as usize..store.active.len() * 64 {
+            store.set_active(slot, false);
+        }
+        // Everything on disk is sealed into chunks; the tail starts empty.
+        store.seal_existing()?;
+        Ok((store, kept))
+    }
+
+    /// Maps `[0, len_bytes)` in chunks that end at record boundaries.
+    fn seal_existing(&mut self) -> io::Result<()> {
+        let mut start = 0u64;
+        let mut slot = 0usize;
+        while start < self.len_bytes {
+            // The first record at or past `start + CHUNK_BYTES` ends the chunk.
+            let limit = start + CHUNK_BYTES as u64;
+            let mut end_slot = slot;
+            while end_slot < self.offsets.len() && self.offsets[end_slot] < limit {
+                end_slot += 1;
+            }
+            let end = if end_slot < self.offsets.len() { self.offsets[end_slot] } else { self.len_bytes };
+            // SAFETY: read-only mapping of bytes that are never rewritten in
+            // place (see `seal_tail`).
+            let map = unsafe {
+                memmap2::MmapOptions::new().offset(start).len((end - start) as usize).populate().map(&self.file)?
+            };
+            self.chunks.push(Chunk { start, map });
+            start = end;
+            slot = end_slot;
+        }
+        self.sealed_len = self.len_bytes;
+        Ok(())
+    }
+
+    /// The active bits, one per slot, 64 to a word.
+    pub(crate) fn active_bits(&self) -> &[u64] {
+        &self.active
+    }
+
     /// The file this store appends to.
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -414,6 +499,23 @@ impl Entries {
         match self {
             Self::Heap(entries) => Ok(Self::Heap(entries.clone())),
             Self::File(file) => file.duplicate().map(Self::File),
+        }
+    }
+
+    /// The active bits, one per slot, 64 to a word (built from the entries
+    /// in the heap).
+    pub(crate) fn active_bits(&self) -> Vec<u64> {
+        match self {
+            Self::Heap(entries) => {
+                let mut bits = vec![0u64; entries.len().div_ceil(64)];
+                for (slot, entry) in entries.iter().enumerate() {
+                    if entry.active {
+                        bits[slot / 64] |= 1 << (slot % 64);
+                    }
+                }
+                bits
+            }
+            Self::File(file) => file.active_bits().to_vec(),
         }
     }
 

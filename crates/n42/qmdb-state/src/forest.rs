@@ -66,6 +66,66 @@ impl PreparedBlock {
     }
 }
 
+/// Everything a restart needs when the entries live in the file: where the
+/// head stands, how many slots the file holds for it, and which are live.
+/// The tree itself is rebuilt from the file (`QmdbForest::from_entry_file`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForestCheckpoint {
+    /// Layout version.
+    pub version: u32,
+    /// The block the state stands at.
+    pub head_number: u64,
+    /// Its hash.
+    pub head_hash: B256,
+    /// The append cursor.
+    pub next_slot: u64,
+    /// One bit per slot, 64 to a word.
+    pub active: Vec<u64>,
+}
+
+impl ForestCheckpoint {
+    /// The layout this crate writes.
+    pub const VERSION: u32 = 1;
+
+    /// Moves this checkpoint forward by one delta: the cursor to the delta's
+    /// (truncating first on a rewind), the appended range live, the changed
+    /// slots to their flags. The entries themselves are in the file.
+    pub fn apply_delta(&mut self, delta: &ForestDelta) -> Result<(), StateError> {
+        if delta.version != ForestDelta::VERSION {
+            return Err(StateError::SnapshotVersion { found: delta.version, expected: ForestDelta::VERSION });
+        }
+        if delta.base_next_slot > self.next_slot {
+            return Err(StateError::DeltaBase { expected: self.next_slot, found: delta.base_next_slot });
+        }
+        let words = |slots: u64| (slots as usize).div_ceil(64);
+        // Truncate to the base.
+        self.active.truncate(words(delta.base_next_slot));
+        for slot in delta.base_next_slot..(self.active.len() as u64 * 64) {
+            self.active[(slot / 64) as usize] &= !(1 << (slot % 64));
+        }
+        // The appended range is live.
+        self.active.resize(words(delta.next_slot), 0);
+        for slot in delta.base_next_slot..delta.next_slot {
+            self.active[(slot / 64) as usize] |= 1 << (slot % 64);
+        }
+        for (slot, active) in &delta.changed {
+            if *slot >= delta.base_next_slot {
+                return Err(StateError::DeltaSlot(*slot));
+            }
+            let word = (*slot / 64) as usize;
+            if *active {
+                self.active[word] |= 1 << (*slot % 64);
+            } else {
+                self.active[word] &= !(1 << (*slot % 64));
+            }
+        }
+        self.next_slot = delta.next_slot;
+        self.head_number = delta.head_number;
+        self.head_hash = delta.head_hash;
+        Ok(())
+    }
+}
+
 /// Everything needed to rebuild the canonical head's tree after a restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForestSnapshot {
@@ -263,12 +323,56 @@ impl QmdbForest {
 
     /// Moves the tree's entries into the append-only file at `path` and
     /// appends there from now on (`docs/QMDB_ENTRY_LOG.md`): the heap then
-    /// holds an offset and a bit per slot instead of the entry. The file is
-    /// rebuilt from the checkpoint and the log at every start, so it needs
-    /// no durability of its own.
+    /// holds an offset and a bit per slot instead of the entry, and the file
+    /// is the record of every appended slot (`sync_entries` before the delta
+    /// that names them is written).
     pub fn with_entry_file(mut self, path: &std::path::Path) -> Result<Self, StateError> {
-        self.tree.set_entry_file(path).map_err(|e| StateError::Undo(format!("entry file {}: {e}", path.display())))?;
+        self.tree.set_entry_file(path).map_err(|e| StateError::EntryFile(format!("{}: {e}", path.display())))?;
         Ok(self)
+    }
+
+    /// A forest whose entries are in the file at `path`, standing at
+    /// `checkpoint`: the tree is rebuilt from the file's records. An error if
+    /// the file holds fewer slots than the checkpoint names.
+    pub fn from_entry_file(checkpoint: &ForestCheckpoint, path: &std::path::Path) -> Result<Self, StateError> {
+        if checkpoint.version != ForestCheckpoint::VERSION {
+            return Err(StateError::SnapshotVersion { found: checkpoint.version, expected: ForestCheckpoint::VERSION });
+        }
+        let (tree, kept) = QmdbCompatTree::from_entry_file(path, checkpoint.next_slot, &checkpoint.active)
+            .map_err(|e| StateError::EntryFile(e.to_string()))?;
+        if kept != checkpoint.next_slot {
+            return Err(StateError::EntryFile(format!(
+                "{} holds {kept} slots but the checkpoint at block {} needs {}",
+                path.display(),
+                checkpoint.head_number,
+                checkpoint.next_slot
+            )));
+        }
+        Ok(Self::at(checkpoint.head_number, checkpoint.head_hash, tree))
+    }
+
+    /// Whether the entries live in a file.
+    pub fn has_entry_file(&self) -> bool {
+        self.tree.entry_file().is_some()
+    }
+
+    /// Makes the entry file's appends durable.
+    pub fn sync_entries(&mut self) -> Result<(), StateError> {
+        self.tree.sync_entries().map_err(|e| StateError::EntryFile(e.to_string()))
+    }
+
+    /// The canonical head as a file-mode checkpoint: the cursor and the
+    /// active bits, with the tree stood at the head.
+    pub fn checkpoint(&mut self) -> Result<ForestCheckpoint, StateError> {
+        let head = self.head.1;
+        self.move_to(head)?;
+        Ok(ForestCheckpoint {
+            version: ForestCheckpoint::VERSION,
+            head_number: self.head.0,
+            head_hash: head,
+            next_slot: self.tree.next_slot(),
+            active: self.tree.active_bits(),
+        })
     }
 
     fn at(number: u64, hash: B256, tree: QmdbCompatTree) -> Self {
@@ -459,10 +563,17 @@ impl QmdbForest {
         let base_next_slot = undo.prev_next_slot;
         let next_slot = self.tree.next_slot();
         let tree = &self.tree;
-        let appended: Vec<QmdbEntrySnapshot> = (base_next_slot..next_slot)
-            .into_par_iter()
-            .map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree"))
-            .collect();
+        // With the entries in the file, the file is the record of the
+        // appended range (synced before the delta is written); the delta
+        // names it by its bounds and carries nothing.
+        let appended: Vec<QmdbEntrySnapshot> = if tree.entry_file().is_some() {
+            Vec::new()
+        } else {
+            (base_next_slot..next_slot)
+                .into_par_iter()
+                .map(|slot| tree.entry_at(slot).expect("an appended slot is on the tree"))
+                .collect()
+        };
         // The block only ever deactivates the slots its undo names (a
         // revival is a move, not a block), so no read: the flag is false.
         let changed: Vec<(u64, bool)> = undo
@@ -647,9 +758,13 @@ impl QmdbForest {
         // those slots travel as appends (the replay truncates to the base
         // first). Below that, the slots a move flipped travel as flags.
         let base = self.min_cursor.min(base_next_slot);
-        let appended = (base..next_slot)
-            .map(|slot| self.tree.entry_at(slot).ok_or(StateError::DeltaSlot(slot)))
-            .collect::<Result<Vec<_>, _>>()?;
+        let appended = if self.tree.entry_file().is_some() {
+            Vec::new()
+        } else {
+            (base..next_slot)
+                .map(|slot| self.tree.entry_at(slot).ok_or(StateError::DeltaSlot(slot)))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let changed = self
             .dirty_slots
             .iter()

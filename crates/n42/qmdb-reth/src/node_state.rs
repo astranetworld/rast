@@ -69,8 +69,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use alloy_primitives::{Address, B256};
 use n42_qmdb_state::{
-    BlockChanges, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, StateError,
-    StateProofProvider,
+    BlockChanges, ForestCheckpoint, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest,
+    StateError, StateProofProvider,
 };
 use n42_twig_core::qmdb_compat::QmdbProof;
 use reth_chainspec::ChainSpec;
@@ -176,6 +176,8 @@ fn entry_file_enabled() -> bool {
 }
 
 const ENTRY_FILE: &str = "entries.log";
+/// The file-mode checkpoint: the cursor and the active bits, no entries.
+const CKPT_FILE: &str = "forest.ckpt";
 
 /// Why the node's QMDB state could not be used.
 #[derive(Debug, thiserror::Error)]
@@ -262,6 +264,9 @@ struct Inner {
     /// can wait for it. Only ever one: the cursor's `compacting` flag stops a
     /// second from starting while it runs.
     compaction: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The entries live in `entries.log` and the checkpoint is `forest.ckpt`
+    /// (`N42_QMDB_ENTRY_FILE=1`, or the constructor's choice).
+    entry_file: bool,
 }
 
 /// The delta log's position, as the node last left it.
@@ -324,8 +329,32 @@ impl QmdbNodeState {
                 dir: dir.into(),
                 persist: Mutex::new(PersistCursor::default()),
                 compaction: Mutex::new(None),
+                entry_file: entry_file_enabled(),
             }),
         }
+    }
+
+    /// [`Self::new`] with the entry file on or off regardless of the
+    /// environment (tests run both in one process).
+    pub fn new_with_entry_file(chain: Arc<ChainSpec>, dir: impl Into<PathBuf>, entry_file: bool) -> Self {
+        let state = Self::new(chain, dir);
+        let inner = Arc::try_unwrap(state.inner).unwrap_or_else(|_| unreachable!("a fresh handle has one owner"));
+        Self { inner: Arc::new(Inner { entry_file, ..inner }) }
+    }
+
+    /// Whether the entries live in the file.
+    pub fn uses_entry_file(&self) -> bool {
+        self.inner.entry_file
+    }
+
+    /// Where the file-mode checkpoint lives.
+    pub fn ckpt_path(&self) -> PathBuf {
+        self.inner.dir.join(CKPT_FILE)
+    }
+
+    /// Where the entry file lives.
+    pub fn entry_file_path(&self) -> PathBuf {
+        self.inner.dir.join(ENTRY_FILE)
     }
 
     /// Where the snapshot lives.
@@ -384,6 +413,11 @@ impl QmdbNodeState {
             return Ok(());
         }
         let (head_number, head_hash) = head;
+        if self.inner.entry_file {
+            let forest = self.initialize_file_mode(head, &mut cursor)?;
+            *guard = Some(with_configured_retention(forest));
+            return Ok(());
+        }
         let path = self.snapshot_path();
 
         let log_path = self.delta_log_path();
@@ -471,22 +505,124 @@ impl QmdbNodeState {
         Ok(())
     }
 
-    /// The forest as the node's configuration wants it: the record
-    /// retention, and the entries in the file when asked.
-    fn configured(&self, forest: QmdbForest) -> Result<QmdbForest, NodeStateError> {
-        let forest = with_configured_retention(forest);
-        if !entry_file_enabled() {
+    /// [`Self::initialize`] with the entries in the file: from `forest.ckpt`
+    /// plus the logs and the entry file; from a version-1 checkpoint
+    /// (`forest.bin`, every entry inside) by writing the entry file once;
+    /// or from the genesis alloc. The cursor is left describing the files.
+    fn initialize_file_mode(&self, head: (u64, B256), cursor: &mut PersistCursor) -> Result<QmdbForest, NodeStateError> {
+        let (head_number, head_hash) = head;
+        let ckpt_path = self.ckpt_path();
+        let entry_path = self.entry_file_path();
+        let log_path = self.delta_log_path();
+        if let Some(ckpt) = read_ckpt(&ckpt_path)? {
+            let checkpoint_len = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
+            let sealed_path = self.sealed_log_path();
+            let sealed = sealed_path.exists();
+            let (ckpt, sealed_head) = if sealed {
+                let (state, _) = replay_delta_log(&sealed_path, ckpt, Some(head_hash))?;
+                let at = (state.head_number, state.head_hash);
+                (state, Some(at))
+            } else {
+                (ckpt, None)
+            };
+            let (ckpt, log_len) = replay_delta_log(&log_path, ckpt, Some(head_hash))?;
+            if ckpt.head_hash != head_hash {
+                return Err(NodeStateError::SnapshotMismatch {
+                    snapshot_number: ckpt.head_number,
+                    snapshot_hash: ckpt.head_hash,
+                    head_number,
+                    head_hash,
+                });
+            }
+            let started = std::time::Instant::now();
+            let forest = QmdbForest::from_entry_file(&ckpt, &entry_path)?;
+            *cursor = PersistCursor {
+                head: ckpt.head_hash,
+                next_slot: ckpt.next_slot,
+                log_len,
+                checkpoint_len,
+                compacting: false,
+            };
+            info!(
+                target: "n42.qmdb",
+                block = head_number, %head_hash, slots = ckpt.next_slot, log_bytes = log_len, sealed,
+                rebuild_ms = started.elapsed().as_millis() as u64,
+                "restored the QMDB forest from the entry file",
+            );
+            if let Some(sealed_head) = sealed_head {
+                self.spawn_compaction(cursor, sealed_head);
+            }
             return Ok(forest);
         }
-        let path = self.inner.dir.join(ENTRY_FILE);
+        // No file-mode checkpoint: a version-1 one, or genesis.
+        let v1_path = self.snapshot_path();
+        let forest = match read_snapshot(&v1_path)? {
+            Some(snapshot) => {
+                let (snapshot, _) = replay_delta_log(&log_path, snapshot, Some(head_hash))?;
+                if snapshot.head_hash != head_hash {
+                    return Err(NodeStateError::SnapshotMismatch {
+                        snapshot_number: snapshot.head_number,
+                        snapshot_hash: snapshot.head_hash,
+                        head_number,
+                        head_hash,
+                    });
+                }
+                info!(target: "n42.qmdb", block = head_number, %head_hash, "migrating a version-1 QMDB checkpoint to the entry file");
+                QmdbForest::from_snapshot(&snapshot)?
+            }
+            None if head_number == 0 => {
+                let chain = &self.inner.chain;
+                let forest = QmdbForest::genesis(head_hash, &changes_from_alloc(&chain.genesis.alloc))?;
+                let header_root = chain.genesis_header.state_root;
+                if forest.root() != header_root {
+                    return Err(NodeStateError::GenesisRootMismatch { computed: forest.root(), header: header_root });
+                }
+                info!(target: "n42.qmdb", root = %forest.root(), "seeded the QMDB forest from the genesis alloc");
+                forest
+            }
+            None => return Err(NodeStateError::NoSnapshot { path: ckpt_path, head_number }),
+        };
+        let forest = self.adopt_entry_file(forest, cursor)?;
+        // The version-1 checkpoint and whatever log there was are folded into
+        // the entry file and the new checkpoint; a delta the file already
+        // covers would be refused as standing on the wrong cursor.
+        let _ = std::fs::remove_file(&v1_path);
+        Ok(forest)
+    }
+
+    /// Moves a heap forest's entries into the entry file, writes the
+    /// file-mode checkpoint for its head and starts a fresh log; the cursor
+    /// describes the result.
+    fn adopt_entry_file(&self, forest: QmdbForest, cursor: &mut PersistCursor) -> Result<QmdbForest, NodeStateError> {
+        let entry_path = self.entry_file_path();
         let started = std::time::Instant::now();
-        let forest = forest.with_entry_file(&path)?;
+        let mut forest = forest.with_entry_file(&entry_path)?;
+        forest.sync_entries()?;
+        let ckpt = forest.checkpoint()?;
+        forest.forget_changes();
+        let checkpoint_len = write_ckpt(&self.ckpt_path(), &ckpt)?;
+        let _ = std::fs::remove_file(self.delta_log_path());
+        let _ = std::fs::remove_file(self.sealed_log_path());
+        *cursor = PersistCursor {
+            head: ckpt.head_hash,
+            next_slot: ckpt.next_slot,
+            log_len: 0,
+            checkpoint_len,
+            compacting: false,
+        };
         info!(
             target: "n42.qmdb",
-            path = %path.display(), total_ms = started.elapsed().as_millis() as u64,
+            path = %entry_path.display(), slots = ckpt.next_slot,
+            total_ms = started.elapsed().as_millis() as u64,
             "moved the QMDB entries into the entry file",
         );
         Ok(forest)
+    }
+
+    /// The forest as the node's configuration wants it: the record
+    /// retention (the entry file is handled by the initialisers).
+    fn configured(&self, forest: QmdbForest) -> Result<QmdbForest, NodeStateError> {
+        Ok(with_configured_retention(forest))
     }
 
     /// Restores the forest from a cross-client portable snapshot — gov5's
@@ -525,6 +661,12 @@ impl QmdbNodeState {
         }
         let mut forest = QmdbForest::from_tree(expected_head.0, expected_head.1, tree);
         let mut cursor = self.cursor();
+        if self.inner.entry_file {
+            let forest = self.adopt_entry_file(forest, &mut cursor)?;
+            info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
+            *self.lock() = Some(self.configured(forest)?);
+            return Ok(());
+        }
         let snapshot = forest.snapshot()?;
         let checkpoint_len = write_snapshot(&self.snapshot_path(), &snapshot)?;
         // Any log left in this datadir describes a different chain of states.
@@ -549,13 +691,24 @@ impl QmdbNodeState {
     /// running.
     pub fn portable_export(&self, chain_id: u64, genesis_hash: B256) -> Result<Vec<u8>, NodeStateError> {
         use n42_twig_core::qmdb_compat::{QmdbPortableSnapshot, QmdbSlotEntry, QmdbSlotSnapshot};
-        let path = self.snapshot_path();
-        let checkpoint =
-            read_snapshot(&path)?.ok_or(NodeStateError::NoSnapshot { path, head_number: 0 })?;
-        // The checkpoint alone is not the persisted head: the deltas written
-        // since it are the rest of the story, and an export taken without them
-        // would be a state some blocks behind the one it claims to be at.
-        let (snapshot, _) = replay_delta_log(&self.delta_log_path(), checkpoint, None)?;
+        let ckpt_path = self.ckpt_path();
+        let snapshot = if let Some(ckpt) = read_ckpt(&ckpt_path)? {
+            // File mode: the checkpoint plus the logs say where the head is
+            // and which slots are live; the entries come from the file.
+            let (ckpt, _) = replay_delta_log(&self.sealed_log_path(), ckpt, None)?;
+            let (ckpt, _) = replay_delta_log(&self.delta_log_path(), ckpt, None)?;
+            let mut forest = QmdbForest::from_entry_file(&ckpt, &self.entry_file_path())?;
+            forest.snapshot()?
+        } else {
+            let path = self.snapshot_path();
+            let checkpoint =
+                read_snapshot(&path)?.ok_or(NodeStateError::NoSnapshot { path, head_number: 0 })?;
+            // The checkpoint alone is not the persisted head: the deltas written
+            // since it are the rest of the story, and an export taken without them
+            // would be a state some blocks behind the one it claims to be at.
+            let (snapshot, _) = replay_delta_log(&self.delta_log_path(), checkpoint, None)?;
+            snapshot
+        };
         let tree = QmdbForest::from_snapshot(&snapshot)?;
         let entries = snapshot
             .tree
@@ -704,6 +857,7 @@ impl QmdbNodeState {
             Ok(forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash))
         })?;
         if let Some(deltas) = ready {
+            self.sync_entries_if_file()?;
             for delta in &deltas {
                 let written = append_delta(&self.delta_log_path(), cursor.log_len, delta)?;
                 cursor.next_slot = delta.next_slot;
@@ -740,6 +894,7 @@ impl QmdbNodeState {
         // The measured delta is appended first either way: the compaction
         // folds the log as it stands, and the synchronous checkpoint's
         // snapshot covers it too (the log is then emptied).
+        self.sync_entries_if_file()?;
         let written = append_delta(&self.delta_log_path(), cursor.log_len, &delta)?;
         cursor.head = block_hash;
         cursor.next_slot = delta.next_slot;
@@ -754,6 +909,15 @@ impl QmdbNodeState {
             return self.rewrite_checkpoint(block_hash, &mut cursor);
         }
         Ok(())
+    }
+
+    /// In file mode, the entry file's appends are made durable before the
+    /// delta that names them is written.
+    fn sync_entries_if_file(&self) -> Result<(), NodeStateError> {
+        if !self.inner.entry_file {
+            return Ok(());
+        }
+        self.with_forest(|forest| forest.sync_entries())
     }
 
     /// The checkpoint, rewritten at `block_hash` = the log's head: from the
@@ -833,6 +997,26 @@ impl QmdbNodeState {
         let path = self.snapshot_path();
         let sealed_path = self.sealed_log_path();
         let result = (|| -> Result<(u64, u64), NodeStateError> {
+            if self.inner.entry_file {
+                let ckpt_path = self.ckpt_path();
+                let ckpt = read_ckpt(&ckpt_path)?.ok_or_else(|| NodeStateError::NoSnapshot {
+                    path: ckpt_path.clone(),
+                    head_number: sealed_head.0,
+                })?;
+                let read_ms = started.elapsed().as_millis() as u64;
+                let (ckpt, _) = replay_delta_log(&sealed_path, ckpt, Some(sealed_head.1))?;
+                if ckpt.head_hash != sealed_head.1 {
+                    return Err(NodeStateError::SnapshotMismatch {
+                        snapshot_number: ckpt.head_number,
+                        snapshot_hash: ckpt.head_hash,
+                        head_number: sealed_head.0,
+                        head_hash: sealed_head.1,
+                    });
+                }
+                let len = write_ckpt(&ckpt_path, &ckpt)?;
+                let _ = std::fs::remove_file(&sealed_path);
+                return Ok((len, read_ms));
+            }
             let checkpoint = read_snapshot(&path)?.ok_or_else(|| NodeStateError::NoSnapshot {
                 path: path.clone(),
                 head_number: sealed_head.0,
@@ -889,6 +1073,31 @@ impl QmdbNodeState {
         cursor: &mut PersistCursor,
     ) -> Result<(), NodeStateError> {
         let started = std::time::Instant::now();
+        if self.inner.entry_file {
+            let ckpt = self.with_forest(|forest| {
+                forest.set_canonical(block_hash)?;
+                forest.sync_entries()?;
+                let ckpt = forest.checkpoint()?;
+                forest.forget_changes();
+                Ok(ckpt)
+            })?;
+            let len = write_ckpt(&self.ckpt_path(), &ckpt)?;
+            let _ = std::fs::remove_file(self.delta_log_path());
+            *cursor = PersistCursor {
+                head: block_hash,
+                next_slot: ckpt.next_slot,
+                log_len: 0,
+                checkpoint_len: len,
+                compacting: cursor.compacting,
+            };
+            info!(
+                target: "n42.qmdb",
+                block = ckpt.head_number, %block_hash, bytes = len,
+                total_ms = started.elapsed().as_millis() as u64,
+                "checkpointed the QMDB head (entry file)",
+            );
+            return Ok(());
+        }
         let snapshot = self.with_forest(|forest| {
             forest.set_canonical(block_hash)?;
             let snapshot = forest.snapshot()?;
@@ -938,6 +1147,66 @@ impl StateProofProvider for QmdbNodeState {
     fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof> {
         self.lock().as_mut()?.prove_storage(address, slot)
     }
+}
+
+/// What a delta log replays onto: the full snapshot (heap mode) or the
+/// file-mode checkpoint.
+trait DeltaTarget {
+    fn apply(&mut self, delta: &ForestDelta) -> Result<(), StateError>;
+    fn head_hash(&self) -> B256;
+    fn head_number(&self) -> u64;
+    fn next_slot(&self) -> u64;
+}
+
+impl DeltaTarget for ForestSnapshot {
+    fn apply(&mut self, delta: &ForestDelta) -> Result<(), StateError> {
+        self.apply_delta(delta)
+    }
+    fn head_hash(&self) -> B256 {
+        self.head_hash
+    }
+    fn head_number(&self) -> u64 {
+        self.head_number
+    }
+    fn next_slot(&self) -> u64 {
+        self.tree.next_slot
+    }
+}
+
+impl DeltaTarget for ForestCheckpoint {
+    fn apply(&mut self, delta: &ForestDelta) -> Result<(), StateError> {
+        self.apply_delta(delta)
+    }
+    fn head_hash(&self) -> B256 {
+        self.head_hash
+    }
+    fn head_number(&self) -> u64 {
+        self.head_number
+    }
+    fn next_slot(&self) -> u64 {
+        self.next_slot
+    }
+}
+
+fn read_ckpt(path: &Path) -> Result<Option<ForestCheckpoint>, NodeStateError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(NodeStateError::Io { path: path.to_path_buf(), source }),
+    };
+    bincode::deserialize(&bytes).map(Some).map_err(|source| NodeStateError::Decode { path: path.to_path_buf(), source })
+}
+
+fn write_ckpt(path: &Path, ckpt: &ForestCheckpoint) -> Result<u64, NodeStateError> {
+    let io = |source| NodeStateError::Io { path: path.to_path_buf(), source };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    let bytes = bincode::serialize(ckpt).map_err(|source| NodeStateError::Decode { path: path.to_path_buf(), source })?;
+    let temp = path.with_extension("ckpt.tmp");
+    std::fs::write(&temp, &bytes).map_err(io)?;
+    std::fs::rename(&temp, path).map_err(io)?;
+    Ok(bytes.len() as u64)
 }
 
 fn read_snapshot(path: &Path) -> Result<Option<ForestSnapshot>, NodeStateError> {
@@ -1041,13 +1310,13 @@ fn append_delta(path: &Path, from: u64, delta: &ForestDelta) -> Result<u64, Node
 ///
 /// Returns the state and how many bytes of the log it accounts for, so a later
 /// append writes over whatever was left rather than after it.
-fn replay_delta_log(
+fn replay_delta_log<T: DeltaTarget>(
     path: &Path,
-    checkpoint: ForestSnapshot,
+    checkpoint: T,
     stop_at: Option<B256>,
-) -> Result<(ForestSnapshot, u64), NodeStateError> {
+) -> Result<(T, u64), NodeStateError> {
     let mut state = checkpoint;
-    if stop_at == Some(state.head_hash) {
+    if stop_at == Some(state.head_hash()) {
         // Already there. Anything in the log describes blocks past the head,
         // which will arrive again through the engine.
         return Ok((state, 0));
@@ -1090,15 +1359,15 @@ fn replay_delta_log(
         // the state does; it is skipped. A delta on the wrong cursor that
         // would move the state forward is the corruption `apply_delta`
         // refuses.
-        if delta.base_next_slot != state.tree.next_slot && delta.head_number <= state.head_number {
+        if delta.base_next_slot != state.next_slot() && delta.head_number <= state.head_number() {
             at = end;
             good = at as u64;
             continue;
         }
-        state.apply_delta(&delta)?;
+        state.apply(&delta)?;
         at = end;
         good = at as u64;
-        if stop_at == Some(state.head_hash) {
+        if stop_at == Some(state.head_hash()) {
             break;
         }
     }
@@ -1319,9 +1588,17 @@ mod tests {
         // stands at block 5 and the segment is gone.
         restarted.wait_for_compaction();
         assert!(!restarted.sealed_log_path().exists());
-        let checkpoint = read_snapshot(&restarted.snapshot_path()).unwrap().unwrap();
-        assert_eq!((checkpoint.head_number, checkpoint.head_hash), (5, hashes[5]));
-        assert_eq!(restarted.cursor().checkpoint_len, std::fs::metadata(restarted.snapshot_path()).unwrap().len());
+        // The checkpoint stands at block 5 whichever form it takes: the
+        // version-1 snapshot with every entry, or the file-mode checkpoint.
+        let (at, len) = if restarted.uses_entry_file() {
+            let ckpt = read_ckpt(&restarted.ckpt_path()).unwrap().unwrap();
+            ((ckpt.head_number, ckpt.head_hash), std::fs::metadata(restarted.ckpt_path()).unwrap().len())
+        } else {
+            let checkpoint = read_snapshot(&restarted.snapshot_path()).unwrap().unwrap();
+            ((checkpoint.head_number, checkpoint.head_hash), std::fs::metadata(restarted.snapshot_path()).unwrap().len())
+        };
+        assert_eq!(at, (5, hashes[5]));
+        assert_eq!(restarted.cursor().checkpoint_len, len);
         drop(restarted);
 
         // The segment reappears although the checkpoint covers it (a crash
@@ -1394,6 +1671,106 @@ mod tests {
             ahead.initialize((5, hashes[5])),
             Err(NodeStateError::SnapshotMismatch { .. })
         ));
+    }
+
+    /// Blocks on a state, as the file-mode tests need them.
+    fn advance(state: &QmdbNodeState, number: u64, parent: B256) -> (B256, B256) {
+        use n42_qmdb_state::AccountState;
+        use alloy_primitives::{Address, U256};
+        let mut changes = BlockChanges::new();
+        // Two accounts a block: one new, one rewritten every block, so every
+        // block appends and retires slots.
+        changes.set_account(
+            Address::from_word(B256::from(U256::from(number))),
+            AccountState { nonce: number, balance: U256::from(number), code_hash: B256::ZERO },
+        );
+        changes.set_account(
+            Address::from_word(B256::from(U256::from(7u64))),
+            AccountState { nonce: number, balance: U256::from(number * 3), code_hash: B256::ZERO },
+        );
+        let hash = B256::from(U256::from(number) << 64);
+        let prepared = state.compute(parent, &changes).unwrap();
+        let root = prepared.root;
+        state.insert(hash, number, prepared).unwrap();
+        state.on_canonical(hash).unwrap();
+        (hash, root)
+    }
+
+    /// The entry file is the persistence: a node stops after its deltas,
+    /// restarts from `forest.ckpt` plus the entry file, and stands at the
+    /// same root; a torn tail on the entry file past the checkpoint (a
+    /// crash between the file append and the delta) is dropped.
+    #[test]
+    fn the_entry_file_restores_the_head_and_survives_a_torn_tail() {
+        let chain = qmdb_chain();
+        let dir = scratch("entry-file");
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        assert!(state.ckpt_path().exists(), "file mode writes its checkpoint at once");
+        let mut parent = chain.genesis_hash();
+        let mut root = B256::ZERO;
+        for number in 1..=40 {
+            let (hash, r) = advance(&state, number, parent);
+            parent = hash;
+            root = r;
+        }
+        assert!(!state.snapshot_path().exists(), "no version-1 checkpoint in file mode");
+        state.wait_for_compaction();
+        drop(state);
+
+        let restarted = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        restarted.initialize((40, parent)).unwrap();
+        assert_eq!(restarted.head(), Some((40, parent)));
+        assert_eq!(restarted.state_root(), root);
+        assert!(restarted.lock().as_ref().unwrap().has_entry_file());
+        // A block after the restart appends to the same file and persists.
+        let (hash41, root41) = advance(&restarted, 41, parent);
+        drop(restarted);
+
+        // Garbage past the end of the file: records a crash appended after
+        // the last delta, and half a record on top.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(dir.join(ENTRY_FILE)).unwrap();
+            f.write_all(&[0xAB; 100]).unwrap();
+        }
+        let again = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        again.initialize((41, hash41)).unwrap();
+        assert_eq!(again.state_root(), root41);
+        // Its export is the full slot history, dead entries included.
+        let portable = again.portable_export(1143, chain.genesis_hash()).unwrap();
+        assert!(!portable.is_empty());
+    }
+
+    /// A datadir written in heap mode (a version-1 checkpoint with every
+    /// entry) starts in file mode by writing the entry file once.
+    #[test]
+    fn a_version_1_checkpoint_migrates_to_the_entry_file() {
+        let chain = qmdb_chain();
+        let dir = scratch("migrate");
+        let heap = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, false);
+        heap.initialize((0, chain.genesis_hash())).unwrap();
+        let mut parent = chain.genesis_hash();
+        let mut root = B256::ZERO;
+        for number in 1..=12 {
+            let (hash, r) = advance(&heap, number, parent);
+            parent = hash;
+            root = r;
+        }
+        heap.wait_for_compaction();
+        assert!(heap.snapshot_path().exists());
+        drop(heap);
+
+        let file = QmdbNodeState::new_with_entry_file(chain.clone(), &dir, true);
+        file.initialize((12, parent)).unwrap();
+        assert_eq!(file.state_root(), root);
+        assert!(file.ckpt_path().exists() && file.entry_file_path().exists());
+        assert!(!file.snapshot_path().exists(), "the version-1 checkpoint is folded into the file");
+        let (hash13, root13) = advance(&file, 13, parent);
+        drop(file);
+        let again = QmdbNodeState::new_with_entry_file(chain, &dir, true);
+        again.initialize((13, hash13)).unwrap();
+        assert_eq!(again.state_root(), root13);
     }
 
     #[test]
