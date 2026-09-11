@@ -277,6 +277,15 @@ vote*, and the next block's check overlaps this block's import:
   state-dependent failure the includability pass does not see, EIP-8037's state gas among
   them) leaves this node without a recorded result for it, so it refuses to vote on the
   child (section 8.3's semantic shift), as an invalid block would be refused today.
+- The leader's own block reaches its execution layer as a sealed header whose hash differs
+  from the build's (the validator normalises the header): the handoff files the build's
+  recorded result under the sealed hash too, as it already did the QMDB tree. Without it the
+  leader's followers-to-be waited 10 s for a parent result that was there under the other
+  hash (the first smoke run).
+- Smoke test (2026-09-11, `scripts/fleet7.sh` on `n42_fleet7.json` with the fork at genesis,
+  200 tx/s offered for 90 s, every node its own execution layer): 28 blocks at the 3 s
+  interval, all seven at the same height and hash, every block voted for on its check (2-8
+  ms after the body), 189 tx/s sealed, no rejection.
 - Cycle: the follower's serial chain per block becomes the includability pass plus the
   execution (the stateless half of the check overlaps the previous import), and the leader
   gets the QC while the followers execute; the idle gap between a follower's import and the

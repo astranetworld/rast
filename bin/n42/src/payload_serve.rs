@@ -285,6 +285,14 @@ where
             return None;
         }
     }
+    // The build's own execution result, recorded by the builder under the
+    // build's hash: under deferred execution the next block's header is
+    // checked against it under the sealed hash.
+    if built_hash != sealed_hash {
+        if let Some(fields) = n42_engine_types::executed_fields::get(&built_hash) {
+            n42_engine_types::executed_fields::remember(sealed_hash, fields);
+        }
+    }
     let executed = reth_payload_primitives::BuiltPayloadExecutedBlock::<n42_tx_types::N42Primitives> {
         recovered_block: std::sync::Arc::new(recovered),
         execution_output: built.execution_output,
