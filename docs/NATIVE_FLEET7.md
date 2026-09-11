@@ -1780,6 +1780,21 @@ off the loop: the driver now runs a follower's import on a task when the flag is
 one at a time, in order, the rest queued; the verdict comes back on a channel the loop selects
 on, and a commit that arrived meanwhile runs its forkchoice then). loop129 runs that.
 
+**loop129, first run (2026-09-11 03:30-03:40 EDT): the import off the loop works, and the box was
+not ours.** With `N42_VOTE_BEFORE_IMPORT=1` now also running the follower's import on a task
+(`f880de3ce`), V1 collected its votes in 5-21 ms instead of 499 and made 59 blocks in window 1
+at a 0.508 s cycle -- the mechanism does what the bound needs. The leg is void all the same:
+two `eth-el-framed` jobs (gov5's eth-el mode bootstrapping mainnet snapshots under
+`/data/blockchain/ethel-test`, 1.6-4.4 GB each, I/O heavy) were running beside the fleet, the
+followers' imports read 670-830 ms instead of 330, the builder waited 333-1158 ms on the pool
+(`pool_ms`), and the blocks were small (4.38M transactions over 59 blocks, 146k TPS). Those
+jobs do not trip the launcher's load gate; the gate now also requires none of them. The round
+was stopped after V1 and re-armed behind them. Two things to read on the clean run: the cycle
+and the blocks a window on the V legs against the F legs (the bound), and whether the V legs
+are supply-bound (small blocks with a low `pool_ms`... a chain at 60+ blocks a window wants
+~330k transactions a second, near what the ingest gives) -- if they are, the cycle is the
+number, not the TPS.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
