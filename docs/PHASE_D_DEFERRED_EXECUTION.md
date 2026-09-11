@@ -286,6 +286,15 @@ vote*, and the next block's check overlaps this block's import:
   200 tx/s offered for 90 s, every node its own execution layer): 28 blocks at the 3 s
   interval, all seven at the same height and hash, every block voted for on its check (2-8
   ms after the body), 189 tx/s sealed, no rejection.
+- loop132 A1 (the first bench leg with the fork at genesis) stalled at 3-6 blocks a window
+  with a 10 s cycle: a follower's vote on N now precedes N's import, so the Decide for N
+  arrives while N is still executing, and the validator's service dropped that commit as
+  "a block the execution layer has not imported" -- N never got its forkchoice, never became
+  canonical, and N+1's check waited the full parent timeout for a header the provider could
+  not see. Fixed: a commit for a block whose import is in flight goes to the driver, which
+  runs the forkchoice when the import lands. Blocks 1-81 (the base-fee decay, empty or small)
+  had passed because their imports finished before the Decide; the smoke run passed for the
+  same reason.
 - Cycle: the follower's serial chain per block becomes the includability pass plus the
   execution (the stateless half of the check overlaps the previous import), and the leader
   gets the QC while the followers execute; the idle gap between a follower's import and the

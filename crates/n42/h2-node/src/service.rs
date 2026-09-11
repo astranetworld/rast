@@ -1477,8 +1477,13 @@ impl<E: ExecutionLayer> H2Service<E> {
 
         // The execution driver sees every output and decides for itself which
         // ones concern it, so this does not have to duplicate that judgement.
+        // A block whose import is in flight (deferred execution: voted for
+        // on its check, still executing) is the driver's to commit once the
+        // import lands; only a block the execution layer has not seen at all
+        // is skipped.
         if let EngineOutput::BlockCommitted { view, block_hash, .. } = &output
             && !self.imported.contains(block_hash)
+            && !self.driver.is_importing(block_hash)
         {
             // The engine commits what the fleet certifies, imported here or
             // not; the execution layer follows only what it has. The pull

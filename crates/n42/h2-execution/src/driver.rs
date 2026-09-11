@@ -744,6 +744,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.deferred_execution_time = at;
     }
 
+    /// Whether `block_hash`'s import is in flight: a commit for it is not
+    /// dropped as "not imported" but deferred to the import's success.
+    pub fn is_importing(&self, block_hash: &B256) -> bool {
+        self.executing.contains(block_hash)
+    }
+
     /// Whether a block stamped `timestamp` is under deferred execution.
     fn deferred_at(&self, timestamp: u64) -> bool {
         self.deferred_execution_time.is_some_and(|at| timestamp >= at)
