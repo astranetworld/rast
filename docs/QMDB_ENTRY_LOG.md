@@ -128,11 +128,13 @@ faults per window on a D-A-D-A round, then by windows 2-3.
   re-established every 64 MB (minor faults on cached pages).
 - The mapping is chunked (`bad780f40`): sealed 256 MB chunks mapped once with populated page
   tables; loop124 measures it.
-- Step 3a done (delta v2 + slot-only undo): the retired slots are read by nothing on the block
-  path any more; loop125 measures it. Step 3b (the checkpoint as bits + roots, the file as the
-  persistence with `sync` before the delta) and step 4 (restart from the file) are next; until
-  then the file is recreated from the checkpoint at every start and the checkpoint still
-  carries every entry.
+- Step 3a done (delta v2 + slot-only undo, `492a2ab29`): the retired slots are read by nothing
+  on the block path any more; loop125 measures it.
+- Steps 3b and 4 done (the file as the persistence): `forest.ckpt` = cursor + active bits, the
+  delta's appended range by its bounds, `sync` before the delta, restart by hashing the file's
+  records and rebuilding twigs and index from the bits, a torn tail dropped, the version-1
+  checkpoint migrated once, the portable export from the file. loop126 measures it. Step 5
+  (long-dead twigs keep only their root) is next.
 
 ## 8. Implementation order
 
