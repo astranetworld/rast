@@ -142,3 +142,69 @@ seven-machine measurement, or one with a supply that does not share the fleet's 
 4. Whether gov5's `VerifyHeader` can cheaply produce the includability check (nonce and
    balance from the parent post-state for 163,000 senders) -- this node does it from the
    parallel sender groups it already builds.
+
+## 8. The gov5 side's reading (2026-09-11, via the gov5 session)
+
+Agreed in principle; their answers to section 7, and what they add:
+
+1. **Header layout: reuse the fields, 7862 style, no new fields.** A hashed header field on
+   their side lands in three codecs (RLP hash, proto/trailer, the compact storage codec) plus
+   the mobile SDK, DATC and the proof tools; reuse has zero wire surface and keeps header
+   hashes and every codec byte-compatible across clients. The cost is semantic and local: an
+   `executed_root_of(N) = header(N+1).state_root` helper for state-as-of proofs, `eth_getProof`
+   and the snapshot tool; the places that assume `header.Root` is the state after N (their
+   Finalize root comparison at import, the miner's tree reload check, the QMDB applied marker,
+   hotstuff-reset tooling) get the fork check. All fork-gated, all local.
+2. **Activation: a timestamp fork, `deferredExecutionTime` in the genesis config** -- every
+   gov5 gate is `header.Time` (MobileAnchorTime, PQPrecompilesTime, AIInferenceTime).
+   **Fork invariant:** the first deferred header F carries the state after F-1 under the old
+   rule, which is exactly `header(F-1).Root`, so `header(F).Root == header(F-1).Root` is the
+   assert at the switch.
+3. **Sync and the tip: acceptable.** Their range importer's per-block root check becomes
+   "`header(N).Root` equals the executed root of N-1 I stored"; the tip's executed root sits
+   unverified for one buffered header. The mobile anchor is unaffected (MobileRegistryRoot is a
+   separate accumulator). One semantic shift to write down: a state divergence stops being
+   "reject block N" and becomes "refuse to vote on N+1" -- N's transactions are committed, and
+   the majority's execution result reaches consensus through N+1's QC. Their BAD BLOCK
+   watchdog, own-unverified sibling mark and qs-hsreset assume root-at-N and need a pass;
+   none is a blocker.
+4. **Includability in VerifyHeader: cheap.** Sender recovery already precedes execution
+   (pool sender hints + a 16M-slot sender cache: ~100 ms hinted for 163k, ~460 ms cold);
+   nonce/balance from the parent post-state through their Block-STM workers' QMDB reads
+   (~23k accounts across 16 goroutines in 4 ms; the worst case of 163k distinct senders
+   ~30-40 ms). The pass: group by sender, nonces contiguous from the parent's, sum(value +
+   gasLimit*feeCap) <= parent balance, intrinsic gas <= gasLimit, block gas sum <= limit --
+   one read per sender. **The hard requirement it places on the follower: the parent
+   post-state must be its own executed state of N-1, so a follower votes on N only after
+   importing N-1 -- pipeline depth 1**, which is what makes the cycle max(build, import)
+   rather than a deeper pipeline.
+
+Their own numbers: the chained cycle is 1.5-1.9 s at 163k (follower import 0.8-1.1 s, seal to
+QC ~1.4 s, leader build ~0.6 s), so max(build 0.6, import 1.0) instead of the sum would take it
+from ~1.75 to ~1.1 s -- worth more than any single lever left on their list. gov5 already has a
+chainspec gate `hotstuff.twoPhaseVoteGate` (R1 static vote, R2 commit vote held until import)
+whose R1-only behaviour is the equivalent of this bench's `N42_VOTE_BEFORE_IMPORT=1`, so their
+cycle floor can be measured before the rule change too. They offered to prototype the gov5 side
+behind `deferredExecutionTime` on their worktree after their current round queue.
+
+## 9. Agreed names and the split
+
+- Genesis: `config.deferredExecutionTime` (u64 seconds; absent = never).
+- Helper, both clients: `executed_root_of(n)` = the state root after block n = `header(n+1).state_root`
+  once `header(n+1).timestamp >= deferredExecutionTime`, else `header(n).state_root`; likewise
+  `executed_receipts_root_of`, `executed_logs_bloom_of`, `executed_gas_used_of`.
+- The switch: for a header H with `H.timestamp >= deferredExecutionTime`, H's execution fields
+  are the parent's executed values; the first such header F asserts `F.state_root ==
+  parent.state_root` (the invariant of section 8.2). Headers before the fork are unchanged.
+- The vote (both clients): a proposal for H is voted for once the follower has imported the
+  parent, H's execution fields equal the follower's own result for the parent, and H's
+  transactions pass the includability check against that post-state. Pipeline depth 1.
+- Rust side: the chainspec field, `HotStuffConsensus` header validation, the builder's
+  header assembly (the block's fields from the parent's `BuiltExecution`), the follower's
+  direct import (compare against the stored result of the parent, then execute for the next
+  header), the mobile receipt/proof binding (`mobile-verify`: state after N under N+1),
+  `n42-init-snapshot` pairing, the RPC presentation. gov5 side: the mirror list of section 8.1,
+  behind the same gate.
+- A cross-client vector: a short chain across the fork (F-2 .. F+3) with every header's
+  fields and roots, checked byte-for-byte by both clients' test suites.
+
