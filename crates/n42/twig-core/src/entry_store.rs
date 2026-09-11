@@ -63,8 +63,13 @@ pub(crate) struct FileEntries {
     chunks: Vec<Chunk>,
     /// Bytes of the file the sealed chunks cover.
     sealed_len: u64,
-    /// The file's content from `sealed_len` on.
+    /// The file's content from `sealed_len` on. Its first `written` bytes
+    /// are on disk; the rest are written in one call by `flush`, so an
+    /// append is a memory copy and not a write syscall (147,000 of those a
+    /// block were the file store's root phase, loop125).
     tail: Vec<u8>,
+    /// How many bytes of `tail` the file already holds.
+    written: usize,
     /// Bytes of the file that belong to slots.
     len_bytes: u64,
     /// Where each slot's record starts.
@@ -97,6 +102,7 @@ impl FileEntries {
             chunks: Vec::new(),
             sealed_len: 0,
             tail: Vec::new(),
+            written: 0,
             len_bytes: 0,
             offsets: Vec::new(),
             active: Vec::new(),
@@ -142,6 +148,7 @@ impl FileEntries {
             chunks: Vec::new(),
             sealed_len: 0,
             tail: Vec::new(),
+            written: 0,
             len_bytes,
             offsets,
             active: vec![0u64; (kept as usize).div_ceil(64)],
@@ -235,25 +242,33 @@ impl FileEntries {
         }
     }
 
-    /// Appends a live entry as the next slot: written through to the file
-    /// and kept in the tail until the tail is sealed into a chunk.
+    /// Appends a live entry as the next slot: into the tail, which reaches
+    /// the file at the next `flush` (a sync, a sealed chunk, a truncation).
     pub(crate) fn push(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
         let slot = self.offsets.len();
-        let mut record = Vec::with_capacity(KEY_LEN + LEN_LEN + value.len());
-        record.extend_from_slice(key);
-        record.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        record.extend_from_slice(value);
-        self.file.seek(io::SeekFrom::Start(self.len_bytes))?;
-        self.file.write_all(&record)?;
+        let record_len = KEY_LEN + LEN_LEN + value.len();
+        self.tail.reserve(record_len);
+        self.tail.extend_from_slice(key);
+        self.tail.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.tail.extend_from_slice(value);
         self.offsets.push(self.len_bytes);
         if self.active.len() * 64 <= slot {
             self.active.push(0);
         }
         self.set_active(slot, true);
-        self.len_bytes += record.len() as u64;
-        self.tail.extend_from_slice(&record);
+        self.len_bytes += record_len as u64;
         if self.tail.len() >= CHUNK_BYTES {
             self.seal_tail()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the tail's unwritten bytes to the file, in one call.
+    fn flush(&mut self) -> io::Result<()> {
+        if self.written < self.tail.len() {
+            self.file.seek(io::SeekFrom::Start(self.sealed_len + self.written as u64))?;
+            self.file.write_all(&self.tail[self.written..])?;
+            self.written = self.tail.len();
         }
         Ok(())
     }
@@ -263,7 +278,7 @@ impl FileEntries {
         if self.tail.is_empty() {
             return Ok(());
         }
-        self.file.flush()?;
+        self.flush()?;
         // SAFETY: the mapping is read-only over bytes that `push` wrote
         // before this call and that nothing rewrites: the file is only ever
         // shortened, and a shortening below a chunk's start unmaps the chunk
@@ -278,12 +293,14 @@ impl FileEntries {
         self.chunks.push(Chunk { start: self.sealed_len, map });
         self.sealed_len = self.len_bytes;
         self.tail.clear();
+        self.written = 0;
         self.tail.shrink_to(CHUNK_BYTES);
         Ok(())
     }
 
-    /// Makes every appended record durable.
+    /// Writes what the tail still holds and makes every record durable.
     pub(crate) fn sync(&mut self) -> io::Result<()> {
+        self.flush()?;
         self.file.sync_data()
     }
 
@@ -301,6 +318,7 @@ impl FileEntries {
         self.len_bytes = new_len_bytes;
         if new_len_bytes >= self.sealed_len {
             self.tail.truncate((new_len_bytes - self.sealed_len) as usize);
+            self.written = self.written.min(self.tail.len());
         } else {
             // The cut lands inside a sealed chunk: that chunk and every later
             // one go, and the chunk's bytes below the cut become the tail
@@ -313,6 +331,8 @@ impl FileEntries {
             self.chunks.truncate(keep - 1);
             self.sealed_len = start;
             std::mem::swap(&mut self.tail, &mut bytes);
+            // The chunk's bytes are on disk already.
+            self.written = self.tail.len();
         }
         self.file.set_len(new_len_bytes)?;
         Ok(())
@@ -344,6 +364,7 @@ impl FileEntries {
             chunks,
             sealed_len: self.sealed_len,
             tail: self.tail.clone(),
+            written: self.written,
             len_bytes: self.len_bytes,
             offsets: self.offsets.clone(),
             active: self.active.clone(),
