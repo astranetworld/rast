@@ -185,6 +185,18 @@ pub struct ExecutionDriver<E> {
     own_imports: tokio::sync::mpsc::UnboundedSender<B256>,
     /// The receiving end, until the loop takes it.
     own_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
+    /// **Bench only** (`N42_VOTE_BEFORE_IMPORT=1`): a follower's import runs
+    /// on a task instead of being awaited by the loop, so the loop can vote
+    /// on the next proposal while the block executes -- what deferred
+    /// execution would give the cycle. Imports still run one at a time, in
+    /// order; the rest queue.
+    spawn_imports: bool,
+    /// Where a spawned import reports its verdict.
+    foreign_imports: tokio::sync::mpsc::UnboundedSender<(B256, Result<(), String>)>,
+    /// The receiving end, until the loop takes it.
+    foreign_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(B256, Result<(), String>)>>,
+    /// Blocks waiting for the import in flight to finish (spawned mode).
+    import_queue: std::collections::VecDeque<B256>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
@@ -214,12 +226,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Builds a driver whose head and finalised block are `genesis`.
     pub fn new(el: E, genesis: B256) -> Self {
         let (own_imports_tx, own_imports_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (foreign_tx, foreign_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             el: std::sync::Arc::new(el),
             normalizer: None,
             prepared: None,
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
+            spawn_imports: false,
+            foreign_imports: foreign_tx,
+            foreign_imports_rx: Some(foreign_rx),
+            import_queue: std::collections::VecDeque::new(),
             payloads: HashMap::new(),
             head: genesis,
             finalized: genesis,
@@ -687,6 +704,78 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.own_imports_rx.take()
     }
 
+    /// The channel a spawned follower import reports on, once.
+    pub fn take_foreign_imports(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<(B256, Result<(), String>)>> {
+        self.foreign_imports_rx.take()
+    }
+
+    /// **Bench only**: run follower imports on a task (see the field).
+    pub fn set_spawn_imports(&mut self, on: bool) {
+        self.spawn_imports = on;
+    }
+
+    /// Starts `block_hash`'s import on a task, or queues it behind the one in
+    /// flight. The verdict arrives on the channel and goes through
+    /// [`Self::finish_execute`].
+    fn spawn_execute(&mut self, block_hash: B256) -> DriverAction {
+        if self.executing.is_some() {
+            if !self.import_queue.contains(&block_hash) {
+                self.import_queue.push_back(block_hash);
+            }
+            return DriverAction::Ignored;
+        }
+        let Some(payload) = self.payloads.get(&block_hash).cloned() else {
+            return DriverAction::PayloadMissing { block_hash };
+        };
+        self.executing = Some(block_hash);
+        let el = std::sync::Arc::clone(&self.el);
+        let report = self.foreign_imports.clone();
+        let txs = payload.payload.as_v1().transactions.len();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let outcome = el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload).await;
+            if txs >= 10_000 {
+                info!(target: "n42.h2.el", block = ?block_hash, txs, import_ms = started.elapsed().as_millis() as u64, "imported a block");
+            }
+            let verdict = match outcome {
+                Ok(status) => match status.status {
+                    PayloadStatusEnum::Valid => Ok(()),
+                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Err("not executed (syncing)".to_string()),
+                    PayloadStatusEnum::Invalid { validation_error } => Err(validation_error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = report.send((block_hash, verdict));
+        });
+        DriverAction::Ignored
+    }
+
+    /// A spawned import's verdict: the head moves, a commit that waited runs
+    /// its forkchoice, the next queued import starts, and the loop gets the
+    /// same action an awaited import would have returned.
+    pub async fn finish_execute(&mut self, block_hash: B256, verdict: Result<(), String>) -> DriverAction {
+        if self.executing == Some(block_hash) {
+            self.executing = None;
+        }
+        let action = match verdict {
+            Ok(()) => {
+                self.head = block_hash;
+                if self.pending_commit == Some(block_hash) {
+                    self.pending_commit = None;
+                    let _ = self.commit(block_hash).await;
+                }
+                DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
+            }
+            Err(reason) => DriverAction::Rejected { block_hash, reason },
+        };
+        if let Some(next) = self.import_queue.pop_front() {
+            let _ = self.spawn_execute(next);
+        }
+        action
+    }
+
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
         let started = std::time::Instant::now();
         let status = self
@@ -769,6 +858,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Follower path: executes a proposed block and, on acceptance, produces the
     /// event that releases the import-gated vote.
     async fn execute(&mut self, block_hash: B256) -> DriverAction {
+        if self.spawn_imports {
+            return self.spawn_execute(block_hash);
+        }
         let Some(payload) = self.payloads.get(&block_hash).cloned() else {
             return DriverAction::PayloadMissing { block_hash };
         };

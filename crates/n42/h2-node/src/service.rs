@@ -179,6 +179,9 @@ pub struct H2Service<E> {
     /// Our own blocks as the execution layer takes them, from the driver's
     /// spawned import; each one is the parent of the next build ahead.
     own_imports: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
+    /// Verdicts of follower imports the driver ran on a task (bench only,
+    /// `N42_VOTE_BEFORE_IMPORT=1`).
+    foreign_imports: Option<tokio::sync::mpsc::UnboundedReceiver<(B256, Result<(), String>)>>,
     outputs: mpsc::Receiver<EngineOutput>,
     identity: H2V4ChainIdentity,
     /// The size the signer bitmaps on the wire are read against. A message
@@ -575,6 +578,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             transport,
             engine,
             own_imports: driver.take_own_imports(),
+            foreign_imports: driver.take_foreign_imports(),
             driver,
             outputs,
             identity,
@@ -889,8 +893,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         let outbound = self.outbound_transactions.as_mut();
         let body_rx = self.body_rx.as_mut();
         let own_imports = self.own_imports.as_mut();
+        let foreign_imports = self.foreign_imports.as_mut();
 
         tokio::select! {
+            verdict = async {
+                match foreign_imports {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // A follower import that ran on a task: the same action an
+                // awaited import returns, applied now.
+                if let Some((block_hash, verdict)) = verdict {
+                    let action = self.driver.finish_execute(block_hash, verdict).await;
+                    self.apply_driver_action(action, &mut events)?;
+                }
+            }
             body = async {
                 match body_rx {
                     Some(rx) => rx.recv().await,

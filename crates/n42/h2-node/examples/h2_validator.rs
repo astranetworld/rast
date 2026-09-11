@@ -421,7 +421,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => identity.genesis_hash,
         };
-        let driver = ExecutionDriver::new(el, start_head);
+        let mut driver = ExecutionDriver::new(el, start_head);
+        // Bench only (see the engine flag below): with the vote sent before
+        // the import, the import must not hold the loop either.
+        if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {
+            driver.set_spawn_imports(true);
+        }
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
         if let Some(store) = store {
