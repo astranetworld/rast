@@ -235,6 +235,13 @@ deferred_execution_active_at}`):
   carries block N-1's root and gas, the registry holds each block's own result, and a restart
   restores the head's own root while its header carries its parent's.
 
+- Cross-client vector: `crates/n42/n42-testing/testdata/deferred_execution_vectors.json`,
+  written by that test with the fork two blocks in (F = 3, blocks 1..6 = F-2..F+3, transfers
+  in blocks 2, 3 and 5): the genesis (header, alloc, hash), and per block its transactions
+  (raw 2718), the full header as carried and the `executed` fields its own execution
+  produced. Keys and timestamps are fixed, so the document is reproducible; the test
+  compares every run with it (`N42_WRITE_VECTORS=1` rewrites it).
+
 Stage 2 is the vote: a follower votes on N once the parent is imported, N's fields match the
 parent's result and N's transactions pass the includability check, then executes N off the
 loop (the machinery of `N42_VOTE_BEFORE_IMPORT=1`, now under the gate and safe).

@@ -197,6 +197,25 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
     consensus: &CapturingConsensusBuilder,
 ) -> eyre::Result<()>
     where
+    <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes:
+        From<reth::rpc::types::engine::PayloadAttributes>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives: NodePrimitives<Block = n42_tx_types::Block>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
+{
+    new_block_at(node, eth_signer_key, vote, consensus, None).await
+}
+
+/// `new_block` with the block's timestamp chosen by the caller (the wall clock
+/// when `None`): a fixed timestamp makes a chain reproducible, which a
+/// cross-client fixture needs.
+async fn new_block_at<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
+    node: &FullNode<Node, AddOns>,
+    eth_signer_key: String,
+    vote: Option<(Address, bool)>,
+    consensus: &CapturingConsensusBuilder,
+    timestamp: Option<u64>,
+) -> eyre::Result<()>
+    where
     // replaces the old PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>
     // bound; upstream removed that associated type
     <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes:
@@ -222,10 +241,12 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
             .header()
             .hash_slow()
     );
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = timestamp.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    });
     let eth_signer =
         PrivateKeySigner::from_bytes(&FixedBytes::from_str(&eth_signer_key).unwrap()).unwrap();
     let eth_signer_address = eth_signer.address();
@@ -1490,13 +1511,27 @@ async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::
     Ok(())
 }
 
+/// Deferred execution (docs/PHASE_D_DEFERRED_EXECUTION.md) on a QMDB dev
+/// chain with the fork two blocks in: before it a header carries its own
+/// execution, from the first gated header on it carries its parent's, and that
+/// first header repeats its parent's fields. The chain is reproducible (fixed
+/// keys and timestamps) and is the cross-client vector
+/// `testdata/deferred_execution_vectors.json`, F-2..F+3: `N42_WRITE_VECTORS=1`
+/// rewrites it, otherwise the run is compared with it.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_deferred_execution__headers_carry_the_parents_execution_across_the_fork() -> eyre::Result<()> {
-    use n42_qmdb_reth::{with_declared_state_scheme, QmdbNodeState};
+    use alloy_eips::eip2718::Encodable2718;
+    use n42_qmdb_reth::{executed_fields::ExecutedFields, with_declared_state_scheme, QmdbNodeState};
+    use reth_provider::BlockReader;
 
     reth_tracing::init_test_tracing();
     let runtime = Runtime::test();
     let mut accounts = TesterAccountPool::new();
+    // A fixed signer: the fees go to the block's beneficiary, so the roots
+    // depend on its address.
+    accounts
+        .accounts
+        .insert("A".to_string(), secp256k1::SecretKey::from_slice(&[0x11u8; 32])?);
     let base = CliqueTest {
         signers: vec!["A".to_string()],
         ..Default::default()
@@ -1504,8 +1539,8 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
     let mut chainspec = base.gen_chainspec(&mut accounts);
     let mpt_genesis_root = chainspec.genesis_header.state_root;
 
-    // A funded sender, so one block can carry a transaction and actually move
-    // the root. Empty blocks leave a QMDB root where it was, which would let a
+    // A funded sender, so blocks can carry transactions and actually move the
+    // root. Empty blocks leave a QMDB root where it was, which would let a
     // builder that never appended anything pass every assertion below.
     let sender = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42))?;
     chainspec.genesis.alloc.insert(
@@ -1516,25 +1551,30 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
         },
     );
 
+    // Block n is stamped T0 + n, in the past so nothing rejects it as future;
+    // the fork is at block FORK's timestamp: F-2..F+3 is blocks 1..6.
+    const T0: u64 = 1_750_000_000;
+    const FORK: u64 = 3;
+    const LAST: u64 = FORK + 3;
+    let fork_time = T0 + FORK;
+
     // Declare the scheme the way gov5 does, in the genesis config.
     chainspec
         .genesis
         .config
         .extra_fields
         .insert_value("stateScheme".to_string(), "qmdb")?;
-    // Deferred execution from the genesis on (docs/PHASE_D_DEFERRED_EXECUTION.md):
-    // every header past this time carries its parent's execution, and the
-    // first one repeats the genesis header's fields.
     chainspec
         .genesis
         .config
         .extra_fields
-        .insert_value("deferredExecutionTime".to_string(), chainspec.genesis.timestamp)?;
+        .insert_value("deferredExecutionTime".to_string(), fork_time)?;
     let chainspec = with_declared_state_scheme(chainspec)?;
     assert_ne!(
         chainspec.genesis_header.state_root, mpt_genesis_root,
         "a QMDB genesis has a different root than the same alloc on MPT",
     );
+    assert_eq!(reth_chainspec::qmdb::deferred_execution_time(&chainspec.genesis), Some(fork_time));
     let chainspec = Arc::new(chainspec);
 
     let dir = std::env::temp_dir().join(format!("n42-deferred-e2e-{}", std::process::id()));
@@ -1580,14 +1620,25 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
     qmdb.initialize((0, genesis_hash))?;
     assert_eq!(qmdb.root_of(&genesis_hash), Some(chainspec.genesis_header.state_root));
 
+    let fields_of = |h: &alloy_consensus::Header| ExecutedFields {
+        state_root: h.state_root,
+        receipts_root: h.receipts_root,
+        logs_bloom: h.logs_bloom,
+        gas_used: h.gas_used,
+    };
     let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let mut nonce = 0u64;
     let mut previous_root = chainspec.genesis_header.state_root;
-    for expected in 1..=3u64 {
-        // Block 2 carries a transfer; the others are empty.
-        if expected == 2 {
+    // What the parent's execution produced: the genesis header's own fields.
+    let mut parent_own = fields_of(&chainspec.genesis_header);
+    let mut blocks = Vec::new();
+    for expected in 1..=LAST {
+        // Transfers before the fork, at it and after it; empty blocks between.
+        let carries = matches!(expected, 2 | 3 | 5);
+        if carries {
             let tx = alloy_consensus::TxEip1559 {
                 chain_id: chainspec.chain().id(),
-                nonce: 0,
+                nonce,
                 gas_limit: 21_000,
                 max_fee_per_gas: 10_000_000_000,
                 max_priority_fee_per_gas: 1_000_000_000,
@@ -1595,6 +1646,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
                 value: U256::from(1_000u64),
                 ..Default::default()
             };
+            nonce += 1;
             let signature = alloy_signer::SignerSync::sign_hash_sync(
                 &sender,
                 &alloy_consensus::SignableTransaction::signature_hash(&tx),
@@ -1603,7 +1655,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
                 tx.into(),
                 signature,
             ));
-            let encoded_len = alloy_eips::eip2718::Encodable2718::encode_2718_len(&signed);
+            let encoded_len = signed.encode_2718_len();
             let recovered =
                 reth_primitives_traits::Recovered::new_unchecked(signed, sender.address());
             let pooled = n42_engine_types::N42PooledTransaction::new(recovered, encoded_len);
@@ -1615,41 +1667,56 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
             .await?;
         }
 
-        new_block(&node, key.clone(), None, &capturing_consensus).await?;
+        new_block_at(&node, key.clone(), None, &capturing_consensus, Some(T0 + expected)).await?;
         let header = node.provider.latest_header()?.expect("a head");
         assert_eq!(
             header.number, expected,
             "block {expected} was not accepted by the engine — its QMDB root did not validate",
         );
+        assert_eq!(header.timestamp, T0 + expected);
+        let deferred = expected >= FORK;
         let own_root = qmdb
             .root_of(&header.hash())
             .expect("validating the block filed its tree");
-        let parent = reth_provider::HeaderProvider::sealed_header(&node.provider, expected - 1)?.expect("the parent");
-        // The header carries the parent's execution: its root is the parent's
-        // forest root (the genesis root for block 1, the invariant at the
-        // switch), never its own, and the block's own root is what the next
-        // header will carry.
-        let parent_root = qmdb.root_of(&parent.hash()).expect("the parent's tree");
-        assert_eq!(header.state_root, parent_root, "block {expected}'s header carries its parent's root");
-        if expected == 1 {
-            assert_eq!(header.state_root, chainspec.genesis_header.state_root, "block 1 repeats the genesis root");
-            assert_eq!(header.receipts_root, chainspec.genesis_header.receipts_root);
-            assert_eq!(header.gas_used, 0);
-        }
-        let fields = n42_engine_types::executed_fields::get(&header.hash())
+        let own = n42_engine_types::executed_fields::get(&header.hash())
             .expect("the block's own execution is remembered under its hash");
-        assert_eq!(fields.state_root, own_root, "the remembered root is the forest's");
-        if expected == 2 {
-            assert!(fields.gas_used > 0, "block 2 must have included the transfer");
-            assert_eq!(header.gas_used, 0, "block 2's header carries block 1's (empty) gas");
+        assert_eq!(own.state_root, own_root, "the remembered root is the forest's");
+        if carries {
+            assert!(own.gas_used > 0, "block {expected} must have included the transfer");
             assert_ne!(own_root, previous_root, "a block that writes state must move the QMDB root");
-        } else if expected == 3 {
-            assert!(header.gas_used > 0, "block 3's header carries block 2's gas");
-            assert_eq!(own_root, previous_root, "an empty block leaves the root alone");
         } else {
+            assert_eq!(own.gas_used, 0);
             assert_eq!(own_root, previous_root, "an empty block leaves the root alone");
         }
+        let carried = fields_of(header.header());
+        if deferred {
+            // The header carries the parent's execution: the first gated header
+            // repeats its parent's (own) fields, the invariant at the switch.
+            assert_eq!(carried, parent_own, "block {expected}'s header carries its parent's execution");
+        } else {
+            assert_eq!(carried, own, "block {expected}'s header carries its own execution");
+        }
+        let block = node.provider.block_by_number(expected)?.expect("the block");
+        blocks.push(serde_json::json!({
+            "number": expected,
+            "hash": header.hash(),
+            "deferred": deferred,
+            "transactions": block
+                .body
+                .transactions
+                .iter()
+                .map(|tx| alloy_primitives::Bytes::from(tx.encoded_2718()))
+                .collect::<Vec<_>>(),
+            "header": header.header(),
+            "executed": {
+                "stateRoot": own.state_root,
+                "receiptsRoot": own.receipts_root,
+                "logsBloom": own.logs_bloom,
+                "gasUsed": alloy_primitives::U64::from(own.gas_used),
+            },
+        }));
         previous_root = own_root;
+        parent_own = own;
         qmdb.on_canonical(header.hash())?;
     }
 
@@ -1659,8 +1726,53 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
     let restarted = QmdbNodeState::new(chainspec.clone(), &dir);
     restarted.initialize((head.number, head.hash()))?;
     assert_eq!(restarted.root_of(&head.hash()), Some(previous_root), "the forest restores the head's own root");
-    // The head's header carries block 2's root, which block 3 (empty) left
-    // alone: the two are equal by value here, and distinct by meaning.
+    assert_eq!(
+        serde_json::json!(head.state_root),
+        blocks[blocks.len() - 2]["executed"]["stateRoot"],
+        "and its header carries its parent's"
+    );
+
+    // The cross-client vector.
+    let vectors = serde_json::json!({
+        "description": "Deferred execution across the fork (docs/PHASE_D_DEFERRED_EXECUTION.md): \
+            from the first header whose timestamp is at or past deferredExecutionTime, \
+            stateRoot / receiptsRoot / logsBloom / gasUsed are the parent's after execution \
+            (`executed` is what the block's own execution produced, and is what its child's \
+            header carries); before it a header carries its own. Plain EIP-1559 transfers, \
+            the priority fee to `feeRecipient` (the APoS signer; the header's miner field is zero), \
+            no withdrawals, no block reward. \
+            Generated by n42-testing test_deferred_execution__headers_carry_the_parents_execution_across_the_fork.",
+        "chainId": chainspec.chain().id(),
+        "stateScheme": "qmdb",
+        "deferredExecutionTime": fork_time,
+        "forkBlock": FORK,
+        "signerPrivateKey": B256::from([0x11u8; 32]),
+        // APoS: the header's miner field is zero and the fees go to the
+        // signer recovered from the seal.
+        "signerAddress": accounts.address("A"),
+        "feeRecipient": accounts.address("A"),
+        "senderPrivateKey": B256::repeat_byte(0x42),
+        "genesis": {
+            "hash": genesis_hash,
+            "header": &chainspec.genesis_header.header(),
+            "alloc": &chainspec.genesis.alloc,
+        },
+        "blocks": blocks,
+    });
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/deferred_execution_vectors.json");
+    let rendered = serde_json::to_string_pretty(&vectors)? + "\n";
+    if std::env::var_os("N42_WRITE_VECTORS").is_some() {
+        std::fs::create_dir_all(path.parent().expect("a parent"))?;
+        std::fs::write(&path, &rendered)?;
+        println!("wrote {}", path.display());
+    } else if let Ok(stored) = std::fs::read_to_string(&path) {
+        let stored: serde_json::Value = serde_json::from_str(&stored)?;
+        assert_eq!(
+            vectors, stored,
+            "the chain no longer matches {} (N42_WRITE_VECTORS=1 rewrites it)",
+            path.display()
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
