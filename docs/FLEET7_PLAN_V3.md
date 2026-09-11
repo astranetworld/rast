@@ -331,7 +331,10 @@ import (`N42_VOTE_BEFORE_IMPORT=1`, the import on a task) the followers' votes c
 coupling is the whole difference -- but on one box the ingest, sharing its cores with seven
 followers executing off the loop, supplies only 130-150k transactions a second and the blocks
 empty; more recovery slots and flood connections do not change it. The TPS deferred execution
-is worth at full blocks is a measurement for a fleet whose ingest has cores of its own.*
+is worth at full blocks is a measurement for a fleet whose ingest has cores of its own. The
+gov5 side agreed (reuse the fields 7862-style, a timestamp fork, pipeline depth 1) and the Rust
+side's stage 1 -- the header semantics behind `config.deferredExecutionTime`, with the
+executed-fields registry and the dev-chain fork test -- is in; stage 2 is the vote flow.*
 
 Everything above keeps "a follower executes the block before it votes". The
 fixed ~100 ms and the execute-then-vote coupling are then the wall: at

@@ -86,7 +86,7 @@ where
         Primitives = EthPrimitives,
         BlockExecutorFactory = n42_engine_types::parallel_transfer::FastExecutorFactory,
     >,
-    ChainSpec: reth_chainspec::EthereumHardforks,
+    ChainSpec: reth_chainspec::EthereumHardforks + reth_chainspec::EthChainSpec,
 {
     let qmdb = qmdb.ok_or("no QMDB state: the direct import needs the chain's root")?;
     let started = std::time::Instant::now();
@@ -249,7 +249,19 @@ where
     // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_PARALLEL=1` puts
     // them on the worker pool together.
     let bundle = &output.state;
+    let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), recovered.timestamp);
     let root_job = || -> Result<B256, String> {
+        if deferred {
+            // The header carries the parent's root (checked against the
+            // parent's result by the consensus rules above); this block's
+            // own root is filed and remembered for its child's header.
+            let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle, prague);
+            let root = qmdb
+                .insert_block_operations(parent_hash, block_hash, number, ops)
+                .map_err(|err| format!("state root: {err}"))?;
+            n42_engine_types::executed_fields::remember_state_root(block_hash, root);
+            return Ok(root);
+        }
         if parallel_state_commit() {
             // The leaf operations keyed, encoded and sorted on the worker pool,
             // straight from the bundle (the change set and its serial

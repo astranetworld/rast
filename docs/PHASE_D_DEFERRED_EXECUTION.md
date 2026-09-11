@@ -87,11 +87,11 @@ the chain would have committed to a state it cannot produce. EIP-7862's answer, 
   post-state is defined. A transaction that reverts is not a failure of the block.
 - The block reward and the withdrawals (the flood's funding, the faucet) are applied in
   execution as now; they are part of the post-state the next header commits to.
-- Fee cap and base fee: the includability check uses the block's base fee, which the header
-  carries as now (it depends on the parent's `gasUsed`, which is the parent's own field; with
-  deferred execution the parent's `gasUsed` is in the *grandparent's* successor... to keep
-  `baseFee` computable at proposal time, the header keeps a `gasUsed` of N-1, which the
-  proposer knows because it executed N-1 -- the same value the followers check).
+- Base fee: unchanged, byte for byte. EIP-1559 derives `baseFeePerGas(N)` from the parent
+  header's `gasUsed` and `gasLimit` fields *as the parent header carries them*; under the rule
+  the parent's `gasUsed` field is the grandparent's executed gas, so the fee responds one block
+  later than today and every existing base-fee check stays valid without a fork branch. The
+  includability check reads the block's own `baseFeePerGas`, which the header carries as now.
 
 The one thing deferred execution costs is that a transaction's *effects* are final one
 block later than its inclusion: a wallet that waits for a commit today waits for the next
@@ -207,4 +207,35 @@ behind `deferredExecutionTime` on their worktree after their current round queue
   behind the same gate.
 - A cross-client vector: a short chain across the fork (F-2 .. F+3) with every header's
   fields and roots, checked byte-for-byte by both clients' test suites.
+
+## 10. Rust side, stage 1 (2026-09-11): the header semantics are in
+
+Behind `config.deferredExecutionTime` (`reth_chainspec::qmdb::{deferred_execution_time,
+deferred_execution_active_at}`):
+
+- `n42_qmdb_reth::executed_fields`: a registry of what each block's execution produced
+  (`ExecutedFields { state_root, receipts_root, logs_bloom, gas_used }` by block hash), fed
+  by every path that executes a block -- the builder under the sealed hash, the follower's
+  direct import, the engine's QMDB state-root job -- and seeded at startup from the persisted
+  head (its header before the fork; the forest's root and the database's receipts after it).
+- The builder (`default_n42_payload`): a header at or past the gate takes the parent's fields
+  (`parent_executed_fields`: the parent's own header before the fork or for genesis, the
+  registry otherwise; an unknown parent is a build error, never a guess) and records its own.
+- `HotStuffConsensus::validate_header_against_parent`: at or past the gate the four fields
+  must equal the parent's result (`DeferredExecutionError::{ParentUnknown, Mismatch}`);
+  `validate_block_post_execution` records the block's receipt side instead of comparing it
+  with its own header. The first header past the fork repeats its parent's fields by the same
+  rule (section 8.2's invariant), with no special case.
+- The follower's direct import and the engine's state-root job file the block's QMDB root and
+  record it (`QmdbNodeState::insert_block_operations`); the engine job hands reth the header's
+  root as the outcome, since reth compares the outcome with the header.
+- Base fee: unchanged (section 4).
+- Test: `n42-testing` `test_deferred_execution__headers_carry_the_parents_execution_across_the_fork`
+  runs a QMDB dev chain with the fork at genesis: block 1 repeats the genesis fields, block N
+  carries block N-1's root and gas, the registry holds each block's own result, and a restart
+  restores the head's own root while its header carries its parent's.
+
+Stage 2 is the vote: a follower votes on N once the parent is imported, N's fields match the
+parent's result and N's transactions pass the includability check, then executes N off the
+loop (the machinery of `N42_VOTE_BEFORE_IMPORT=1`, now under the gate and safe).
 

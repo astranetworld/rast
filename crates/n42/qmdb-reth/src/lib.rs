@@ -21,6 +21,7 @@
 //! The payload builder side lives with the builder itself, in
 //! `n42-engine-types`, since that builder is this repo's code.
 
+pub mod executed_fields;
 pub mod chainspec;
 pub mod changes;
 pub mod hotstuff;

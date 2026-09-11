@@ -65,6 +65,27 @@ pub fn alt_sig_tx_enabled(genesis: &Genesis) -> bool {
         .unwrap_or(false)
 }
 
+/// Genesis `config` key: the timestamp from which headers carry the
+/// execution of their *parent* -- deferred execution
+/// (`docs/PHASE_D_DEFERRED_EXECUTION.md`). Absent means never.
+pub const DEFERRED_EXECUTION_TIME_KEY: &str = "deferredExecutionTime";
+
+/// The deferred-execution fork time, if the genesis declares one.
+pub fn deferred_execution_time(genesis: &Genesis) -> Option<u64> {
+    genesis
+        .config
+        .extra_fields
+        .get_deserialized::<u64>(DEFERRED_EXECUTION_TIME_KEY)
+        .and_then(Result::ok)
+}
+
+/// Whether a header with `timestamp` carries its parent's execution: its
+/// `stateRoot`, `receiptsRoot`, `logsBloom` and `gasUsed` are those of the
+/// parent after execution, and the block's own are in its child's header.
+pub fn deferred_execution_active_at(genesis: &Genesis, timestamp: u64) -> bool {
+    deferred_execution_time(genesis).is_some_and(|at| timestamp >= at)
+}
+
 /// The QMDB root of a genesis allocation.
 pub fn qmdb_genesis_root(genesis: &Genesis) -> Result<B256, StateError> {
     // The hash the forest is filed under does not affect the root; the real

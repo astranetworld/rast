@@ -59,6 +59,9 @@ pub struct QmdbStateRootStrategy {
     /// Whether Prague is active at a timestamp: it decides whether the block
     /// wrote the system caller leaf. See `changes::with_prague_system_caller`.
     prague_at: PragueAt,
+    /// Whether deferred execution is active at a timestamp
+    /// (`deferredExecutionTime`): the header then carries the parent's root.
+    deferred_at: PragueAt,
 }
 
 /// Fork lookup captured from the chain spec, so the strategy needs no type
@@ -78,10 +81,12 @@ impl QmdbStateRootStrategy {
     pub fn new<C: EthereumHardforks + Send + Sync + 'static>(
         state: QmdbNodeState,
         chain_spec: Arc<C>,
+        deferred_execution_time: Option<u64>,
     ) -> Self {
         Self {
             state,
             prague_at: Arc::new(move |timestamp| chain_spec.is_prague_active_at_timestamp(timestamp)),
+            deferred_at: Arc::new(move |timestamp| deferred_execution_time.is_some_and(|at| timestamp >= at)),
         }
     }
 }
@@ -102,6 +107,7 @@ where
             Box::new(QmdbStateRootJob {
                 state: self.state.clone(),
                 prague_at: self.prague_at.clone(),
+                deferred_at: self.deferred_at.clone(),
             }),
             None,
         ))
@@ -111,6 +117,7 @@ where
 struct QmdbStateRootJob {
     state: QmdbNodeState,
     prague_at: PragueAt,
+    deferred_at: PragueAt,
 }
 
 impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
@@ -126,6 +133,24 @@ impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
     ) -> ProviderResult<StateRootJobOutcome> {
         let header = block.header();
         let changes = changes_from_execution(&output.state, (self.prague_at)(header.timestamp()));
+        if (self.deferred_at)(header.timestamp()) {
+            // Deferred execution: the header's root is the parent's, checked
+            // by the consensus rules; this block's own root is filed and
+            // remembered for its child. reth compares the outcome with the
+            // header, so the outcome is what the header carries.
+            let ops = crate::sorted_operations_from_execution(&output.state, (self.prague_at)(header.timestamp()));
+            let root = self
+                .state
+                .insert_block_operations(header.parent_hash(), block.hash(), header.number(), ops)
+                .map_err(ProviderError::other)?;
+            crate::executed_fields::remember_state_root(block.hash(), root);
+            debug!(
+                target: "n42.qmdb",
+                block = header.number(), hash = %block.hash(), %root,
+                "computed and filed the QMDB root of a block under deferred execution",
+            );
+            return Ok(StateRootJobOutcome::new(header.state_root(), Arc::new(TrieUpdates::default())));
+        }
         let root = self
             .state
             .validate_block(
@@ -206,7 +231,11 @@ where
             Some(state) => {
                 let strategy: Arc<
                     dyn StateRootStrategy<PrimitivesTy<Node::Types>, Node::Provider, Node::Evm>,
-                > = Arc::new(QmdbStateRootStrategy::new(state, ctx.config.chain.clone()));
+                > = Arc::new(QmdbStateRootStrategy::new(
+                    state,
+                    ctx.config.chain.clone(),
+                    reth_chainspec::qmdb::deferred_execution_time(reth_chainspec::EthChainSpec::genesis(&*ctx.config.chain)),
+                ));
                 validator.with_state_root_strategy(strategy)
             }
             None => validator,

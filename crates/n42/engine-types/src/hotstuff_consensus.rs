@@ -115,6 +115,37 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
 }
 
 /// gov5's receipts root and the logs bloom, from what execution produced.
+/// Why a header failed the deferred-execution check.
+#[derive(Debug, thiserror::Error)]
+pub enum DeferredExecutionError {
+    /// The parent's execution result is not known here: it was not executed
+    /// on this node and the chain holds no receipts for it yet.
+    #[error("deferred execution: the parent {0}'s execution result is not known here")]
+    ParentUnknown(B256),
+    /// The header's execution fields are not the parent's result.
+    #[error("deferred execution: header carries {got:?} for parent {parent}, this node executed {expected:?}")]
+    Mismatch {
+        /// The parent.
+        parent: B256,
+        /// What the header says.
+        got: Box<crate::executed_fields::ExecutedFields>,
+        /// What this node executed.
+        expected: Box<crate::executed_fields::ExecutedFields>,
+    },
+}
+
+/// The execution result a header past the fork must carry for `parent`:
+/// the parent's own header if the parent is before the fork (its header
+/// carries its own execution), the registry otherwise.
+pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedHeader) -> Option<crate::executed_fields::ExecutedFields> {
+    // The genesis header carries the genesis state by definition, whatever
+    // the fork time says; so does every header before the fork.
+    if parent.number == 0 || !reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp) {
+        return Some(crate::executed_fields::fields_from_child_header(parent.header()));
+    }
+    crate::executed_fields::get(&parent.hash())
+}
+
 pub fn gov5_receipt_root_bloom(receipts: &[Receipt]) -> ReceiptRootBloom {
     let root = gov5_receipts_root(receipts.iter().map(|receipt| ReceiptView {
         success: receipt.success,
@@ -200,6 +231,22 @@ where
         // relies on every producer deriving the rest the same way, which is
         // what checking them here guarantees for blocks this node accepts.
         self.ethereum.validate_header_against_parent(header, parent)?;
+        // Deferred execution: the header's execution fields are the parent's
+        // result, which this node executed (or, before the fork, which the
+        // parent's own header carries). The first header past the fork
+        // therefore repeats its parent's fields, the invariant at the switch.
+        if reth_chainspec::qmdb::deferred_execution_active_at(self.chain_spec.genesis(), header.timestamp) {
+            let expected = parent_executed_fields(self.chain_spec.genesis(), parent)
+                .ok_or_else(|| ConsensusError::Other(Arc::new(DeferredExecutionError::ParentUnknown(parent.hash()))))?;
+            let got = crate::executed_fields::fields_from_child_header(header);
+            if got != expected {
+                return Err(ConsensusError::Other(Arc::new(DeferredExecutionError::Mismatch {
+                    parent: parent.hash(),
+                    got: Box::new(got),
+                    expected: Box::new(expected),
+                })));
+            }
+        }
         // The committee-evidence link, exactly as gov5's `VerifyHeader`
         // checks it: the parent beacon root is the Blake3 of the parent's
         // evidence, zero when the parent is genesis.
@@ -351,6 +398,13 @@ where
     ) -> Result<(), ConsensusError> {
         let _ = block_access_list_hash;
         let header = block.header();
+        if reth_chainspec::qmdb::deferred_execution_active_at(self.chain_spec.genesis(), header.timestamp) {
+            // The header describes the parent; this block's own result is
+            // what its child's header will be checked against.
+            let (receipts_root, logs_bloom) = gov5_receipt_root_bloom(&result.receipts);
+            crate::executed_fields::remember_receipts(block.hash(), receipts_root, logs_bloom, result.gas_used);
+            return Ok(());
+        }
         if header.gas_used != result.gas_used {
             return Err(ConsensusError::BlockGasUsed {
                 gas: GotExpected {

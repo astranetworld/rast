@@ -790,6 +790,28 @@ impl QmdbNodeState {
         self.with_forest(|forest| forest.insert(block_hash, number, prepared))
     }
 
+    /// Computes a block's root and files its tree whatever its header says:
+    /// under deferred execution the header carries the *parent's* root, and
+    /// this block's own root is checked by its child. Returns the root (the
+    /// held one for a block already filed).
+    pub fn insert_block_operations(
+        &self,
+        parent: B256,
+        block_hash: B256,
+        number: u64,
+        ops: Vec<QmdbOperation>,
+    ) -> Result<B256, NodeStateError> {
+        self.with_forest(|forest| {
+            if let Some(root) = forest.root_of(&block_hash) {
+                return Ok(root);
+            }
+            let prepared = forest.compute_operations(parent, ops)?;
+            let root = prepared.root;
+            forest.insert(block_hash, number, prepared)?;
+            Ok(root)
+        })
+    }
+
     /// Computes a validated block's root and files its tree if the header agrees.
     ///
     /// Returns the computed root either way — the validator compares it to the

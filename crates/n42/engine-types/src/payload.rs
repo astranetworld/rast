@@ -1146,23 +1146,43 @@ where
         }
     }
 
-    header.state_root = match &qmdb_prepared {
+    // This block's own execution, as its child's header will carry it
+    // under deferred execution, or as its own header carries it before the
+    // fork.
+    let own_state_root = match &qmdb_prepared {
         Some(prepared) => prepared.root,
         None => block.header().state_root,
     };
-    header.transactions_root = block.header().transactions_root;
-    header.receipts_root = if hotstuff {
-        crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_output.result.receipts).0
+    let (own_receipts_root, own_logs_bloom) = if hotstuff {
+        crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_output.result.receipts)
     } else {
-        block.header().receipts_root
+        (block.header().receipts_root, block.header().logs_bloom)
     };
+    let own_gas_used = block.header().gas_used;
+    let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
+    if deferred {
+        // The header carries the parent's execution (docs/PHASE_D_DEFERRED_EXECUTION.md):
+        // what this node executed for the parent, or the parent's own header
+        // before the fork -- the first header past the fork repeats its
+        // parent's fields, the invariant at the switch.
+        let parent_fields = crate::hotstuff_consensus::parent_executed_fields(chain_spec.genesis(), &parent_header)
+            .ok_or_else(|| PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_header.hash())))?;
+        header.state_root = parent_fields.state_root;
+        header.receipts_root = parent_fields.receipts_root;
+        header.logs_bloom = parent_fields.logs_bloom;
+        header.gas_used = parent_fields.gas_used;
+    } else {
+        header.state_root = own_state_root;
+        header.receipts_root = own_receipts_root;
+        header.logs_bloom = own_logs_bloom;
+        header.gas_used = own_gas_used;
+    }
+    header.transactions_root = block.header().transactions_root;
     if hotstuff {
         header.ommers_hash = B256::ZERO;
         header.difficulty = U256::ZERO;
     }
-    header.logs_bloom = block.header().logs_bloom;
     header.gas_limit = block.header().gas_limit;
-    header.gas_used = block.header().gas_used;
     header.base_fee_per_gas = block.header().base_fee_per_gas;
     header.withdrawals_root = block.header().withdrawals_root;
     header.blob_gas_used = block.header().blob_gas_used;
@@ -1185,6 +1205,17 @@ where
     let senders = block.senders().to_vec();
     let sealed_block = SealedBlock::seal_parts(header, block.into_block().body);
     let block_hash = SealedBlock::hash(&sealed_block);
+    // Under the sealed hash, for the next header: the child's header is
+    // assembled from and checked against exactly this.
+    crate::executed_fields::remember(
+        block_hash,
+        crate::executed_fields::ExecutedFields {
+            state_root: own_state_root,
+            receipts_root: own_receipts_root,
+            logs_bloom: own_logs_bloom,
+            gas_used: own_gas_used,
+        },
+    );
     if let (Some(state), Some(prepared)) = (&qmdb, qmdb_prepared) {
         // Now the hash is known, the tree can be filed. Validation of this same
         // block, moments from now, finds it there and agrees by construction.

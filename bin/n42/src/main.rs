@@ -187,6 +187,28 @@ fn main() {
                     .ok_or_else(|| eyre::eyre!("no hash for head block {}", info.best_number))?;
                 qmdb.initialize((info.best_number, head_hash))?;
                 info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
+                // The head's execution result, for the first header after a
+                // restart under deferred execution: before the fork the
+                // header carries it; past the fork the forest holds the root
+                // and the database the receipts.
+                use reth_provider::{HeaderProvider, ReceiptProvider};
+                if let Some(head) = node.provider.sealed_header(info.best_number)? {
+                    let chain_spec = node.chain_spec();
+                    let genesis = chain_spec.genesis();
+                    if reth_chainspec::qmdb::deferred_execution_active_at(genesis, head.timestamp) {
+                        let receipts = node.provider.receipts_by_block(head.hash().into())?.unwrap_or_default();
+                        let (receipts_root, logs_bloom) = n42_engine_types::hotstuff_consensus::gov5_receipt_root_bloom(&receipts);
+                        let gas_used = receipts.last().map_or(0, |r| r.cumulative_gas_used);
+                        if let Some(state_root) = qmdb.root_of(&head.hash()) {
+                            n42_engine_types::executed_fields::remember(
+                                head.hash(),
+                                n42_engine_types::executed_fields::ExecutedFields { state_root, receipts_root, logs_bloom, gas_used },
+                            );
+                        }
+                    } else {
+                        n42_engine_types::executed_fields::seed_from_header(head.hash(), head.header());
+                    }
+                }
 
                 // Follow the canonical chain so the persisted head keeps up with
                 // the database's. Lagging is tolerable — only the tip matters,
