@@ -1663,6 +1663,30 @@ from 1.6-2.0M to 0.1-0.8M, windows 2-3 read 230-236k / 191-199k against 208-214k
 the retired slots' reads off the block path altogether (the delta carries a flag, the undo
 record a slot number): the memory gain should then stand alone.
 
+**loop125 (2026-09-10 21:38-22:00 EDT): delta v2 and the slot-only undo -- 296,936 and two rounds
+at 21.11M.** Step 3a (`492a2ab29`): the delta says which slots below its base flipped and to what
+instead of carrying their entries, and a file-backed tree's undo record carries slot numbers
+(the key is read at revival). E legs the entry file, A legs the heap, retention 16, tenure 64:
+
+    leg  win1          win2     win3     round       leader finish w1/w2/w3  follower w1  w3 majflt  AnonPages peak  w3 blocks
+    E1   266,220 (50)  219,169  195,898  20.45M      145 / 154 / 163         396-417      1.61M      77 GB           35
+    A1   287,836 (53)  209,984  176,908  20.25M       83 / 109 / 119         333-357      2.29M      88 GB           36
+    E2   261,122 (48)  243,253  199,174  21,110,364  142 / 145 / 150         391-414      73k        79 GB           44
+    A2   296,936 (56)  221,880  184,683  21,110,380   82 / 100 / 105         326-355      1.77M      87 GB           37
+
+The retired slots are read by nothing on the block path now, on either arm, and the heap arm
+shows it first: the leader's finish phase 82-83 ms against 94-96 (the delta capture used to
+read 133,000 retired entries there too), the follower's import 326-357 against 336-379, and
+**A2's 296,936 is the best window 1 of the campaign, 56 blocks**; both A2 and E2 read
+21.11M, the best rounds (loop118 K1 was 20.70M). The file arm's root phase still read 101-107 ms
+against the heap's 33-35: not reads any more but writes -- `push` wrote each of the 147,000
+records with its own seek and write syscall; fixed after this round (`05c7d984c`: appends go to
+the tail buffer and reach the file in one write at the next sync, seal or truncation), and
+loop126 measures it with step 3b (the file as the persistence: `forest.ckpt` of bits, fsync
+before the delta, restart from the file). Even so the file arm's windows 2-3 are the best
+yet (E2 243,253 / 199,174, 44 blocks in window 3 on the chain's clock against 37; window 3's
+major faults 73k against 1.77M), and its round ties the heap's.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
