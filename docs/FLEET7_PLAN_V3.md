@@ -236,9 +236,13 @@ leader's builds (1.8 GB). Not reth's chain, not the sender cache, not the queue.
 `N42_QMDB_RETAIN_DEPTH` -- loop122: 16 against 64 ends the leg 3.7 GB smaller per execution
 layer, halves window 2's major faults and gives window 2 four or five blocks on the chain's
 clock (46 against 41-42); adopted in the bench R set. M2b/M2c are superseded by the entry
-log (`docs/QMDB_ENTRY_LOG.md`): step 1 (the entries in an append-only file behind
-`N42_QMDB_ENTRY_FILE=1`) is built and loop123 measures it; steps 3-5 (formats v2, restart
-from the file, dead-twig trimming) follow. M3 (heap policy) after those.*
+log (`docs/QMDB_ENTRY_LOG.md`), built in full on 2026-09-10/11 and measured in loop123-127:
+the entries in an append-only file that is the persistence, a checkpoint of bits, the delta
+by bounds and flags, restart from the file, dead twigs trimmed by the retention window, the
+fsync outside the lock. loop127: window 1 298k (the heap's or better), anonymous memory
+79 GB against 88-90, the best round 21,836,504; adopted in the bench R set. Open: two of four
+file-mode legs opened with a page-in storm (the leg-start huge-page state, or something in
+the arm) -- attribute before flipping the code default. M3 (heap policy) after that.*
 
 M1. **Attribute the growth.** One profiling leg with `fleet7-profile.sh
     --alloc` on the leader *and* one follower during window 2, plus

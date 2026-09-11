@@ -1714,6 +1714,37 @@ bytes stays inside, milliseconds; the fsync goes to a second handle), and loop12
 The file arm is now the default candidate: it holds the best window 2 and the best round, and
 its window 1 is the heap's.
 
+**loop127 (2026-09-11 00:58-01:25 EDT): dead twigs trimmed, the fsync off the lock -- 21,836,504
+and 298k on window 1.** Step 5 (`07fd98033`: a twig whose slots are all dead and outside the
+retention window keeps only its root and bits) and the fsync of the entry file's appends moved
+outside the forest lock (`c8e9043ba`). T = entry file with trimming, N = entry file without
+(`N42_QMDB_TRIM_TWIGS=0`), A = the heap; retention 16, tenure 64:
+
+    leg  win1          win2     win3     round       follower w1  w1 majflt  w2 majflt  w3 majflt  AnonPages peak  chain blocks
+    T1   297,955 (55)  227,118  202,640  21,836,504  306-332      19k        108k       1.54M      79 GB           56 / 43 / 40
+    A1   293,087 (55)  217,846  192,432  21.11M      326-383      74k        537k       2.18M      88 GB           55 / 42 / 36
+    N1   298,387 (55)  207,712  200,280  21.20M      322-338      29k        726k       2.03M      79 GB           56 / 45 / 38
+    T2   250,939 (46)  205,517  195,511  19.57M      356-574      877k       2.07M      2.51M      79 GB           47 / 38 / 36
+    A2   277,090 (53)  210,999  182,113  20.11M      336-371      97k        2.21M      2.49M      90 GB           53 / 40 / 33
+
+With the fsync outside the lock the file arm's window 1 is the heap's or better (297,955 /
+298,387 against 293,087 / 277,090, all 55-56 blocks on the chain's clock; the follower's
+import 306-338 against 326-383), its anonymous memory peaks 79 GB against 88-90, and T1's
+21,836,504 is the best round of the campaign (loop126 E2's 21.68M before it). Trimming
+against not trimming, one clean pair: window 2's major faults 108k against 726k and window 2
+227,118 against 207,712 (43 against 45 blocks on the chain's clock -- the flood's window
+edges again; window 3 40 against 38). T2 is void: 877k major faults in window 1 with 72 GB
+available and an execution layer at 6.7 GB -- the leg-start state (`page-cache-at-leg-start`:
+a leg whose huge-page pool is fragmented reads the slow mode from its first block), which
+loop126's E1 also had; two of the four file-mode legs across the two rounds against none of
+the heap's, not attributed to the arm yet and the first thing to look at. A2 read 277k with
+2.2M faults in window 2, the same family.
+
+Adopted for the bench: `N42_QMDB_ENTRY_FILE=1` joins the launchers' R set with trimming on;
+the code's default flips once the leg-start storm is attributed. The entry log is complete as
+designed (`docs/QMDB_ENTRY_LOG.md`): entries in the file, a checkpoint of bits, the delta by
+bounds and flags, restart from the file, trimming by the retention window.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
