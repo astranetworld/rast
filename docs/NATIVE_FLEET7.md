@@ -1840,6 +1840,27 @@ waiting for the import (loop129), and what it is worth in transactions is a meas
 fleet whose ingest has cores of its own. The adopted configuration (F450: 292k, 54 blocks,
 21.0M-ish rounds) stays the record path here.
 
+**loop131 (2026-09-11 18:56-19:18 EDT): a 16M-slot Ed25519 sender cache buys nothing.** The
+adopted configuration (file mode, tenure 64, retention 16, pacing 450) with
+`N42_ALTSIG_SENDER_CACHE=16777216` on the C legs against the default 4,194,304 on the A legs,
+first legs after the gov5 fleet left the box (7 GB of swapped tmpfs and 16.6 GB of shmem stayed
+behind; the huge-page pool was 39-44 GB at every leg's start):
+
+    leg  cache   win1          win2     win3     blocks/window   flood sent
+    W    4M      249,857 (46)  192,202  184,669  46 / 36 / 34    27.4M   (warm-up, not read)
+    C1   16M     233,439 (44)  188,240  173,801  44 / 35 / 32    26.5M
+    A1   4M      292,432 (54)  206,937  183,035  54 / 40 / 34    30.8M
+    C2   16M     277,087 (51)  205,204  189,331  51 / 40 / 34    29.3M
+    A2   4M      292,276 (54)  207,629  194,048  54 / 40 / 34    31.5M
+
+The 4M legs read 292k twice at a 0.556 s cycle -- the record configuration's number on a box
+in this state -- and the 16M legs 233k and 277k at 0.68 and 0.59 s: the larger cache costs
+window 1, not the reverse (a 16M-slot table is four times the memory the ingest's and the
+follower's lookups walk, and the misses it would save were never the follower's cost: senders
+are 1-6 ms of a direct import with the ingest's cache). Not adopted. The stage-2 measurement
+of deferred execution (loop132, `docs/PHASE_D_DEFERRED_EXECUTION.md` section 11) follows on
+the same box state.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
