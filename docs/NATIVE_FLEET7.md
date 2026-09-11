@@ -1735,10 +1735,16 @@ against not trimming, one clean pair: window 2's major faults 108k against 726k 
 227,118 against 207,712 (43 against 45 blocks on the chain's clock -- the flood's window
 edges again; window 3 40 against 38). T2 is void: 877k major faults in window 1 with 72 GB
 available and an execution layer at 6.7 GB -- the leg-start state (`page-cache-at-leg-start`:
-a leg whose huge-page pool is fragmented reads the slow mode from its first block), which
-loop126's E1 also had; two of the four file-mode legs across the two rounds against none of
-the heap's, not attributed to the arm yet and the first thing to look at. A2 read 277k with
-2.2M faults in window 2, the same family.
+a leg whose huge-page pool is short reads the slow mode from its first block), which
+loop126's E1 also had. Attributed the next morning from the legs' `memory :` headers: the
+two storm legs started with `Cached` 18.7 / 14.1 GB against the clean legs' 9.6-10.5, and the
+smallest huge-page pools of their rounds (40 / 34 GB against 44-53) -- the *previous* leg's
+datadirs were still on disk when the cache was dropped and the pool rebuilt (`up --fresh`
+wipes them afterwards), and a file-mode leg leaves 7 x ~1 GB of `entries.log` written
+seconds earlier, dirty, which `dropcache` cannot evict and `hugeprep` cannot collapse. So the
+file arm hurt the *next* leg's start, whichever arm that was (A2, after T2, read 277k with
+2.2M faults in window 2). `fleet7-bench.sh` now deletes the previous leg's datadirs before
+the cache drop and the pool rebuild.
 
 Adopted for the bench: `N42_QMDB_ENTRY_FILE=1` joins the launchers' R set with trimming on;
 the code's default flips once the leg-start storm is attributed. The entry log is complete as

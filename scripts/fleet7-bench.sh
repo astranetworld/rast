@@ -289,6 +289,21 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
 # judged afterwards.
 F7_DROP_CACHE=${F7_DROP_CACHE:-1}
 F7_HUGEPREP=${F7_HUGEPREP:-40}
+# The previous leg's datadirs go before the cache is dropped and the huge-page
+# pool rebuilt, not after: their files are dirty in the page cache (a leg
+# with the QMDB entry file leaves 7 x ~1 GB of entries.log written seconds
+# ago, loop126-127), dropcache cannot evict dirty pages, hugeprep cannot
+# collapse them, and the leg then starts from a pool 5-10 GB short and reads
+# the slow mode from its first block (loop126 E1, loop127 T2: 877k-1.66M
+# major faults in window 1). Deleting the files frees their pages outright.
+# Only when no node is running: a live datadir is never touched here.
+if [[ "$(pgrep -fc 'n4[2] node')" == 0 ]]; then
+  for ((i = 0; i < F7_NODES; i++)); do
+    d=$(f7_node_dir "$i")
+    rm -rf "$d/el" "$d/consensus"
+  done
+  sync
+fi
 if [ "$F7_DROP_CACHE" = 1 ]; then
   python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" 2>&1 | tail -1
 fi
