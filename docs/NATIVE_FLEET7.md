@@ -1642,6 +1642,27 @@ removes the second read entirely, with the undo record reduced to slot numbers f
 store (the key is read at revival, the only time it is needed) removing the first. The
 retention knob (loop122) and the entry file are independent: their memory savings add.
 
+**loop124 (2026-09-10 20:51-21:13 EDT): the entry file through sealed, populated chunks -- the
+reads were never the faults.** The file mapped in 256 MB chunks, each mapped once with its
+page tables populated (`bad780f40`), E against the heap A, retention 16 on both:
+
+    leg  win1          win2     win3     round    leader finish w1/w2/w3  follower w1  w3 majflt  AnonPages peak  w3 blocks
+    E1   259,823 (48)  230,506  191,491  20.47M   155 / 162 / 176         394-460      778k       78 GB           36
+    A1   286,255 (53)  208,024  188,458  20.49M    94 / 112 / 132         336-379      1.57M      88 GB           35
+    E2   249,797 (46)  235,784  199,374  20.55M   158 / 164 / 170         396-558      103k       86 GB           41
+    A2   285,751 (53)  213,669  177,394  20.31M    94 / 109 / 140         337-355      2.01M      87 GB           34
+
+The follower's root phase still reads 94-134 ms and the leader's finish 155-176 against the
+heap's 33-35 and 94-140: populating the mapping changed nothing, so the ~70 ms was not page
+faults but the 266,000 random reads themselves -- a file mapping is 4 KB pages and every read
+is a TLB walk, where the heap's entries sit on the 2 MB pages `thp:always` gives the
+allocator. And the other side of the ledger is now unmistakable: window 3's major faults fall
+from 1.6-2.0M to 0.1-0.8M, windows 2-3 read 230-236k / 191-199k against 208-214k / 177-188k
+(the highest windows 2 and 3 of the campaign), and the rounds tie (20.47 / 20.55M against
+20.49 / 20.31M) with window 1 five to seven blocks down. loop125 runs step 3a, which takes
+the retired slots' reads off the block path altogether (the delta carries a flag, the undo
+record a slot number): the memory gain should then stand alone.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
