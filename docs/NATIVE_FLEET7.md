@@ -1687,6 +1687,33 @@ before the delta, restart from the file). Even so the file arm's windows 2-3 are
 yet (E2 243,253 / 199,174, 44 blocks in window 3 on the chain's clock against 37; window 3's
 major faults 73k against 1.77M), and its round ties the heap's.
 
+**loop126 (2026-09-11 00:26-00:48 EDT): the entry file as the persistence -- 21,684,816.** Step
+3b/4 (`e7ccae7a8`: `forest.ckpt` is the cursor and the active bits, the delta names its appended
+range by its bounds, fsync before the delta, restart from the file) with the appends buffered
+and written in one call (`05c7d984c`). E legs the entry file, A legs the heap, retention 16,
+tenure 64:
+
+    leg  win1          win2     win3     round       leader finish w1/w2/w3  follower w1  w1 majflt  w2 majflt  chain blocks w1/w2/w3
+    E1   238,975 (44)  194,187  179,105  18.38M       101 / 119 / 120        384-408      1.66M      2.30M      45 / 34 / 36
+    A1   291,720 (55)  206,009  178,701  20.30M        81 / 105 / 122        328-346      65k        1.08M      55 / 45 / 40
+    E2   293,384 (56)  226,661  202,581  21,684,816    80 /  96 / 116        328-348      15k        142k       56 / 51 / 39
+    A2   292,703 (55)  201,872  196,420  20.74M        84 /  96 / 111        331-360      75k        671k       55 / 45 / 38
+
+E2 is what the design promised: the follower's root phase 32 ms and its import 328-348 in
+window 1 (the heap's numbers), the leader's finish 80 (the heap's), `forest.ckpt` 3 MB and
+`forest.log` 2 MB where the checkpoint used to be 300-800 MB, window 2's major faults 142k
+against 671k-1.08M, **51 blocks in window 2 on the chain's clock against 45, and the best
+round of the campaign, 21,684,816** (loop125's 21.11M before it); window 1 ties the heap at
+56 blocks. E1 is not the same leg: 1.66M major faults already in window 1 (the heap legs'
+15-75k), the followers 384-408, 45 blocks -- a memory storm from the start, the shape of
+loop98's "first leg after the box changed state", on the leg right after the build (the
+warm-up did not clear it). Its one design-side suspect is the fsync of the block's ~20 MB
+inside the forest lock (`sync_entries_if_file`): under a busy disk that stalls the builder and
+the importer on every block; moved outside the lock after this round (the write of the pending
+bytes stays inside, milliseconds; the fsync goes to a second handle), and loop127 carries it.
+The file arm is now the default candidate: it holds the best window 2 and the best round, and
+its window 1 is the heap's.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
