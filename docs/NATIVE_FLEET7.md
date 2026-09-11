@@ -1821,6 +1821,25 @@ blocks), and the number it is worth at full blocks is a seven-machine number, wh
 node's ingest has its own cores. loop130 tries the supply side of this box (32 recovery
 slots, 96 flood connections, pacing 300) to see how far the ingest can be pushed.
 
+**loop130 (2026-09-11 04:13-04:33 EDT): the supply side cannot be pushed on this box.** The
+vote-before-import legs with the ingest given more (32 recovery slots instead of 20, 96 flood
+connections instead of 64) at pacing 450 and 300, against the adopted configuration:
+
+    leg    pacing  win1          win2     win3     blocks/window
+    V450   450      85,765 (38)  114,212   68,283  38 / 55 / 27
+    V300   300      77,606 (49)   32,588   33,407  49 / 47 / 56
+    F450   450     292,188 (54)  213,987  181,654  54 / 40 / 34
+    V300b  300     (see round.txt)
+
+More recovery slots and connections did not raise the supply -- the queue saw-tooths as in
+loop129 (6k to 359k), the blocks are 1-163k, and the leader's builds wait on an empty queue;
+faster pacing only empties them further. The box's ingest is CPU-bound beside seven
+followers executing off the loop, and no knob on the flood's side changes that. So the phase D
+bound on one box is closed: the protocol reaches the pacing floor the moment the vote stops
+waiting for the import (loop129), and what it is worth in transactions is a measurement for a
+fleet whose ingest has cores of its own. The adopted configuration (F450: 292k, 54 blocks,
+21.0M-ish rounds) stays the record path here.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
