@@ -439,7 +439,8 @@ impl ConsensusEngine {
         if matches!(
             self.signing_profile,
             super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) {
+        ) && !self.vote_before_import
+        {
             self.pending_proposal = Some(super::state_machine::PendingProposal {
                 view,
                 block_hash: proposal.block_hash,

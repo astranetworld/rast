@@ -192,6 +192,11 @@ pub struct ExecutionDriver<E> {
     head: B256,
     /// Last block consensus committed.
     finalized: B256,
+    /// A commit that arrived before the block's import finished (a follower
+    /// that voted before importing, `N42_VOTE_BEFORE_IMPORT=1`): the
+    /// forkchoice waits for the import, since the engine would answer
+    /// SYNCING for a block it has not seen.
+    pending_commit: Option<B256>,
     /// Bounds `payloads` so a peer cannot make us buffer without limit.
     max_cached_payloads: usize,
     /// Insertion order, for evicting the oldest cached payload.
@@ -214,6 +219,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             payloads: HashMap::new(),
             head: genesis,
             finalized: genesis,
+            pending_commit: None,
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
         }
@@ -780,6 +786,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     self.head = block_hash;
+                    if self.pending_commit == Some(block_hash) {
+                        self.pending_commit = None;
+                        // The commit that waited for this import; its own
+                        // action is a log line the node does nothing with.
+                        let _ = self.commit(block_hash).await;
+                    }
                     DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
                 }
                 // SYNCING/ACCEPTED are not a verdict: the EL has not executed the
@@ -802,6 +814,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// Commit path: makes a committed block the head and the finalised block.
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
+        if self.head != block_hash && self.payloads.contains_key(&block_hash) {
+            // Still importing (or not yet asked to): the forkchoice follows
+            // the import's success.
+            self.pending_commit = Some(block_hash);
+            return DriverAction::Ignored;
+        }
         self.finalized = block_hash;
         let state = ForkchoiceState {
             head_block_hash: block_hash,

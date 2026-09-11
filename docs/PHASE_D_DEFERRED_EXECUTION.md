@@ -110,8 +110,9 @@ receipt format (a receipt of N is proven under N+1).
 ## 6. What to measure before deciding
 
 On this bench, without any client change, the gain can be *bounded* by a follower that votes
-before importing (a bench-only flag on the Rust validator: vote on structure, import after --
-unsafe, for measurement only): that reads the cycle the protocol would give at today's
+before importing (`N42_VOTE_BEFORE_IMPORT=1` on the Rust validator: vote on the verified
+proposal, import after, the commit's forkchoice deferred until the import lands -- unsafe,
+for measurement only; loop128): that reads the cycle the protocol would give at today's
 sides, and says whether the ~460 ms leader build then becomes the floor (in which case
 phase A3's build cuts pay 1:1 again). If it reads ~65 blocks a window against 56, the
 proposal is worth the cross-client work; if the leader's build or the network floor caps it

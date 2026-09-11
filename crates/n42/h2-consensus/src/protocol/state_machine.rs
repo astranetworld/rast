@@ -274,6 +274,12 @@ pub struct ConsensusEngine {
     /// Explicitly selected signing domain. Native is the safe default; H2-v4
     /// is enabled only for gov5 participant mode.
     pub(super) signing_profile: ConsensusSigningProfile,
+    /// **Bench only, unsafe.** Under the H2-v4 profile vote on a proposal the
+    /// moment it is verified, before the block is executed, as the native
+    /// profile does -- an R1 vote then no longer attests execution. Bounds
+    /// what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would
+    /// give the cycle before any header changes.
+    pub(super) vote_before_import: bool,
     pub(super) round_state: RoundState,
     pub(super) pacemaker: Pacemaker,
     pub(super) vote_collector: Option<VoteCollector>,
@@ -404,6 +410,7 @@ impl ConsensusEngine {
             epoch_manager,
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
+            vote_before_import: false,
             round_state: RoundState::new(),
             pacemaker: Pacemaker::new(base_timeout_ms, max_timeout_ms),
             vote_collector: None,
@@ -509,6 +516,7 @@ impl ConsensusEngine {
             epoch_manager,
             leader_tenure: 1,
             signing_profile: ConsensusSigningProfile::Native,
+            vote_before_import: false,
             round_state: RoundState::from_snapshot(
                 recovered_view,
                 locked_qc,
@@ -890,6 +898,12 @@ impl ConsensusEngine {
     /// is refused.
     pub fn set_leader_tenure(&mut self, tenure: u64) {
         self.leader_tenure = tenure.max(1);
+    }
+
+    /// **Bench only, unsafe**: vote on a verified proposal before executing
+    /// it, under the H2-v4 profile too. See the field.
+    pub fn set_vote_before_import(&mut self, on: bool) {
+        self.vote_before_import = on;
     }
 
     /// Consecutive views one validator leads; see [`Self::set_leader_tenure`].

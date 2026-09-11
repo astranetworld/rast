@@ -394,6 +394,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // member rejects its votes.
         engine.enable_h2_v4_signing(identity);
         engine.set_leader_tenure(leader_tenure);
+        // Bench only: a vote before the import bounds what deferred execution
+        // (docs/PHASE_D_DEFERRED_EXECUTION.md) would give the cycle.
+        if std::env::var("N42_VOTE_BEFORE_IMPORT").is_ok_and(|v| v == "1") {
+            engine.set_vote_before_import(true);
+            println!("UNSAFE        : voting before import (N42_VOTE_BEFORE_IMPORT=1) -- a measurement, not a node");
+        }
 
         let el = EngineApiClient::new(HttpTransport::new(el_url, jwt, Duration::from_secs(8))?);
         // The driver starts where the execution layer actually is. The
