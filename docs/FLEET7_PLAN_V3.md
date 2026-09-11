@@ -325,7 +325,13 @@ cache. Each removes a pass from both chains at once. Target ~300 ms a side,
 carries the execution of N-1, the vote certifies N-1's execution and N's includability, the
 cycle becomes max(build, import, network); with the component table, the "execution cannot
 fail a block" rule, the bench-only measurement that bounds the gain before any header changes,
-and the open questions for gov5.*
+and the open questions for gov5. Measured on 2026-09-11 (loop128-130): with the vote off the
+import (`N42_VOTE_BEFORE_IMPORT=1`, the import on a task) the followers' votes collect in
+5-40 ms and the cycle becomes the pacing (62-66 blocks a window against 54-55) -- the
+coupling is the whole difference -- but on one box the ingest, sharing its cores with seven
+followers executing off the loop, supplies only 130-150k transactions a second and the blocks
+empty; more recovery slots and flood connections do not change it. The TPS deferred execution
+is worth at full blocks is a measurement for a fleet whose ingest has cores of its own.*
 
 Everything above keeps "a follower executes the block before it votes". The
 fixed ~100 ms and the execute-then-vote coupling are then the wall: at

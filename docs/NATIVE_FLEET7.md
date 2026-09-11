@@ -1829,7 +1829,7 @@ connections instead of 64) at pacing 450 and 300, against the adopted configurat
     V450   450      85,765 (38)  114,212   68,283  38 / 55 / 27
     V300   300      77,606 (49)   32,588   33,407  49 / 47 / 56
     F450   450     292,188 (54)  213,987  181,654  54 / 40 / 34
-    V300b  300     (see round.txt)
+    V300b  300      60,762 (37)  109,617   36,392  37 / 84 / 14
 
 More recovery slots and connections did not raise the supply -- the queue saw-tooths as in
 loop129 (6k to 359k), the blocks are 1-163k, and the leader's builds wait on an empty queue;
