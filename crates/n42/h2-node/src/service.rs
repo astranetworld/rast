@@ -905,8 +905,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // A follower import that ran on a task: the same action an
                 // awaited import returns, applied now.
                 if let Some((block_hash, verdict)) = verdict {
-                    let action = self.driver.finish_execute(block_hash, verdict).await;
-                    self.apply_driver_action(action, &mut events)?;
+                    for action in self.driver.finish_execute(block_hash, verdict).await {
+                        self.apply_driver_action(action, &mut events)?;
+                    }
                 }
             }
             body = async {

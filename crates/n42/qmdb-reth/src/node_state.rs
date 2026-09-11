@@ -331,6 +331,12 @@ impl QmdbNodeState {
     /// A handle for `chain`, persisting under `dir`. Not yet usable — see
     /// [`Self::initialize`].
     pub fn new(chain: Arc<ChainSpec>, dir: impl Into<PathBuf>) -> Self {
+        Self::new_with_entry_file(chain, dir, entry_file_enabled())
+    }
+
+    /// [`Self::new`] with the entry file on or off regardless of the
+    /// environment (tests run both in one process).
+    pub fn new_with_entry_file(chain: Arc<ChainSpec>, dir: impl Into<PathBuf>, entry_file: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
                 forest: Mutex::new(None),
@@ -338,17 +344,9 @@ impl QmdbNodeState {
                 dir: dir.into(),
                 persist: Mutex::new(PersistCursor::default()),
                 compaction: Mutex::new(None),
-                entry_file: entry_file_enabled(),
+                entry_file,
             }),
         }
-    }
-
-    /// [`Self::new`] with the entry file on or off regardless of the
-    /// environment (tests run both in one process).
-    pub fn new_with_entry_file(chain: Arc<ChainSpec>, dir: impl Into<PathBuf>, entry_file: bool) -> Self {
-        let state = Self::new(chain, dir);
-        let inner = Arc::try_unwrap(state.inner).unwrap_or_else(|_| unreachable!("a fresh handle has one owner"));
-        Self { inner: Arc::new(Inner { entry_file, ..inner }) }
     }
 
     /// Whether the entries live in the file.

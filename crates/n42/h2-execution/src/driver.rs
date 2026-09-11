@@ -720,6 +720,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// flight. The verdict arrives on the channel and goes through
     /// [`Self::finish_execute`].
     fn spawn_execute(&mut self, block_hash: B256) -> DriverAction {
+        if self.executing == Some(block_hash) {
+            // Asked again for the block in flight: its verdict is coming.
+            return DriverAction::Ignored;
+        }
         if self.executing.is_some() {
             if !self.import_queue.contains(&block_hash) {
                 self.import_queue.push_back(block_hash);
@@ -754,12 +758,16 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// A spawned import's verdict: the head moves, a commit that waited runs
     /// its forkchoice, the next queued import starts, and the loop gets the
-    /// same action an awaited import would have returned.
-    pub async fn finish_execute(&mut self, block_hash: B256, verdict: Result<(), String>) -> DriverAction {
+    /// same action an awaited import would have returned -- plus, when the
+    /// next queued block's payload is gone from the cache, the
+    /// `PayloadMissing` that makes the loop fetch it (dropping that would
+    /// leave the block unimported for good).
+    pub async fn finish_execute(&mut self, block_hash: B256, verdict: Result<(), String>) -> Vec<DriverAction> {
         if self.executing == Some(block_hash) {
             self.executing = None;
         }
-        let action = match verdict {
+        let mut actions = Vec::with_capacity(2);
+        actions.push(match verdict {
             Ok(()) => {
                 self.head = block_hash;
                 if self.pending_commit == Some(block_hash) {
@@ -769,11 +777,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
             }
             Err(reason) => DriverAction::Rejected { block_hash, reason },
-        };
+        });
         if let Some(next) = self.import_queue.pop_front() {
-            let _ = self.spawn_execute(next);
+            match self.spawn_execute(next) {
+                DriverAction::Ignored => {}
+                other => actions.push(other),
+            }
         }
-        action
+        actions
     }
 
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
