@@ -1884,6 +1884,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.driver.spawn_import_own_block(&built);
             }
             Err(err) => {
+                // Under deferred execution a new leader's parent -- the block
+                // it just voted for on its check -- may still be importing,
+                // and the execution layer cannot build on it yet (loop134 A1:
+                // "forkchoiceUpdated returned no payload id (status Syncing)"
+                // at every tenure boundary, then a full view timeout). Ask
+                // again once it lands, as with a declined attribute builder.
+                if self.driver.is_importing(&head) {
+                    info!(target: "n42.h2.node", %err, view, parent = ?head, "the parent is still importing; proposing once it lands");
+                    self.proposed_view = None;
+                    self.proposal_deferred = true;
+                    self.defer_reason = Some("the parent is still importing");
+                    return;
+                }
                 // The view will time out and move on; that is the correct
                 // outcome for a leader that cannot produce.
                 warn!(target: "n42.h2.node", %err, view, "could not build a block to propose");
