@@ -572,7 +572,7 @@ pub fn execute_for_build<T, G>(
     open: &(dyn Fn() -> Option<G> + Sync),
 ) -> Result<BuildRun<T>, NotParallel>
 where
-    T: Send,
+    T: Send + Sync,
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
@@ -591,14 +591,18 @@ where
     phases.partition_ms = at.elapsed().as_millis() as u64;
 
     let at = std::time::Instant::now();
-    let results: Vec<Result<(Vec<BuiltTransfer<T>>, Vec<usize>, BundleState), NotParallel>> = pool.install(|| {
+    // Each result goes into its candidate's slot from the batch's own
+    // thread: collecting the batches' vectors and sorting them by index was
+    // 80-150 ms of a full block's build (loop138-139).
+    let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = (0..keys.len()).map(|_| std::sync::OnceLock::new()).collect();
+    let slots_ref = &slots;
+    let results: Vec<Result<(Vec<usize>, BundleState), NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
             .par_iter()
             .map(|members| {
                 let db = open().ok_or(NotParallel::NoState)?;
                 let mut state = State::builder().with_database(db).with_bundle_update().build();
-                let mut done = Vec::with_capacity(members.iter().map(|g| g.len()).sum());
                 let mut skipped = Vec::new();
                 {
                     let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
@@ -613,7 +617,7 @@ where
                                 Ok(Some(out)) => {
                                     let gas_used = out.result.gas_used();
                                     evm.db_mut().commit(out.state);
-                                    done.push(BuiltTransfer { index: i, tx, result: out.result, gas_used });
+                                    let _ = slots_ref[i].set(BuiltTransfer { index: i, tx, result: out.result, gas_used });
                                 }
                                 Ok(None) => {
                                     // The sender's later transfers would only
@@ -628,7 +632,7 @@ where
                     }
                 }
                 state.merge_transitions(BundleRetention::Reverts);
-                Ok((done, skipped, state.take_bundle()))
+                Ok((skipped, state.take_bundle()))
             })
             .collect()
     });
@@ -636,24 +640,16 @@ where
 
     let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
-    // Candidate order, as the serial builder would have laid the block out
-    // (each sender's transfers were run in that order, and the graft does
-    // not care): round 43's followers imported a sender-grouped block 35%
-    // slower than the serial builder's. Placed by index, one move each: a
-    // sort of 163,000 results (each a transaction and its outcome) was
-    // ~40 ms of the build.
-    let mut slots: Vec<Option<BuiltTransfer<T>>> = Vec::with_capacity(keys.len());
-    slots.resize_with(keys.len(), || None);
     for r in results {
-        let (done, skipped, bundle) = r?;
-        for built in done {
-            let index = built.index;
-            slots[index] = Some(built);
-        }
+        let (skipped, bundle) = r?;
         run.skipped.extend(skipped);
         run.bundles.push(bundle);
     }
-    run.executed = slots.into_iter().flatten().collect();
+    // Candidate order, as the serial builder would have laid the block out
+    // (each sender's transfers were run in that order, and the graft does
+    // not care): round 43's followers imported a sender-grouped block 35%
+    // slower than the serial builder's. The slots are in that order already.
+    run.executed = slots.into_iter().filter_map(|slot| slot.into_inner()).collect();
     run.skipped.sort_unstable();
     run.phases.collect_ms = at.elapsed().as_millis() as u64;
     Ok(run)

@@ -769,6 +769,9 @@ where
     let mut par_collect_ms = 0u64;
     // Of the fold: the receipts loop, before the graft.
     let mut par_commit_ms = 0u64;
+    // The transactions root, computed beside the graft for a block that
+    // will seal early.
+    let mut early_transactions_root: Option<B256> = None;
     let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     // What the seal-first path needs of the chain and the block, short of
     // the block being full (known after the parallel step).
@@ -867,9 +870,22 @@ where
                     let keep_cache = !(sealing_early || (build_graft_no_cache() && block_full && withdrawals_clear));
                     par_commit_ms = fold_at.elapsed().as_millis() as u64;
                     let _ = executed_count;
-                    let db = builder.evm_mut().db_mut();
-                    let graft = crate::parallel_transfer::graft_bundles_with(db, run.bundles, beneficiary, keep_cache)
-                        .map_err(PayloadBuilderError::other)?;
+                    // The transactions root beside the graft when the block
+                    // will seal early: the seal needs it, and the graft's
+                    // 60-100 ms hide it (loop139: 42 ms on the seal path).
+                    let bundles = run.bundles;
+                    let (graft, early_root) = std::thread::scope(|scope| {
+                        let root = sealing_early.then(|| {
+                            let txs: &[reth_primitives_traits::Recovered<TransactionSigned>] = &builder.transactions;
+                            scope.spawn(move || crate::assembler::parallel_transaction_root_recovered(txs))
+                        });
+                        let db = builder.executor.evm_mut().db_mut();
+                        let graft = crate::parallel_transfer::graft_bundles_with(db, bundles, beneficiary, keep_cache);
+                        (graft, root.map(|job| job.join().expect("the transactions root job does not panic")))
+                    });
+                    early_transactions_root = early_root;
+                    let graft = graft.map_err(PayloadBuilderError::other)?;
+                    let db = builder.executor.evm_mut().db_mut();
                     let fees = graft.beneficiary_delta;
                     par_committed = graft.committed;
                     par_reverts = graft.reverts;
@@ -946,7 +962,10 @@ where
             let txs = std::mem::take(&mut builder.transactions);
             let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) =
                 txs.into_iter().map(|tx| tx.into_parts()).unzip();
-            let transactions_root = crate::assembler::parallel_transaction_root(&transactions);
+            let transactions_root = match early_transactions_root {
+                Some(root) => root,
+                None => crate::assembler::parallel_transaction_root(&transactions),
+            };
             let root_ms = seal_at.elapsed().as_millis() as u64;
             let parent_sealed = parent_header.hash();
             // The parent's execution, as this header carries it: recorded

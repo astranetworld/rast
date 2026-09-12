@@ -88,6 +88,13 @@ impl<ChainSpec> N42BlockAssembler<ChainSpec> {
 ///
 /// Identical to `alloy_consensus::proofs::calculate_transaction_root`: the
 /// trie is over each transaction's EIP-2718 encoding, keyed by index.
+/// [`parallel_transaction_root`] over recovered transactions.
+pub fn parallel_transaction_root_recovered<T: Encodable2718 + Sync>(transactions: &[reth_primitives_traits::Recovered<T>]) -> B256 {
+    use rayon::prelude::*;
+    let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.inner().encoded_2718()).collect();
+    parallel_ordered_trie_root(&encoded)
+}
+
 pub fn parallel_transaction_root<T: Encodable2718 + Sync>(transactions: &[T]) -> B256 {
     use rayon::prelude::*;
     let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.encoded_2718()).collect();
