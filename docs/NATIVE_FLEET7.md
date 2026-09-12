@@ -1870,7 +1870,7 @@ reached) and on the same genesis with `deferredExecutionTime: 0` (A legs), recor
     loop132 W    293,384 (54)  208,314  200,959  54 / 39 / 38    ungated: parity with target/release (loop131 A: 292k)
     loop132 C1   287,140 (53)  204,544  196,415  53 / 39 / 37
     loop132 A1     3,317 (3)    10,866   10,866   3 /  6 /  6    gated: stalled, 10 s cycle (defect 1)
-    loop132 C2   282,932 (52)  ...                               (post-processing; not read)
+    loop132 C2   292,504 (54)
     loop132 A2     4,067 (3)                                     gated: stalled (defect 1)
     loop133 W    290,806 (54)  208,034  197,634  54 / 39 / 37    rebuilt with the fix for defect 1
     loop133 C1   287,955 (53)  212,552   16,414  53 / 41 / 46    window 3: empty blocks with the flood at 194k/s
