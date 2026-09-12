@@ -1948,6 +1948,42 @@ build chain -- the serial fold/finish/assemble ~260 ms of a 430 ms build -- and 
 blocks; on a fleet whose ingest and leader have cores of their own the follower's 400 ms is
 already beside the path.
 
+**loop136 (2026-09-12 01:31-01:57 EDT): where an execution layer's CPU goes under deferred
+execution -- half of it is Ed25519.** The profiling build of the loop135 tree on the gated bench
+genesis, record configuration, with `perf` pulled between the windows from node2 (P1: the leader
+of views 128-191, window 1's end and window 2) and node4 (P2: a follower then):
+
+    leg  win1          win2     win3     blocks/window
+    W    286,431 (54)  200,551  188,369  54 / 39 / 37
+    P1   297,499 (55)  213,328   88,384  55 / 40 / ..   (profiled; window 3 pays for the pull)
+    A1   274,230 (51)  205,626  190,350  51 / 39 / 37
+    P2   298,307 (55)  212,941  144,829  55 / 40 / ..   (profiled)
+    A2   295,681 (55)  214,026  189,755  55 / 41 / 37
+
+The flat profiles, leader and follower alike (`profile-win1.data` under `bench-loop136P1` and
+`P2`, `--no-children -g none --sort sym`):
+
+    symbol                                                     leader (P1)   follower (P2)
+    curve25519 field squaring (`pow2k`)                          19.3%         19.7%
+    curve25519 AVX2 field multiply                               17.3%         18.2%
+    curve25519 (mul, edwards ops, pippenger)                     ~7%           ~6%
+    keccak-f                                                     10.3%         11.2%
+    rocksdb memtable (skiplist splice, key comparator)           2.8%          2.6%
+    kernel                                                       4.3%          2.5%
+    by thread: tokio-rt 66% / builder+rayon ("n42") 18%          --            tokio-rt 61% / 26%
+
+So ~45% of an execution layer's CPU, on every node, is Ed25519 verification of the ingest --
+each node verifies every transaction the flood sends it (F7_INGEST_ALL) at 24-26 us a
+transaction against ~6 us the batch arithmetic needs -- and a third of that is `pow2k`: the
+square root of decompressing a point, paid for the *public key* on every signature
+(`VerifyingKey::from_bytes`) although the bench's 6,000 senders sign every block, and for R
+once per signature. The builder's own threads are 18% of the leader; keccak (transaction
+hashes and the 0x50 sender derivation, both computed more than once a transaction) is 10%.
+Three cuts follow from this, in order of size: decompress each public key once (a key cache,
+loop137 K legs), verify in larger batches, and hash a transaction once. The leader's build
+chain (loop135) competes with this ingest load on the same 16 cores, which is why its
+par_exec read 96 ms against 54 under load.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
