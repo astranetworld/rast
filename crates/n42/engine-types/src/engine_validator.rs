@@ -100,6 +100,14 @@ where
         // A block this node built and has just handed to the engine as
         // executed: the payload is its own, and the block is already made.
         if let Some(block) = crate::built_executions::find_sealed(expected_hash) {
+            let payload_transactions = payload.payload.as_v1().transactions.len();
+            if payload_transactions == 0 || payload_transactions != block.body().transactions.len() {
+                tracing::info!(
+                    target: "n42::engine_validator",
+                    number = block.number, block = ?expected_hash, sealed_transactions = block.body().transactions.len(), payload_transactions,
+                    "payload converted from the sealed block kept for it"
+                );
+            }
             return Ok(block);
         }
         let started = std::time::Instant::now();

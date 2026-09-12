@@ -2258,6 +2258,26 @@ while importing (`pending_commits`). The follower-drags-the-fleet coupling itsel
 gate throttles the whole flood) is the bench's shape and stays; it is what a real network's
 mempool gossip would not do.
 
+**loop150 (2026-09-12 07:40-07:52 EDT): the SYNCING commit fix; the stall is back and the reorg
+path is what kills the leg.** Two legs:
+
+    leg          win1          win2          win3          round     what happened
+    loop150 A1   255,247 (47)        0             0        7.66M    a 9.5 s stall at a tenure change, TC, sibling 129' re-proposed, chain stood at 129
+    loop150 A2   308,477 (57)  135,756 (25)  195,534 (36)  19.20M    the same stall and a poisoned stretch, recovered when the tenure changed
+
+The tick did not remove the leader's stall (one per leg again, `own block imported by header ...
+total_ms=9457`), and the tick itself never came late: the engine service task was polled every
+quarter second throughout, so the request was not sitting in front of an unpolled task -- it was
+not yet in the channel, or the tree's handling of it took the time. What the stall then does is
+now the reproducible part: the TC, the sibling, the fork insert executing an empty body, the
+forest's `DeltaBase` refusal on the switch to a shorter sibling, and every header after it
+rejected. Both are fixed in `0a8dfc2e2` (the sealed block is found, not taken, and a payload
+with no transactions for a block this node sealed with some is refused so the validator falls back
+to the full payload; the measured delta rewinds below the persisted cursor when a move recorded
+the rewind -- `a_switch_to_a_shorter_sibling_rewinds_the_persisted_cursor`). The driver's
+SYNCING commit fix from loop149 fired three times in A2 (`the commit waits for its import`).
+loop151 measures the reorg fixes: a stall and a TC must cost their seconds and nothing more.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

@@ -485,7 +485,11 @@ loop147), neither reachable while the chain does not fork:
   entries were appended after the branch it replaced had filed its own, and the delta's cursor
   bookkeeping assumes the file's tail is the branch being extended.
 
-Until both are fixed, a leader's node that goes through this diverges and its tenure is lost.
-The trigger (reth's persistence backpressure stalling the engine for ~9 s) is removed by the
-bench's `--engine.persistence-backpressure-threshold 1024`; the case to exercise on purpose is
-a TC during a leader's tenure with a fresh build in its engine.
+Both fixed in `0a8dfc2e2` (`built_executions::find_sealed` + the header-only guard in
+`engine_validator`; `QmdbForest::delta_since` rewinding to the move's low-water mark), measured
+by loop151. The stall that triggers the TC (7-10 s before the leader's own-block `newPayload`
+is answered, at some tenure changes) is still open: it is not reth's persistence backpressure
+(count 0), not a slow branch of the node launcher's engine service loop, and not that loop
+going unpolled (its 250 ms tick never came late); what remains is the request not reaching the
+channel in time or the tree's handling of what precedes it. The case to exercise on purpose is a
+TC during a leader's tenure with a fresh build in its engine.
