@@ -408,6 +408,8 @@ where
     // not hold a runtime worker.
     let (parent_hash, number, state_root, receipts_root, gas_used, transactions_root) =
         (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used, Some(header.transactions_root));
+    let stage = crate::follower_import::HandoffStage(number);
+    stage.at(1);
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if build_on_seal() {
             n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
@@ -422,6 +424,7 @@ where
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = built.block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
     let handoff_at = std::time::Instant::now();
+    stage.at(2);
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, std::time::Duration::ZERO)
         .await
         .ok_or("the engine did not take the executed block")?;
@@ -434,9 +437,12 @@ where
     // validator's fallback sends the whole payload and the engine converts
     // it the ordinary way.
     let payload_at = std::time::Instant::now();
+    stage.at(3);
     let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, Vec::new(), withdrawals, None);
     let payload_ms = payload_at.elapsed().as_millis() as u64;
+    stage.at(4);
     let status = engine.new_payload(data).await.map_err(|e| format!("engine: {e}"))?;
+    drop(stage);
     if !status.status.is_valid() {
         return Err(format!("engine answered {:?} to the header-only payload", status.status));
     }

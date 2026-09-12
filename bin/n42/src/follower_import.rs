@@ -45,6 +45,32 @@ pub static IMPORT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Names the stages of [`IMPORT_STAGE`].
 pub const IMPORT_STAGES: [&str; 8] = ["idle", "header", "senders", "execution", "checks", "carry", "qmdb-root", "hashed-state"];
 
+/// The leader's own-block hand-off in progress, `(block number << 8) | stage`
+/// into [`HANDOFF_STAGES`], 0 when none: the header-only import's lookup,
+/// the hand-off to the engine and the engine's `newPayload`. The watchdog
+/// reads it: an engine that took 10 s to answer the own block's `newPayload`
+/// at a tenure change (loop146 A1, the driver's commit forkchoice timing out
+/// behind it) left no line saying what it was doing.
+pub static HANDOFF_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Names for [`HANDOFF_STAGE`]'s low byte.
+pub const HANDOFF_STAGES: [&str; 8] = ["idle", "lookup", "handoff", "payload", "new-payload", "-", "-", "-"];
+
+/// Sets [`HANDOFF_STAGE`] while alive, clears it on drop.
+pub struct HandoffStage(pub u64);
+
+impl HandoffStage {
+    /// Records the stage for the block.
+    pub fn at(&self, stage: u64) {
+        HANDOFF_STAGE.store((self.0 << 8) | stage, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for HandoffStage {
+    fn drop(&mut self) {
+        HANDOFF_STAGE.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Bumped every time a block lands in the engine here (a direct import, the
 /// leader's own block), for [`wait_for_parent`]: under deferred execution
 /// the next block's check starts the moment its parent is in.

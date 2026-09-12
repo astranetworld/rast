@@ -326,17 +326,18 @@ fn main() {
                 n42::stacks::install();
             }
             std::thread::Builder::new().name("n42-watchdog".into()).spawn(move || {
-                let mut last = ((0u64, 0u64), std::time::Instant::now());
-                let mut dumped_at = (0u64, 0u64);
+                let mut last = ((0u64, 0u64, 0u64), std::time::Instant::now());
+                let mut dumped_at = (0u64, 0u64, 0u64);
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     let import = n42::follower_import::IMPORT_STAGE.load(std::sync::atomic::Ordering::Relaxed);
                     let build = n42_engine_types::BUILD_STAGE.load(std::sync::atomic::Ordering::Relaxed);
-                    if (import, build) != last.0 {
-                        last = ((import, build), std::time::Instant::now());
+                    let handoff = n42::follower_import::HANDOFF_STAGE.load(std::sync::atomic::Ordering::Relaxed);
+                    if (import, build, handoff) != last.0 {
+                        last = ((import, build, handoff), std::time::Instant::now());
                         continue;
                     }
-                    if (import == 0 && build == 0) || last.1.elapsed() < std::time::Duration::from_secs(6) {
+                    if (import == 0 && build == 0 && handoff == 0) || last.1.elapsed() < std::time::Duration::from_secs(6) {
                         continue;
                     }
                     tracing::warn!(
@@ -346,12 +347,14 @@ fn main() {
                         import_stage = n42::follower_import::IMPORT_STAGES[(import & 0xff) as usize % 8],
                         build_parent = build >> 8,
                         build_stage = n42_engine_types::BUILD_STAGES[(build & 0xff) as usize % 8],
-                        "the import or the build has not progressed",
+                        handoff_block = handoff >> 8,
+                        handoff_stage = n42::follower_import::HANDOFF_STAGES[(handoff & 0xff) as usize % 8],
+                        "the import, the build or the own-block hand-off has not progressed",
                     );
                     // One dump per stall: the same stages stuck again six
                     // seconds later are the same stall.
-                    if dump_stacks && dumped_at != (import, build) {
-                        dumped_at = (import, build);
+                    if dump_stacks && dumped_at != (import, build, handoff) {
+                        dumped_at = (import, build, handoff);
                         let answered = n42::stacks::dump_all(std::time::Duration::from_millis(300));
                         tracing::warn!(target: "n42.watchdog", answered, "thread stacks written to stderr");
                     }

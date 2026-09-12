@@ -411,7 +411,7 @@ under N+1. First fleet round (35zzn, gov5-only) queued behind the BLAKE3
 tx-root round with a bench-only gate override; the fixture (F-2..F+3) from
 your side will go into our header tests as agreed.
 
-## 14. Audit of the session's code (2026-09-12 05:30), what it found and what changed
+## 16. Audit of the session's code (2026-09-12 05:30), what it found and what changed
 
 Two independent reviews of `2706d1b6b..HEAD` (builder/store side, follower/driver side). Fixed:
 
@@ -455,3 +455,15 @@ recipient spending what it received in the same block (the check refuses; the bl
 ordinary path); the provisional post-state is a bundle clone per block (~60 MB) until the
 finish replaces it.
 
+### 16.1 What the bench found in the audited build (loop143-145)
+
+- A block queued behind the two imports in flight was not "importing": the new leader proposed
+  on it and the tenure timed out. `is_importing` covers the queue (`590a7cf30`); the check's
+  intrinsic-gas pass runs inside the per-sender parallel loop, and the seal-first fold does not
+  re-insert every account into the cache (both were regressions of the audit's own changes).
+- The commit for a queued block ran a forkchoice the engine answered SYNCING; the driver took
+  that as a rejection, withdrew the block's vote evidence and the node's head stopped (loop144 A1,
+  node0 at 173 with consensus at view 327). A queued block's commit now waits for its import like
+  an executing one's, and a refused forkchoice is a warning and `Ignored` (`a2f924705`).
+- Not deferred execution's, but found by these legs: the transaction queue stranded the sender
+  whose run a full block cut short (`5e52dcd64`, `NATIVE_FLEET7.md` loop143-145).

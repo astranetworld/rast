@@ -2118,6 +2118,68 @@ The batch stays at 128. On this box the supply wall is therefore what it is: sev
 verifying every transaction at ~20 us on 16 cores beside their execution; the next step for
 supply is one keccak a transaction and, past that, a box per node.
 
+**loop143-145 (2026-09-12 05:40-06:31 EDT): the audited build on the bench -- two regressions,
+one liveness defect, and the queue's stranded sender.** The audit's fixes (`docs/PHASE_D_DEFERRED_EXECUTION.md`
+section 16) measured on the adopted configuration (gated bench genesis, seal-first, pacing 350),
+two legs a build:
+
+    leg          build                  win1          win2     win3     what happened
+    loop143 A1   9f0244b5f (audit)      284,806 (54)  119,557  225,656  tenure timeouts: a queued block was not "importing"
+    loop143 A2   9f0244b5f              300,210 (56)  142,924   28,041  window 3 at 17% occupancy (see loop144 A2)
+    loop144 A1   590a7cf30              300,245 (56)        0        0  node0's head stuck at 173 while consensus ran on
+    loop144 A2   590a7cf30              316,429 (59)    5,468        0  the leader's blocks 163k, 126k, 32k, 0; flood stalled
+    loop145 A1   a2f924705              296,666 (55)  211,481  193,739  full round, 21.07M
+    loop145 A2   a2f924705              242,516 (46)  224,726  203,987  full round, 20.14M (0.65 s window-1 cycle)
+
+loop143's regressions were the audit's own: a block queued behind the two imports in flight did
+not count as importing (the new leader proposed on it, the tenure timed out), the check's
+intrinsic-gas pass ran serially (+40 ms), and the seal-first fold's cache inserts were back
+(+36 ms) -- `590a7cf30`. loop144 A1 is the liveness defect the fix uncovered: the commit for a
+*queued* block ran a forkchoice the engine refused (SYNCING), the driver took the refusal as a
+rejection, withdrew the vote evidence, and the measured node's canonical head stopped at 173
+while the chain went on to view 327; the commit of a queued block now waits like an executing
+one's, and a refused forkchoice is a log line (`a2f924705`).
+
+loop144 A2 (and loop143 A2's window 3) is older than any of this. The leader's blocks shrank
+163k -> 126k -> 32k -> 0 fifty blocks into its tenure while every node's queue, its own included,
+counted 164,056 transactions; the flood had stopped at +55 s with no reply from any node; the next
+leader's first block took 163,000 of those same transactions. The queue (`crates/n42/tx-queue`)
+takes runs of 64 consecutive nonces per sender (`N42_TX_QUEUE_RUN=64`, the record configuration
+since round 39), and a full block stops the build in the middle of a run nearly every time. The
+next build's start dropped the run's cursor -- and its sender: the lane stayed flagged as queued
+but was in neither the arrival order nor the cursor, nothing offered it again, and every later
+transaction of that sender joined the stranded lane. One sender a block; the flood keeps feeding
+a stranded sender (its frames are answered by the pool, not the rotation), so by the second half
+of a 64-view tenure the stranded lanes held most of the leader's queue count, the ingest gate
+(queue depth >= 407,500) closed on that count, the flood stalled, and the rotation ran dry. loop145
+A1's per-tenure shapes show the mild form: every tenure's first ~25 blocks full, then partial
+blocks (27k, 108k, 118k ...) in its second half, and the next leader starting full again, since
+its lanes were whole and its predecessor's stranded lanes are pruned as it mines them. This is in
+every round since 875d454bc (2026-09-02) and is part of why windows 2-3 read well under window 1.
+Fixed in `5e52dcd64`: the build's start returns the run's sender to the front of the arrival
+order; a regression test cuts a run short and checks the next build offers that sender first.
+
+**loop146 (2026-09-12 06:34-06:46 EDT): the queue fix -- every block full through the round,
+327,484 / 238,126 and 22.33M.** The same binary plus `5e52dcd64`, two legs:
+
+    leg          win1          win2          win3          full blocks        round total
+    loop146 A1   244,159 (45)  244,034 (45)  160,391 (30)  43/45 44/45 27/30  19.46M
+    loop146 A2   327,484 (61)  238,126 (44)  178,687 (39)  59/61 43/44 32/39  22.33M
+
+No leader built a partial block in the second half of its tenure any more (node2's 61 blocks
+all full; node3's 63 with four at 135-145k), and window 2 reads 238-244k at 99.7-99.9%
+occupancy where the previous legs read 211-226k at 92-95% -- the best second window on the
+deferred build. A1's first window lost 8 s to a stall at a tenure change: the new leader's
+execution layer answered the header-only `newPayload` of its own first block after 10.6 s
+(the driver's commit forkchoice queued behind it timed out at the validator's 8 s HTTP limit,
+a TC formed and the leader re-proposed); the same transport timeout appears once in loop141
+P350a, loop143 A1/A2 and loop145 A2, so it is a recurring ~8-10 s stall at some handovers, not
+the queue fix. The execution layer logs nothing for those 10 s; the watchdog now tracks the
+own-block hand-off (`HANDOFF_STAGE`) and loop147 runs the profiling build with
+`N42_WATCHDOG_STACKS=1` to get the engine thread's stack. Windows 3 are the late-window memory
+phase as before (the flood itself was down to 104k/s at the end of A2).
+
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
