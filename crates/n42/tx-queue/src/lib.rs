@@ -78,6 +78,8 @@ struct Inner<T: PoolTransaction> {
     /// The sender a build is taking a run from, and how much of the run is
     /// left. See [`run_length`].
     current: Option<(Address, usize)>,
+    /// Consecutive nonces a build takes from one sender before moving on.
+    run: usize,
 }
 
 /// How many consecutive nonces a build takes from one sender before moving
@@ -136,8 +138,13 @@ impl<T: PoolTransaction> Default for TxQueue<T> {
 }
 
 impl<T: PoolTransaction> TxQueue<T> {
-    /// An empty queue.
+    /// An empty queue, taking runs of `N42_TX_QUEUE_RUN` per sender.
     pub fn new() -> Self {
+        Self::with_run_length(run_length())
+    }
+
+    /// An empty queue taking `run` consecutive nonces per sender per turn.
+    pub fn with_run_length(run: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 lanes: AddressHashMap::default(),
@@ -148,6 +155,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 gaps: Vec::new(),
                 held: VecDeque::new(),
                 current: None,
+                run: run.max(1),
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -391,7 +399,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 _ => {}
             }
             inner.last_build = Some((parent, Vec::new()));
-            inner.current = None;
+            inner.end_run();
         }
         QueueBest { queue: self.clone(), skipped: AddressHashSet::default(), buffer: VecDeque::new(), batch: queue_batch() }
     }
@@ -475,6 +483,30 @@ impl<T: PoolTransaction> Inner<T> {
         // A now-empty lane leaves the arrival order when its turn comes.
     }
 
+    /// Ends the run in progress: the sender it was taking from goes back to
+    /// the front of the arrival order if its lane still holds anything, so
+    /// the next build offers it first.
+    ///
+    /// A build stops mid-run whenever the block fills, which at the bench
+    /// tier is every full block. Dropping the cursor instead (what the
+    /// next build's start did through loop145) left that sender's lane
+    /// queued but in neither the order nor the cursor: nothing offered it
+    /// again, and its later arrivals joined the same stranded lane. A leader
+    /// stranded one sender a block, and by the second half of a 64-view
+    /// tenure the stranded lanes held most of what its queue counted -- the
+    /// ingest gate closed on that count, the flood stalled, and the leader
+    /// built partial and then empty blocks (loop144 A2: 163k, 126k, 32k, 0)
+    /// until the next leader, whose lanes were whole, mined them.
+    fn end_run(&mut self) {
+        let Some((sender, _)) = self.current.take() else { return };
+        let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        if lane.by_nonce.is_empty() {
+            lane.queued = false;
+        } else {
+            self.arrivals.push_front(sender);
+        }
+    }
+
     /// The next transaction: the lowest nonce of the sender at the front of
     /// the arrival order, skipping senders the build marked.
     fn next_ready(&mut self, skipped: &AddressHashSet) -> Option<Arc<ValidPoolTransaction<T>>> {
@@ -508,7 +540,7 @@ impl<T: PoolTransaction> Inner<T> {
                 }
             }
         }
-        let run = run_length();
+        let run = self.run;
         let mut passes = self.arrivals.len();
         while passes > 0 {
             passes -= 1;
@@ -853,5 +885,29 @@ mod tests {
         let mut best = queue.best_for_build(B256::repeat_byte(1));
         assert_eq!(best.next().unwrap().nonce(), 4);
         assert!(best.next().is_none());
+    }
+
+    /// A build that stops in the middle of a sender's run (the block filled)
+    /// must not lose that sender: the next build offers its lane first, and
+    /// what arrives for it meanwhile is offered too.
+    #[test]
+    fn a_sender_whose_run_a_full_block_cut_short_is_offered_by_the_next_build() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        queue.push((0..8).map(|n| tx(1, n)).chain((0..2).map(|n| tx(2, n))));
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        // Two of sender 1's run of four, then the block is full.
+        assert_eq!(best.next().map(|t| (t.sender().as_slice()[0], t.nonce())), Some((1, 0)));
+        assert_eq!(best.next().map(|t| (t.sender().as_slice()[0], t.nonce())), Some((1, 1)));
+        drop(best);
+        // The chain mined them; a later arrival for the same sender.
+        queue.remove_mined_batch([(Address::repeat_byte(1), 1)]);
+        queue.push([tx(1, 8)]);
+        assert_eq!(queue.len(), 9);
+        // The next build: sender 1 first, and everything queued is offered.
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let order: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        assert_eq!(order[0], (1, 2));
+        assert_eq!(order.len(), 9, "{order:?}");
+        assert!(queue.is_empty());
     }
 }
