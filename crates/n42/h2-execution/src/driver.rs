@@ -1098,8 +1098,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
     /// Commit path: makes a committed block the head and the finalised block.
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
-        if self.executing.contains(&block_hash) {
-            // Still importing: the forkchoice follows the import's success.
+        if self.is_importing(&block_hash) {
+            // Still importing, or queued behind the imports in flight: the
+            // forkchoice follows the import's success.
             self.pending_commits.insert(block_hash);
             return DriverAction::Ignored;
         }
@@ -1115,10 +1116,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             .await
         {
             Ok(updated) => match updated.payload_status.status {
-                PayloadStatusEnum::Invalid { validation_error } => DriverAction::Rejected {
-                    block_hash,
-                    reason: validation_error.to_string(),
-                },
+                PayloadStatusEnum::Invalid { validation_error } => {
+                    // A forkchoice the engine refused is not an execution
+                    // verdict on the block (`Rejected` withdraws a block's
+                    // import evidence): logged, and the next commit moves on.
+                    warn!(target: "n42.h2.el", block = ?block_hash, %validation_error, "forkchoice to a committed block refused");
+                    DriverAction::Ignored
+                }
                 _ => {
                     self.head = block_hash;
                     // Committed blocks never need re-execution.
@@ -1127,10 +1131,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     DriverAction::Finalized { block_hash }
                 }
             },
-            Err(error) => DriverAction::Rejected {
-                block_hash,
-                reason: error.to_string(),
-            },
+            Err(error) => {
+                warn!(target: "n42.h2.el", block = ?block_hash, %error, "forkchoice to a committed block failed");
+                DriverAction::Ignored
+            }
         }
     }
 }
