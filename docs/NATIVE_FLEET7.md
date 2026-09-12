@@ -2097,6 +2097,27 @@ late-window memory phase, not the pacing: P350b held 40 blocks there. Adopted: t
 default pacing is 350 ms (`fleet7-bench.sh`; the launchers' `PACE`). Records: window 1 333,416
 (P350a), the round 22,518,476 (P350b).
 
+**loop142 (2026-09-12 04:47-05:09 EDT): the Ed25519 batch size does not move the ingest.** At the
+new configuration (seal-first, pacing 350), `N42_ED25519_BATCH` 128 (the record setting) against
+256 and 512, judged by the ingest's own cost line (`recover_us_per_tx`, `slots_busy_pct` on
+node1, medians over the flood) and window 1:
+
+    leg    batch  win1          win2     win3     recover us/tx   slots busy
+    W      128    317,162 (59)  159,840  203,628  22-23           22-24%
+    B256a  256    326,008 (61)  223,270  122,935  22              24%
+    B512   512    310,768 (58)  214,567  175,022  20              23%
+    B128   128    327,080 (61)  147,684  183,629
+    B256b  256    331,979 (62)  223,790  163,852
+
+The per-transaction cost of the ingest is 20-23 us whatever the batch: pippenger's per-signature
+cost falls with the batch, but it is not where the time is -- the profile's `pow2k` (loop136) is
+the decompression of R, one per signature and not batchable, and the key half of it is gone
+already (the key cache). What is left per transaction on every node is ~11 us of curve
+arithmetic, the keccaks of the transaction hash and the sender, the decode and the queue insert.
+The batch stays at 128. On this box the supply wall is therefore what it is: seven nodes each
+verifying every transaction at ~20 us on 16 cores beside their execution; the next step for
+supply is one keccak a transaction and, past that, a box per node.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
