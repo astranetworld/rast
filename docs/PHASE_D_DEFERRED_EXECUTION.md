@@ -467,3 +467,25 @@ finish replaces it.
   an executing one's, and a refused forkchoice is a warning and `Ignored` (`a2f924705`).
 - Not deferred execution's, but found by these legs: the transaction queue stranded the sender
   whose run a full block cut short (`5e52dcd64`, `NATIVE_FLEET7.md` loop143-145).
+
+### 16.2 Open: the reorg path after a sibling re-proposal (loop147)
+
+A leader whose tenure is cut by a TC after it handed a block to its engine re-proposes the
+height with a different block. loop147 showed two defects behind that (`NATIVE_FLEET7.md`
+loop147), neither reachable while the chain does not fork:
+
+- The header-only own-block `newPayload` (`request::OWN_BLOCK`, an empty transaction list; the
+  engine's conversion takes the sealed block from `built_executions::take_sealed`) executed an
+  empty body when the sealed block was gone from the store, and `validate_block_post_execution`
+  then recorded receipts root empty / gas 0 for the block. The conversion must refuse a payload
+  whose body does not hash to the header's transactions root, so the validator falls back to
+  the full payload as designed.
+- The QMDB forest with the entry file (`N42_QMDB_ENTRY_FILE=1`) could not follow the canonical
+  switch to the sibling: `delta expected append cursor 16218563, found 16234384` -- the sibling's
+  entries were appended after the branch it replaced had filed its own, and the delta's cursor
+  bookkeeping assumes the file's tail is the branch being extended.
+
+Until both are fixed, a leader's node that goes through this diverges and its tenure is lost.
+The trigger (reth's persistence backpressure stalling the engine for ~9 s) is removed by the
+bench's `--engine.persistence-backpressure-threshold 1024`; the case to exercise on purpose is
+a TC during a leader's tenure with a fresh build in its engine.

@@ -40,7 +40,7 @@ use reth_provider::{
 use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
-use reth_tracing::tracing::{debug, error, info};
+use reth_tracing::tracing::{debug, error, info, warn};
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -329,9 +329,29 @@ impl EngineNodeLauncher {
             // advance the chain and await payloads built locally to add into the engine api
             // tree handler to prevent re-execution if that block is received as payload from
             // the CL
+            // N42: the engine's messages reach the tree only through this loop. A
+            // leader's own-block newPayload has sat 7-10 s between the handle and
+            // the tree while the tree idled (loop147-148, a stack dump each): every
+            // branch is timed, a slow one is a warning, and a tick guarantees the
+            // orchestrator is polled again within a quarter second whatever woke
+            // or failed to wake the task.
+            let mut service_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+            service_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_branch_done = std::time::Instant::now();
+            let slow_branch = |name: &str, started: std::time::Instant, since_previous: std::time::Duration| {
+                let took = started.elapsed();
+                if took > std::time::Duration::from_millis(300) || since_previous > std::time::Duration::from_secs(3) {
+                    warn!(target: "reth::cli", branch = name, took_ms = took.as_millis() as u64, idle_before_ms = since_previous.as_millis() as u64, "engine service loop: a slow branch or a long idle");
+                }
+            };
             loop {
                 tokio::select! {
+                    _ = service_tick.tick() => {
+                        // Nothing to do: the next iteration polls the orchestrator.
+                    }
                     event = orchestrator.next() => {
+                        let branch_started = std::time::Instant::now();
+                        let idle_before = branch_started.duration_since(last_branch_done);
                         let Some(event) = event else { break };
                         debug!(target: "reth::cli", "Event: {event}");
                         match event {
@@ -377,12 +397,18 @@ impl EngineNodeLauncher {
                                 event_sender.notify(ev);
                             }
                         }
+                        slow_branch("orchestrator", branch_started, idle_before);
+                        last_branch_done = std::time::Instant::now();
                     }
                     payload = built_payloads.select_next_some(), if !built_payloads.is_terminated() => {
+                        let branch_started = std::time::Instant::now();
+                        let idle_before = branch_started.duration_since(last_branch_done);
                         if let Some(executed_block) = payload.executed_block() {
                             debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
                         }
+                        slow_branch("built_payloads", branch_started, idle_before);
+                        last_branch_done = std::time::Instant::now();
                     }
                     insert = async {
                         match executed_inserts.as_mut() {
@@ -390,6 +416,8 @@ impl EngineNodeLauncher {
                             None => std::future::pending().await,
                         }
                     } => {
+                        let branch_started = std::time::Instant::now();
+                        let idle_before = branch_started.duration_since(last_branch_done);
                         match insert {
                             Some(insert) => {
                                 let handed = match insert.block.downcast() {
@@ -404,6 +432,8 @@ impl EngineNodeLauncher {
                             // Every sender gone: nothing more will come this way.
                             None => executed_inserts = None,
                         }
+                        slow_branch("executed_insert", branch_started, idle_before);
+                        last_branch_done = std::time::Instant::now();
                     }
                     shutdown_req = &mut shutdown_rx => {
                         if let Ok(req) = shutdown_req {

@@ -2180,6 +2180,60 @@ own-block hand-off (`HANDOFF_STAGE`) and loop147 runs the profiling build with
 phase as before (the flood itself was down to 104k/s at the end of A2).
 
 
+**loop147 (2026-09-12 06:51-07:00 EDT): the tenure-change stall caught -- reth's persistence
+backpressure -- and what a sibling re-proposal does to the leader.** The profiling build with
+`N42_WATCHDOG_STACKS=1`: the watchdog fired on node3 six seconds into its own block 192's
+`newPayload` (hand-off stage "new-payload") and dumped 195 threads. The engine thread was idle
+in its `select` -- and reth's engine loop selects only on the persistence channel while a
+persistence cycle is running and more than `persistence-backpressure-threshold` (default 16)
+blocks beyond the buffer target await it. The persistence thread was in the middle of writing
+`HashedAccounts` to MDBX (`DatabaseProvider::write_hashed_state`, ~150,000 accounts a block, a
+batch of eight blocks in ~9 s). So the leader's own-block `newPayload` and the driver's commit
+forkchoice sat in the engine's channel for 9-10 s, the validator's 8 s transport limit fired, a
+TC formed. The stall is reth's soft backpressure, not ours; `fleet7-env.sh` now passes
+`--engine.persistence-backpressure-threshold 1024` (`F7_PERSIST_BACKPRESSURE`), so the engine
+never waits for persistence and the blocks wait in memory. loop148 measures it.
+
+Both loop147 legs then died at the handover, which loop146 A1 had survived by luck: after the
+TC the leader re-proposed the *same height* with a different block (193', a sibling of the 193
+it had already handed to its engine), and the engine took the sibling as a fork -- executed it
+with a header-only payload whose sealed block was no longer in the store (an empty body, so the
+registry got receipts root empty / gas 0 for 193'), and on the canonical switch to the sibling
+QMDB logged `head could not follow the canonical chain: delta expected append cursor 16218563,
+found 16234384`. From there every header the leader built carried fields the followers could
+not have executed (`deferred execution: header carries ... this node executed ...`), every
+proposal was rejected, and the chain stood until the leg ended (A1 at 193, A2 at 92 with a
+state-root mismatch of the same origin). Two defects on the reorg path, reachable only through
+a sibling re-proposal: the header-only own-block payload must fail loudly when its sealed block
+is gone instead of executing an empty body, and the entry-file forest must follow a canonical
+switch to a sibling. Both are open (`docs/PHASE_D_DEFERRED_EXECUTION.md` section 16.2); with the
+stall gone the trigger is gone, and a leader whose own tenure is cut by a TC is the case to test
+on purpose next.
+
+    leg          win1          win2          win3      what happened
+    loop147 A1   304,070 (56)   86,250 (16)        0    stall at 192 (dump), sibling 193' re-proposed, chain stood at 193
+    loop147 A2   257,116 (48)        0             0    the same at 92
+
+**loop148 (2026-09-12 07:07-07:16 EDT): the backpressure flag is not the stall.** Two legs with
+`--engine.persistence-backpressure-threshold 1024`:
+
+    leg          win1          win2          win3          round     what happened
+    loop148 A1   266,149 (49)  244,270 (45)  217,128 (40)  21.84M    full round, every block full; one 9 s stall at a tenure change (no TC)
+    loop148 A2   270,089 (50)        0             0        8.10M    a 7 s stall, TC, sibling re-proposal, chain stood at 131
+
+`backpressure_stall_duration_count` was 0 on every node: reth's persistence backpressure never
+engaged (each persistence cycle averages 1.3 s here, 109 cycles a leg, but the gap never reached
+the threshold). The engine still took 7-9 s to answer the leader's own-block `newPayload` at a
+tenure change, and it answers the moment *another* engine request arrives (the validator's 8 s
+forkchoice retry in loop147 and A1; A2 woke on its own after 7.0 s). With the stack dump showing
+the tree idle in `select` and every tokio worker parked, the message sat unforwarded between the
+`ConsensusEngineHandle` and the tree: the engine service task in the node launcher's event loop
+(`crates/node/builder/src/launch/engine.rs`, a `tokio::select!` over the orchestrator, the built
+payloads and the executed-block hand-offs). loop149 instruments that loop. The flag stays (it is
+harmless and the persistence cycle is slow), the reorg-path defects (section 16.2) are what turn
+the stall into a dead chain: A1 survived its stall because no TC formed.
+
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

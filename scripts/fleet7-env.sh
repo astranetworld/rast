@@ -454,6 +454,13 @@ f7_el_args() {
       # exceed the threshold. Memory: eight executed blocks held in memory.
       --engine.persistence-threshold "${F7_PERSIST_THRESHOLD:-8}"
       --engine.memory-block-buffer-target "${F7_BLOCK_BUFFER_TARGET:-6}"
+      # reth stops draining engine messages while a persistence cycle runs and more than this
+      # many blocks beyond the buffer target await it (default 16). A cycle here writes ~150k
+      # hashed accounts a block to MDBX and takes seconds; the leader's own-block newPayload and
+      # the commit forkchoice then waited 8-10 s (loop146-147, a stall and a TC at a tenure
+      # change every other leg). Raised so the engine never stalls on persistence; the blocks
+      # wait in memory instead.
+      --engine.persistence-backpressure-threshold "${F7_PERSIST_BACKPRESSURE:-1024}"
       # F7_EL_EXTRA: any further execution-layer flags, for a single-variable
       # round (e.g. --engine.disable-prewarming). Word-split on purpose.
       ${F7_EL_EXTRA:-}
