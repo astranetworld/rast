@@ -340,6 +340,7 @@ where
 {
     fn build_on_own(&self, request: crate::direct_build::BuildOnOwnRequest) -> Result<EthBuiltPayload, String> {
         let crate::direct_build::BuildOnOwnRequest { parent, parent_execution, attributes } = request;
+        let pre_at = std::time::Instant::now();
         let parent_hash = parent.hash();
         let executed = crate::direct_build::executed_under_seal(&parent, &parent_execution);
         let opener = crate::direct_build::opener_on_built_parent(self.client.clone(), parent.parent_hash, executed);
@@ -392,6 +393,7 @@ where
             }),
             parent_built: Some(parent_built),
         };
+        let pre_ms = pre_at.elapsed().as_millis() as u64;
         let started = std::time::Instant::now();
         let worker = std::thread::Builder::new()
             .name("build-on-own".into())
@@ -407,6 +409,9 @@ where
                 Ok(payload) => {
                     let number = payload.block().header().number;
                     let sealed_ms = started.elapsed().as_millis() as u64;
+                    if payload.block().body().transactions.len() >= 1000 {
+                        tracing::info!(target: "payload_builder", number, pre_ms, sealed_ms, "build on the sealed block answered on the early seal");
+                    }
                     // The thread finishes the block; its outcome is a log
                     // line, its failure the handoff's problem to report.
                     std::thread::Builder::new()
@@ -759,6 +764,7 @@ where
     let mut par_committed = 0usize;
     let mut deferred: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> = Vec::new();
     let mut par_reverts: Vec<(alloy_primitives::Address, revm::database::AccountRevert)> = Vec::new();
+    let mut par_drained = false;
     if parallel_build() && pulled.is_some() {
         let par_at = std::time::Instant::now();
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
@@ -772,6 +778,8 @@ where
                 }
             }
         }
+        // The queue had less than a block: nothing more will come this build.
+        par_drained = cands.len() < budget;
         par_pull_ms = par_at.elapsed().as_millis() as u64;
         if cands.len() > budget {
             let extra = cands.split_off(budget);
@@ -897,7 +905,9 @@ where
     // post-state, the QMDB root and the receipts follow behind the seal --
     // the next build on this block waits for the state, the engine's handoff
     // for the rest.
-    let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
+    // Full, or the queue had no more to give: either way the serial loop
+    // would add nothing now.
+    let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS || par_drained;
     let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     if let Some(early) = early_seal.take() {
         if deferred_now && hotstuff && !is_amsterdam && block_full && par_txs > 0 && block_blob_count == 0 && qmdb.is_some() {
@@ -974,6 +984,7 @@ where
             let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
             hook(payload.clone());
             let sealed_ms = seal_at.elapsed().as_millis() as u64;
+            let sealed_at_ms = build_started.elapsed().as_millis() as u64;
             build_stage.at(5);
 
             // ---- behind the seal ----
@@ -1076,12 +1087,16 @@ where
                     target: "payload_builder",
                     number = block_number,
                     txs = tx_count,
+                    setup_ms = setup_took.as_millis() as u64,
+                    par_ms,
                     par_pull_ms,
+                    par_part_ms,
                     par_exec_ms,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,
                     sealed_ms,
+                    sealed_at_ms,
                     merge_ms,
                     state_ready_ms,
                     roots_ms,
