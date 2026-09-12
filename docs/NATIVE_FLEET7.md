@@ -1984,6 +1984,37 @@ loop137 K legs), verify in larger batches, and hash a transaction once. The lead
 chain (loop135) competes with this ingest load on the same 16 cores, which is why its
 par_exec read 96 ms against 54 under load.
 
+**loop137 (2026-09-12 02:16-02:48 EDT): the leader seals before it finishes -- 306,538 -- and the
+Ed25519 key cache.** Stage 3 of deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md` section
+13, `N42_SEAL_FIRST=1`, S legs) and the verifying-key cache from loop136's profile (on by default;
+`N42_ED25519_KEY_CACHE=0` on K1), on the gated bench genesis, record configuration. S0 first: a
+10,000-transaction tier as a smoke of the seal-first path (its supply collapsed on that tier's
+25k-slot pool, not on the path: 30 early seals on node1's tenure, no failed finish, no import
+failure, the chain on the 450 ms pacing).
+
+    leg  win1          win2     win3     blocks/window   note
+    W    296,621 (56)  213,763  203,802  56 / 41 / 39    key cache on
+    C1   301,358 (56)  225,414  212,949  56 / 43 / 40    key cache on
+    S1   301,987 (57)  205,447  199,429  57 / 39 / 38    seal first (52+39 early seals on two tenures)
+    K1   292,214 (54)  215,034  179,493  54 / 41 / 36    key cache off
+    C2   297,093 (55)  210,923  197,097  55 / 40 / 38
+    S2   306,538 (57)  216,350  173,729  57 / 42 / 36    seal first
+
+The key cache is worth 2-3% (K1 292k against 297-301k; the ingest's recovery 23 us a
+transaction at 23% of its slots against 24-26 us at 27-28%). Seal-first reads 302k / 307k at
+57 blocks against 297-301k at 55-56: the seal now goes out while the fold's finish, the hashed
+post-state, the QMDB root and the receipts run behind it (all 91 early seals finished; the
+followers never noticed), but the cycle moved only 0.536 -> 0.526 s. The reason, from the
+leader's timeline: the validator asks for the next build the moment it seals a block, and the
+execution layer answers with the early seal ~450 ms later, of which the builder's own phases
+(pull 18, execution 43, fold 97, transactions root 40-65, seal ~10) are ~230; the rest is
+before the parallel step -- the parent's body cloned for the state overlay, the overlay itself,
+the queue's `best_for_build`, the puller's start -- and is not on the phases line yet. loop138
+runs the same legs with those timed (`setup_ms`, `par_ms`, `sealed_at_ms`, and the pre-work in
+`build_on_own`). The transactions root is on the seal path now (it used to hide beside the
+QMDB root): 40-65 ms of a ~230 ms path, a parallel trie over 163,000 encodings; the fold (97-130)
+is the other half.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
