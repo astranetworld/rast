@@ -302,3 +302,15 @@ vote*, and the next block's check overlaps this block's import:
   the bench genesis with `deferredExecutionTime: 0`, against the same binary on the
   ungated genesis).
 
+## 12. Measured and adopted (2026-09-11 21:08)
+
+loop132-135 (`NATIVE_FLEET7.md`): four defects of the pipeline, each visible only at the
+bench tier -- a commit dropped while its block was importing, the far-ahead hold measuring
+against a tip that moved only when an import landed, the leader's own result recorded under the
+build's hash rather than the sealed one, and a new leader's build refused while its parent was
+still importing -- and then, on the same binary, window 1 299,865 / 302,811 at 56 blocks against
+293k ungated, window 2 +3-10%, the best round 22,200,112. The follower's check is ~130 ms, its
+import ~400 ms beside the loop, the cycle's median 485 ms; the leader's build chain (~430 ms a
+full block) is the cycle now. `n42_fleet7_bench.json` carries `deferredExecutionTime: 0`;
+`n42_fleet7.json` and the devnet stay ungated until the gov5 side has the rule (sections 8-9).
+

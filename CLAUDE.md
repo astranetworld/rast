@@ -96,7 +96,10 @@ lives in `scripts/fleet7-env.sh` and nowhere else. `up --fresh` / `status` / `wa
 0 rejected, block interval held).
 
 Throughput rounds are `scripts/fleet7-bench.sh` (one round: fresh datadirs at
-the 480M bench tier on `n42_fleet7_bench.json`, base-fee decay, flood,
+the 480M bench tier on `n42_fleet7_bench.json` -- which since 2026-09-11 carries
+`deferredExecutionTime: 0`, deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`: a header
+carries the parent's execution; a follower checks, votes, then imports beside the loop) --
+base-fee decay, flood,
 N x 30 s windows; `F7_BLOCK_INTERVAL_MS` paces in milliseconds and
 `F7_VIEW_TIMEOUT_MS` overrides the chain's baseTimeout, but a *tighter* one is
 worse: three runs each say 500 ms is 20% slower than the genesis 6,000 ms at

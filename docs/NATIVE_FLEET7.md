@@ -1907,6 +1907,47 @@ sending at +60 s (0/s, no replies, the ingest at 8% busy and the queue draining)
 loop131 or loop132 on the same box state; both are after the gov5 fleet's departure (7 GB of
 swapped tmpfs, 16.6 GB shmem). Not attributed yet; window 1 is the metric here.
 
+**loop134-135 (2026-09-11 20:18-21:08 EDT): deferred execution adopted -- 299,865 / 302,811 on window 1
+and the best round, 22,200,112.** The same binary on the bench genesis (C) and with the fork at
+genesis (A), record configuration; loop134 with the in-flight tip fix (defect 2 above), loop135
+with the tenure-handover fix on top:
+
+    round   leg  win1          win2     win3     blocks/window   round total
+    loop134 W    291,905 (54)  205,998  195,285  54 / 39 / 36
+    loop134 C1   296,584 (55)  214,037   15,835  55 / 41 / 26    (window 3: the flood's replies stalled, see loop133)
+    loop134 A1   246,718 (46)  190,214  210,946  46 / 39 / 36    one 6.9 s tenure change a window (defect 3)
+    loop134 C2   296,036 (55)  208,532  206,050  55 / 40 / 38
+    loop134 A2   249,543 (46)  226,828  190,469  46 / 45 / 39    as A1
+    loop135 W    293,390 (54)  212,046  208,459  54 / 40 / 39    21,423,980
+    loop135 C1   293,388 (54)  215,225  204,832  54 / 40 / 38    21,406,908
+    loop135 A1   299,865 (56)  234,236  205,234  56 / 45 / 41    22,200,112
+    loop135 C2   293,255 (54)  216,285  210,619  54 / 41 / 39    21,609,880
+    loop135 A2   302,811 (56)  222,215  177,157  56 / 42 / 44    21,074,272
+
+Defect 3 (loop134 A1/A2): at every tenure boundary (views 128, 192, 256) the new leader had voted
+for the parent on its check and was still importing it; the execution layer answered its build
+with SYNCING, the failed build was not retried, and the view timed out -- 6.9 s of every 30 s
+window, the whole difference between 46 and 56 blocks. Fixed (f34405fb6): the proposal is
+deferred while the parent is in flight and asked again on the retry cadence; loop135's gated
+legs have no timeout past view 1.
+
+What the gated chain does at full blocks (loop135 A1/A2, every node's execution-layer log):
+the follower's check is 125-137 ms from the request (sender recovery of 163,000 0x50 transfers
+is most of it), its import 380-434 ms beside the loop, the vote 130 ms after the body and the
+Decide ~10 ms later; `import starting since_body_ms` is 0-2 (loop133 A1: 200-340, defect 2).
+The cycle's median is 485 ms in window 1 (mean 527, p25 470, p75 511) against the ungated
+545-556; the follower is no longer the cycle. The leader is: `payload build phases` on a full
+block totals 430-456 ms (par_exec 62, fold 110-122, finish 106-110, assemble ~30, pull ~25),
+plus the body's publish and the followers' check before the QC. Window 1 gains 2-3% (the
+leader's chain was already hidden behind the follower's import; now it is exposed), window 2
+3-10% (the follower's import grows with memory in later windows, and that growth is off the
+critical path now), window 3 is within the spread. Adopted: the bench genesis
+`n42_fleet7_bench.json` carries `deferredExecutionTime: 0` from here on (the fleet7 and devnet
+genesis files stay ungated until the gov5 side has the rule). The next lever is the leader's
+build chain -- the serial fold/finish/assemble ~260 ms of a 430 ms build -- and then bigger
+blocks; on a fleet whose ingest and leader have cores of their own the follower's 400 ms is
+already beside the path.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

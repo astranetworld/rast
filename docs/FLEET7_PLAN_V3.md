@@ -337,8 +337,10 @@ side's stage 1 -- the header semantics behind `config.deferredExecutionTime`, wi
 executed-fields registry and the dev-chain fork test -- is in, with the cross-client vector
 (`n42-testing/testdata/deferred_execution_vectors.json`); stage 2 -- check, vote, import,
 with the next block's check overlapping this block's import (proposal section 11) -- is
-built and is measured by loop132 (`n42_fleet7_bench_deferred.json` against the bench genesis
-on the same binary).*
+built, its four pipeline defects found and fixed on loop132-135 (`NATIVE_FLEET7.md`), and
+adopted on the bench genesis: window 1 299,865 / 302,811 at 56 blocks against 293k ungated on
+the same binary, the best round 22,200,112. The follower is off the critical path; the cycle is
+the leader's build chain (~430 ms a full block), which is the next lever.*
 
 Everything above keeps "a follower executes the block before it votes". The
 fixed ~100 ms and the execute-then-vote coupling are then the wall: at

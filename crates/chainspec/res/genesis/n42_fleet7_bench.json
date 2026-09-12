@@ -96,7 +96,8 @@
         "committeeSize": 512,
         "rampBlocks": 1000000
       }
-    }
+    },
+    "deferredExecutionTime": 0
   },
   "nonce": "0x0",
   "timestamp": "0x67a6ce15",
