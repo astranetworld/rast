@@ -203,7 +203,7 @@ fi
 # The interval is a measurement parameter here, not a property of the chain.
 # 450 ms since round 43 (2026-09-08): at 300 the leader outran a 410-470 ms follower
 # import and every tenure handover stalled; 450 read the same window 1 and no stall.
-export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-450}
+export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-350}
 # The stragglers' grace (round 43, loop92): a leader waits up to this long after a
 # decide for the votes of the validators outside the quorum, so the two slowest
 # importers never fall a block behind per view; 0 turns it off.

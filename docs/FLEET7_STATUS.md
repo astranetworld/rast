@@ -24,7 +24,7 @@ shape a real chain would produce, and record what the ceiling is made of.
   (173k): ours is conservative, close to Tron's.
 - **Throughput at that shape.** 244-253k TPS on window 1 at a 0.64-0.67 s
   cycle; 16.8-18.2M transactions per round. **Best round: loop127 T1, 297,955 / 227,118 /
-  202,640 = 21,836,504, and best window 1: loop127 N1, 298,387 at 55 blocks; superseded 2026-09-11 21:08 by deferred execution (loop135, `docs/PHASE_D_DEFERRED_EXECUTION.md`): window 1 302,811 / 299,865 at 56 blocks, round 22,200,112; 2026-09-12 04:11 seal-first (loop140 S2): 317,086 at 59 blocks, 0.508 s** (2026-09-11: the
+  202,640 = 21,836,504, and best window 1: loop127 N1, 298,387 at 55 blocks; superseded 2026-09-11 21:08 by deferred execution (loop135, `docs/PHASE_D_DEFERRED_EXECUTION.md`): window 1 302,811 / 299,865 at 56 blocks, round 22,200,112; 2026-09-12 04:11 seal-first (loop140 S2): 317,086 at 59 blocks, 0.508 s; 04:42 pacing 350 under seal-first (loop141): window 1 333,416 / 328,018 at 61-62 blocks, round 22,518,476** (2026-09-11: the
   QMDB entries in an append-only file that is the persistence, `forest.ckpt` of bits instead
   of a 300-800 MB snapshot, dead twigs trimmed to their root, the fsync outside the forest
   lock; NATIVE_FLEET7 loop126-127); best window 2: loop125 E2's 243,253; before them loop126 E2

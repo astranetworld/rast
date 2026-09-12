@@ -341,7 +341,8 @@ built, its four pipeline defects found and fixed on loop132-135 (`NATIVE_FLEET7.
 adopted on the bench genesis: window 1 299,865 / 302,811 at 56 blocks against 293k ungated on
 the same binary, the best round 22,200,112. The follower is off the critical path. Stage 3 --
 the leader seals before it finishes (proposal section 13, loop137-140) -- took the leader's seal
-path to ~295 ms and window 1 to 317,086; the cycle is the 450 ms pacing now (loop141 sweeps it),
+path to ~295 ms and window 1 to 317,086; the 450 ms pacing was the cycle then, and 350 ms holds
+under it (loop141: 333,416 / 328,018, the best round 22,518,476; 300 collapses as before),
 and on this box the supply (~250-300k tx/s, every node verifying every transaction at ~23 us)
 is the wall the plan's section 5 named.*
 

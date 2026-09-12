@@ -2076,6 +2076,27 @@ proposal's overheads; with the follower's import beside the loop and the leader'
 ms after the previous one, the pacing is what holds the chain. loop141 sweeps it (350, 300 ms)
 under seal-first.
 
+**loop141 (2026-09-12 04:20-04:42 EDT): the pacing under seal-first -- 350 ms holds, 333,416 on
+window 1 and the best round, 22,518,476.** The loop140 binary (seal-first on, gated bench
+genesis, record configuration) with the block interval swept, 450 bookending 350 and 300:
+
+    leg     pacing  win1          win2     win3     blocks/window   round total   cycle median (win1)
+    W       450     312,199 (58)  235,623  167,514  58 / 45 / 33    21,472,500
+    P350a   350     333,416 (62)  226,815  132,927  62 / 44 / 25    20,799,984    420 ms (p25 376, p75 495)
+    P300    300     216,235 (40)  247,549  209,062  40 / 48 / 40    20,194,184
+    P350b   350     328,018 (61)  220,073  202,273  61 / 42 / 40    22,518,476
+    P450    450     307,401 (58)  219,253  182,784  58 / 41 / 36    21,289,172
+
+With the follower's import beside the loop and the leader sealing ~300 ms after the previous
+block, 450 ms of pacing was the cycle (0.517 s on both 450 legs); at 350 the chain runs at a
+0.484-0.492 s window-1 cycle (a 420 ms median block) and reads 328-333k, +6-7% over 450. At 300
+it collapses as it did before deferred execution (loop92, round 43): a pacing tighter than the
+block's actual cycle makes the leader run past the stragglers and every handover stall. P350a's
+third window (25 blocks at a 1.2 s cycle with the flood still delivering 190-265k/s) is the
+late-window memory phase, not the pacing: P350b held 40 blocks there. Adopted: the bench's
+default pacing is 350 ms (`fleet7-bench.sh`; the launchers' `PACE`). Records: window 1 333,416
+(P350a), the round 22,518,476 (P350b).
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

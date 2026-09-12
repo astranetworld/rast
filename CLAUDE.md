@@ -121,7 +121,7 @@ parallel per-sender batches grafted onto the block's state; the follower's group
 both off by default, both bookended: 201-206k against 172-182k), and **239-247k at 0.65-0.68 s, 17.4-17.7M transactions a round without a stall**, with the
 parallel state commit on top (QMDB leaves and hashed post-state built on the worker pool; on by default
 since loop82, `N42_PARALLEL_STATE_COMMIT=0` turns it off), the provider's chunked hashed post-state, and
-**`F7_BLOCK_INTERVAL_MS=450` and `F7_STRAGGLER_GRACE_MS=600`** (both bench defaults now): at 300 ms pacing the
+**`F7_BLOCK_INTERVAL_MS=450` and `F7_STRAGGLER_GRACE_MS=600`** (both bench defaults then; since 2026-09-12, with deferred execution and the leader sealing before it finishes, the bench paces at 350 ms: loop141, 333k against 312k at 450, 300 still collapses): at 300 ms pacing the
 leader outran the two followers outside the quorum and every tenure handover stalled 10-40 s; the grace makes the
 leader wait for every validator's vote (followers send a progress vote for a block imported after its view passed),
 and with it 450 ms pacing read 244k with no stall on a box where plain 450 ms collapsed (loop92). The queue holds an
