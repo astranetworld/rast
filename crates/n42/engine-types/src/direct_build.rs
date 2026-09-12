@@ -158,15 +158,15 @@ mod tests {
 
         // The registry finds the build by what a seal cannot change.
         crate::built_executions::remember(built_hash, execution.clone());
-        let (found, _) = crate::built_executions::find(grandparent, 11, header.state_root, header.receipts_root, 21_000)
+        let (found, _) = crate::built_executions::find(grandparent, 11, header.state_root, header.receipts_root, 21_000, None)
             .expect("the build is found under the sealed header's parent, number, roots and gas");
         assert_eq!(found, built_hash);
         // The own-block import takes the build; the build on the sealed block
         // must still find it, whichever request the execution layer served first.
-        let (taken, _) = crate::built_executions::take(grandparent, 11, header.state_root, header.receipts_root, 21_000).expect("taken");
+        let (taken, _) = crate::built_executions::take(grandparent, 11, header.state_root, header.receipts_root, 21_000, None).expect("taken");
         assert_eq!(taken, built_hash);
-        assert!(crate::built_executions::find(grandparent, 11, header.state_root, header.receipts_root, 21_000).is_none());
-        let (kept, _) = crate::built_executions::find_kept(grandparent, 11, header.state_root, header.receipts_root, 21_000)
+        assert!(crate::built_executions::find(grandparent, 11, header.state_root, header.receipts_root, 21_000, None).is_none());
+        let (kept, _) = crate::built_executions::find_kept(grandparent, 11, header.state_root, header.receipts_root, 21_000, None)
             .expect("a taken build is still there for the build on the sealed block");
         assert_eq!(kept, built_hash);
 

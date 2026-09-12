@@ -869,7 +869,12 @@ where
                     // Sealed early, nothing after the graft reads the cache
                     // either: the serial loop never runs.
                     let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
-                    let keep_cache = !(sealing_early || (build_graft_no_cache() && block_full && withdrawals_clear));
+                    // ... but only with no withdrawal to a grafted account:
+                    // the executor's finish credits the block's withdrawals
+                    // through the cache, and a miss there loads the parent's
+                    // account over the graft's (the faucet, on a funding
+                    // block: audit 2026-09-12).
+                    let keep_cache = !((sealing_early && withdrawals_clear) || (build_graft_no_cache() && block_full && withdrawals_clear));
                     par_commit_ms = fold_at.elapsed().as_millis() as u64;
                     let _ = executed_count;
                     // The transactions root beside the graft when the block
@@ -1025,6 +1030,10 @@ where
             build_stage.at(5);
 
             // ---- behind the seal ----
+            // A failure here is after the proposal: the store's waiters are
+            // told at once (`fail`), the engine's own path imports the block
+            // when consensus commits it, and the error is loud.
+            let behind_the_seal = || -> Result<(), PayloadBuilderError> {
             let finish_at = std::time::Instant::now();
             let (evm, execution_result) = builder
                 .executor
@@ -1108,7 +1117,6 @@ where
                 state: bundle,
                 result: execution_result,
             });
-            let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
             crate::built_executions::complete(
                 block_hash,
                 crate::built_executions::BuiltExecution {
@@ -1145,7 +1153,19 @@ where
                     "seal-first build phases"
                 );
             }
-            return Ok(BuildOutcome::Better { payload, cached_reads });
+            Ok(())
+            };
+            return match behind_the_seal() {
+                Ok(()) => {
+                    let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
+                    Ok(BuildOutcome::Better { payload, cached_reads })
+                }
+                Err(err) => {
+                    crate::built_executions::fail(block_hash);
+                    tracing::error!(target: "payload_builder", number = block_number, %err, "the finish behind the seal FAILED; the block was proposed already");
+                    Err(err)
+                }
+            };
         }
         // Not sealable early: the hook goes unused and the caller waits for
         // the ordinary outcome.

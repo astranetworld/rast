@@ -410,3 +410,48 @@ RPC/proof presentation of `executed_root_of`, the mobile receipt binding
 under N+1. First fleet round (35zzn, gov5-only) queued behind the BLAKE3
 tx-root round with a bench-only gate override; the fixture (F-2..F+3) from
 your side will go into our header tests as agreed.
+
+## 14. Audit of the session's code (2026-09-12 05:30), what it found and what changed
+
+Two independent reviews of `2706d1b6b..HEAD` (builder/store side, follower/driver side). Fixed:
+
+- **A rejected block kept its vote evidence and lost its commit.** `BlockChecked` put the hash in
+  `imported_blocks`; an import that then failed left it there (a re-proposal of the hash would be
+  voted for at once, unchecked) and the commit parked for it was never dropped. Now
+  `ConsensusEvent::BlockRejected` withdraws the evidence and the driver drops the parked commit
+  and the cached payload, loudly.
+- **SYNCING under the deferred path was final.** The awaited path retries (`PayloadMissing`); the
+  spawned paths turned it into a rejection. `ImportVerdict::NotYet` retries as before.
+- **Unbounded pipeline depth.** The in-flight imports counted as the tip and every admitted block
+  raised it; a follower that fell behind admitted every body at once (a sender recovery each,
+  a payload and a state each). At most two imports are in flight now (one executing, one being
+  checked); the rest queue.
+- **A spawned import that died left its hash in flight forever** (commits parked, a leader with
+  that head deferring every proposal). A guard reports a verdict on drop.
+- **`requests_hash` was checked by nobody past the fork.** It is the block's own, not a deferred
+  field, and `validate_block_post_execution` now holds it to the EIP under the gate too.
+- **The direct import waited 3 s for an unknown parent on ungated chains** (the old path failed at
+  once and let the engine answer SYNCING), after a full sender recovery, on the one connection.
+  Before the fork the parent is looked up first and an unknown one fails at once, as before.
+- **The check did not cover intrinsic gas.** A transaction with calldata and a 21,000 gas limit
+  passed the check and would fail execution. The intrinsic gas (kind, calldata, access list,
+  authorizations, the fork's floor) is required to fit the gas limit.
+- **Seal-first skipped the fold's cache writes without the withdrawals guard.** The executor's
+  finish credits the block's rewards through the state's cache; a grafted account (the faucet,
+  on a funding block) missing there was loaded from the parent and overwrote the graft. The
+  skip needs `withdrawals_clear` as it always did.
+- **Under the gate the build store's identity degenerated** to (parent, number): the roots and gas
+  it keyed on are the parent's, the same for every sibling. The transactions root is part of the
+  identity now wherever the caller has a header.
+- **The store re-filed a build that advanced after eviction**, evicting a live one; it keeps three
+  builds (the one finishing, the one ready, the one sealed) and drops a late advance. A finish
+  that fails behind the seal removes its entry (`fail`) so waiters return at once.
+- The engine's state-root job computed the MPT-style change set before the deferred branch that
+  never used it (~48 ms on the follower); the key cache is capped at ~50 MB; a batch worker that
+  executed a candidate twice is an error, not a silent drop.
+
+Known and left: the check does not see state-dependent gas (EIP-8037 on an Amsterdam chain) or a
+recipient spending what it received in the same block (the check refuses; the block takes the
+ordinary path); the provisional post-state is a bundle clone per block (~60 MB) until the
+finish replaces it.
+

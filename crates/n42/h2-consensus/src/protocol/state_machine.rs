@@ -144,6 +144,11 @@ pub enum ConsensusEvent {
     /// vote exactly as [`Self::BlockImported`] does; the import itself
     /// follows, and moves the execution layer's head.
     BlockChecked(B256),
+    /// A block the execution layer refused after this node had taken it as
+    /// checked (deferred execution: the vote went out on the check): its
+    /// import evidence is withdrawn, so a later proposal of the same hash
+    /// is checked again rather than voted for at once.
+    BlockRejected(B256),
 }
 
 /// A vote message whose single-validator BLS signature was verified by the
@@ -962,6 +967,7 @@ impl ConsensusEngine {
             ConsensusEvent::BlockReady(..) => "block_ready",
             ConsensusEvent::BlockImported(_) => "block_imported",
             ConsensusEvent::BlockChecked(_) => "block_checked",
+            ConsensusEvent::BlockRejected(_) => "block_rejected",
         };
         let _span = tracing::info_span!(
             target: "n42.cl.consensus.event",
@@ -977,6 +983,10 @@ impl ConsensusEngine {
             }
             ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) => {
                 self.on_block_imported(block_hash)
+            }
+            ConsensusEvent::BlockRejected(block_hash) => {
+                self.on_block_rejected(block_hash);
+                Ok(())
             }
         }
     }

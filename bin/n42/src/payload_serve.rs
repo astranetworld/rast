@@ -198,7 +198,7 @@ where
         (v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used);
     // On a thread: a build sealed before its finish is waited for.
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
-        n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used)
+        n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, None)
     })
     .await
     .ok()??;
@@ -406,13 +406,13 @@ where
     // On a thread: a build that sealed before its finish is waited for
     // (docs/PHASE_D_DEFERRED_EXECUTION.md section 13), and that wait must
     // not hold a runtime worker.
-    let (parent_hash, number, state_root, receipts_root, gas_used) =
-        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used);
+    let (parent_hash, number, state_root, receipts_root, gas_used, transactions_root) =
+        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used, Some(header.transactions_root));
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         if build_on_seal() {
-            n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used)
+            n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
         } else {
-            n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used)
+            n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used, transactions_root)
         }
     })
     .await
@@ -484,6 +484,7 @@ async fn build_on_own_block(
     // parent sealed before its finish is waited for, on a thread.
     let (parent_hash, number, state_root, receipts_root, gas_used) =
         (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used);
+    let transactions_root = Some(header.transactions_root);
     let (built_hash, built) = tokio::task::spawn_blocking(move || {
         n42_engine_types::built_executions::find_kept_at(
             parent_hash,
@@ -491,6 +492,7 @@ async fn build_on_own_block(
             state_root,
             receipts_root,
             gas_used,
+            transactions_root,
             n42_engine_types::built_executions::Stage::StateReady,
         )
     })

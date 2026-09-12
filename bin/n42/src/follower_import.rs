@@ -117,11 +117,30 @@ where
 /// cap, a gas limit at least a transfer's; for the block, the gas limits
 /// within the header's. Senders are read on the worker pool, each chunk on
 /// a state provider of its own.
+/// The revm spec the intrinsic gas of a block stamped `timestamp` is
+/// computed under (the forks that change it: Shanghai's init-code word
+/// cost, Prague's calldata floor).
+fn spec_for_intrinsic_gas<ChainSpec: reth_chainspec::EthereumHardforks>(chain_spec: &ChainSpec, timestamp: u64) -> reth_revm::primitives::hardfork::SpecId {
+    use reth_revm::primitives::hardfork::SpecId;
+    if chain_spec.is_osaka_active_at_timestamp(timestamp) {
+        SpecId::OSAKA
+    } else if chain_spec.is_prague_active_at_timestamp(timestamp) {
+        SpecId::PRAGUE
+    } else if chain_spec.is_cancun_active_at_timestamp(timestamp) {
+        SpecId::CANCUN
+    } else if chain_spec.is_shanghai_active_at_timestamp(timestamp) {
+        SpecId::SHANGHAI
+    } else {
+        SpecId::LONDON
+    }
+}
+
 fn check_includable<Provider>(
     provider: &Provider,
     parent_hash: B256,
     block: &RecoveredBlock<Block>,
     chain_id: u64,
+    spec: reth_revm::primitives::hardfork::SpecId,
 ) -> Result<(), String>
 where
     Provider: StateProviderFactory + Sync,
@@ -148,11 +167,28 @@ where
         if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > cap) {
             return Err(format!("transaction {index}: priority fee over the fee cap"));
         }
-        if tx.gas_limit() < 21_000 {
-            return Err(format!("transaction {index}: gas limit {} under a transfer's", tx.gas_limit()));
-        }
         if tx.authorization_list().is_some_and(|list| list.is_empty()) {
             return Err(format!("transaction {index}: empty authorization list"));
+        }
+        // The intrinsic gas -- the transaction's kind, calldata, access list
+        // and authorizations under this fork -- must fit the gas limit, or
+        // the block fails at execution and the vote was wrong.
+        let (al_accounts, al_storages) = tx
+            .access_list()
+            .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
+            .unwrap_or((0, 0));
+        let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+            spec,
+            tx.input(),
+            tx.kind().is_create(),
+            al_accounts,
+            al_storages,
+            tx.authorization_list().map_or(0, |list| list.len() as u64),
+            None,
+        );
+        let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
+        if tx.gas_limit() < needed {
+            return Err(format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()));
         }
         gas_total = gas_total.saturating_add(tx.gas_limit());
         by_sender.entry(*sender).or_default().push(index);
@@ -255,6 +291,21 @@ where
     let block_hash = sealed.hash();
 
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), sealed.timestamp);
+    // Before the fork the parent must be in already, as it always was: an
+    // unknown parent fails here at once and the engine's own path answers
+    // SYNCING, with no wait and no sender recovery spent on it. From the
+    // fork on the parent may still be importing, and the check below waits
+    // for it after the work that needs no parent.
+    let parent_known = if deferred {
+        None
+    } else {
+        Some(
+            provider
+                .sealed_header_by_hash(parent_hash)
+                .map_err(|err| format!("parent header: {err}"))?
+                .ok_or_else(|| format!("parent {parent_hash} unknown"))?,
+        )
+    };
     // The header and body, by the consensus rules the engine would apply;
     // what needs no parent first, so it overlaps the parent's import.
     consensus.validate_header(sealed.sealed_header()).map_err(|err| format!("header: {err}"))?;
@@ -325,13 +376,16 @@ where
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
     // against its post-state.
-    let parent = wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+    let parent = match parent_known {
+        Some(parent) => parent,
+        None => wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?,
+    };
     consensus
         .validate_header_against_parent(recovered.sealed_header(), &parent)
         .map_err(|err| format!("header against parent: {err}"))?;
     if deferred {
         let check_at = std::time::Instant::now();
-        check_includable(provider, parent_hash, &recovered, chain_spec.chain().id())?;
+        check_includable(provider, parent_hash, &recovered, chain_spec.chain().id(), spec_for_intrinsic_gas(chain_spec, recovered.timestamp))?;
         tracing::debug!(
             target: "n42.follower_import",
             number,

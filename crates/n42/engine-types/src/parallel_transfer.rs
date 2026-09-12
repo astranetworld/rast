@@ -617,7 +617,9 @@ where
                                 Ok(Some(out)) => {
                                     let gas_used = out.result.gas_used();
                                     evm.db_mut().commit(out.state);
-                                    let _ = slots_ref[i].set(BuiltTransfer { index: i, tx, result: out.result, gas_used });
+                                    if slots_ref[i].set(BuiltTransfer { index: i, tx, result: out.result, gas_used }).is_err() {
+                                        return Err(NotParallel::Failed(i, "executed twice".to_string()));
+                                    }
                                 }
                                 Ok(None) => {
                                     // The sender's later transfers would only

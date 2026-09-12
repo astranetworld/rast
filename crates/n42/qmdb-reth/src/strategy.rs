@@ -132,7 +132,6 @@ impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
         let header = block.header();
-        let changes = changes_from_execution(&output.state, (self.prague_at)(header.timestamp()));
         if (self.deferred_at)(header.timestamp()) {
             // Deferred execution: the header's root is the parent's, checked
             // by the consensus rules; this block's own root is filed and
@@ -151,6 +150,7 @@ impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
             );
             return Ok(StateRootJobOutcome::new(header.state_root(), Arc::new(TrieUpdates::default())));
         }
+        let changes = changes_from_execution(&output.state, (self.prague_at)(header.timestamp()));
         let root = self
             .state
             .validate_block(

@@ -400,10 +400,12 @@ where
         let header = block.header();
         if reth_chainspec::qmdb::deferred_execution_active_at(self.chain_spec.genesis(), header.timestamp) {
             // The header describes the parent; this block's own result is
-            // what its child's header will be checked against.
+            // what its child's header will be checked against. The requests
+            // hash is not deferred (section 9 of the proposal): it is this
+            // block's own and is held to the EIP here as before the fork.
             let (receipts_root, logs_bloom) = gov5_receipt_root_bloom(&result.receipts);
             crate::executed_fields::remember_receipts(block.hash(), receipts_root, logs_bloom, result.gas_used);
-            return Ok(());
+            return self.validate_requests_hash(header, result);
         }
         if header.gas_used != result.gas_used {
             return Err(ConsensusError::BlockGasUsed {
@@ -445,6 +447,17 @@ where
             ));
         }
 
+        self.validate_requests_hash(header, result)?;
+        Ok(())
+    }
+}
+
+impl<ChainSpec> HotStuffConsensus<ChainSpec>
+where
+    ChainSpec: EthChainSpec<Header = Header> + EthereumHardforks + core::fmt::Debug + Send + Sync,
+{
+    /// The block's EIP-7685 requests hash against the execution's requests.
+    fn validate_requests_hash(&self, header: &Header, result: &BlockExecutionResult<Receipt>) -> Result<(), ConsensusError> {
         // Requests: gov5 spells "none" as the empty trie root where EIP-7685
         // says sha256 of nothing; both are accepted for a block that made no
         // requests, and a block that did is held to the EIP.

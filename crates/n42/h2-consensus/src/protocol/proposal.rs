@@ -601,6 +601,15 @@ impl ConsensusEngine {
         ))
     }
 
+    /// Withdraws a block's import evidence (see `ConsensusEvent::BlockRejected`).
+    pub(super) fn on_block_rejected(&mut self, block_hash: B256) {
+        if self.imported_blocks.remove(&block_hash) {
+            self.imported_block_fifo.retain(|h| *h != block_hash);
+            self.imported_parents.remove(&block_hash);
+            tracing::warn!(target: "n42::interop::h2v4", %block_hash, "import evidence withdrawn: the execution layer refused a block this node had taken as checked");
+        }
+    }
+
     /// Handles the BlockImported event from the orchestrator.
     ///
     /// Native optimistic voting uses this as execution diagnostics. Gov5 H2

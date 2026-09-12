@@ -46,8 +46,65 @@ pub enum ImportReport {
     Checked(B256),
     /// The import finished, with the verdict an awaited import would have
     /// returned.
-    Done(B256, Result<(), String>),
+    Done(B256, ImportVerdict),
 }
+
+/// How a spawned import ended.
+#[derive(Debug)]
+pub enum ImportVerdict {
+    /// The execution layer holds the block.
+    Imported,
+    /// The execution layer has not executed it (SYNCING/ACCEPTED): not a
+    /// verdict -- the block is asked for again, as on the awaited path.
+    NotYet,
+    /// The execution layer refused it, or the import could not run.
+    Invalid(String),
+}
+
+impl ImportVerdict {
+    fn of(outcome: Result<alloy_rpc_types_engine::PayloadStatus, ElError>) -> Self {
+        match outcome {
+            Ok(status) => match status.status {
+                PayloadStatusEnum::Valid => Self::Imported,
+                PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Self::NotYet,
+                PayloadStatusEnum::Invalid { validation_error } => Self::Invalid(validation_error.to_string()),
+            },
+            Err(error) => Self::Invalid(error.to_string()),
+        }
+    }
+}
+
+/// Reports a spawned import that ended without a verdict (a panic, a
+/// dropped runtime), so the driver never waits on it forever.
+struct ReportGuard {
+    block_hash: B256,
+    report: Option<tokio::sync::mpsc::UnboundedSender<ImportReport>>,
+}
+
+impl ReportGuard {
+    fn done(mut self, verdict: ImportVerdict) {
+        if let Some(report) = self.report.take() {
+            let _ = report.send(ImportReport::Done(self.block_hash, verdict));
+        }
+    }
+}
+
+impl Drop for ReportGuard {
+    fn drop(&mut self) {
+        if let Some(report) = self.report.take() {
+            let _ = report.send(ImportReport::Done(
+                self.block_hash,
+                ImportVerdict::Invalid("the import task ended without a verdict".to_string()),
+            ));
+        }
+    }
+}
+
+/// Imports in flight at once under deferred execution: the one executing
+/// and the one being checked behind it. The rest queue -- the pipeline is
+/// one block deep by design, and every block admitted is a payload, a
+/// sender recovery and an executed state held at once.
+const DEFERRED_IN_FLIGHT: usize = 2;
 
 #[derive(Debug)]
 pub enum DriverAction {
@@ -768,12 +825,19 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         if self.executing.contains(&block_hash) {
             return DriverAction::Ignored;
         }
+        if self.executing.len() >= DEFERRED_IN_FLIGHT {
+            if !self.import_queue.contains(&block_hash) {
+                self.import_queue.push_back(block_hash);
+            }
+            return DriverAction::Ignored;
+        }
         let Some(payload) = self.payloads.get(&block_hash).cloned() else {
             return DriverAction::PayloadMissing { block_hash };
         };
         self.executing.insert(block_hash);
         let el = std::sync::Arc::clone(&self.el);
         let report = self.foreign_imports.clone();
+        let guard = ReportGuard { block_hash, report: Some(report.clone()) };
         let txs = payload.payload.as_v1().transactions.len();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -800,15 +864,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             if txs >= 10_000 {
                 info!(target: "n42.h2.el", block = ?block_hash, txs, import_ms = started.elapsed().as_millis() as u64, "imported a block");
             }
-            let verdict = match outcome {
-                Ok(status) => match status.status {
-                    PayloadStatusEnum::Valid => Ok(()),
-                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Err("not executed (syncing)".to_string()),
-                    PayloadStatusEnum::Invalid { validation_error } => Err(validation_error.to_string()),
-                },
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = report.send(ImportReport::Done(block_hash, verdict));
+            guard.done(ImportVerdict::of(outcome));
         });
         DriverAction::Ignored
     }
@@ -832,7 +888,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         };
         self.executing.insert(block_hash);
         let el = std::sync::Arc::clone(&self.el);
-        let report = self.foreign_imports.clone();
+        let guard = ReportGuard { block_hash, report: Some(self.foreign_imports.clone()) };
         let txs = payload.payload.as_v1().transactions.len();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -840,15 +896,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             if txs >= 10_000 {
                 info!(target: "n42.h2.el", block = ?block_hash, txs, import_ms = started.elapsed().as_millis() as u64, "imported a block");
             }
-            let verdict = match outcome {
-                Ok(status) => match status.status {
-                    PayloadStatusEnum::Valid => Ok(()),
-                    PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => Err("not executed (syncing)".to_string()),
-                    PayloadStatusEnum::Invalid { validation_error } => Err(validation_error.to_string()),
-                },
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = report.send(ImportReport::Done(block_hash, verdict));
+            guard.done(ImportVerdict::of(outcome));
         });
         DriverAction::Ignored
     }
@@ -870,22 +918,43 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.executing.remove(&block_hash);
         let mut actions = Vec::with_capacity(2);
         actions.push(match verdict {
-            Ok(()) => {
+            ImportVerdict::Imported => {
                 self.head = block_hash;
                 if self.pending_commits.remove(&block_hash) {
                     let _ = self.commit(block_hash).await;
                 }
                 DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
             }
-            Err(reason) => DriverAction::Rejected { block_hash, reason },
+            // Not executed: asked for again, as the awaited path does. A
+            // commit that waited keeps waiting for the import that follows.
+            ImportVerdict::NotYet => DriverAction::PayloadMissing { block_hash },
+            ImportVerdict::Invalid(reason) => {
+                // A commit for it can never run; a payload for it is dropped
+                // so a fresh copy is executed again, not this outcome.
+                if self.pending_commits.remove(&block_hash) {
+                    warn!(target: "n42.h2.el", block = ?block_hash, %reason, "a commit waited for an import that failed; dropped");
+                }
+                self.forget_payload(block_hash);
+                DriverAction::Rejected { block_hash, reason }
+            }
         });
+        // The next block queued behind the imports in flight, on whichever
+        // path its timestamp puts it.
         if let Some(next) = self.import_queue.pop_front() {
-            match self.spawn_execute(next) {
+            match self.execute(next).await {
                 DriverAction::Ignored => {}
                 other => actions.push(other),
             }
         }
         actions
+    }
+
+    /// Drops a cached payload (a rejected block's), so a block seen again
+    /// is fetched and executed afresh.
+    pub fn forget_payload(&mut self, block_hash: B256) {
+        if self.payloads.remove(&block_hash).is_some() {
+            self.payload_order.retain(|h| h != &block_hash);
+        }
     }
 
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {

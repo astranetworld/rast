@@ -39,11 +39,12 @@ pub struct BuiltExecution {
 }
 
 /// How many recent builds are kept. A leader's block is sealed and comes
-/// back within a view, so one is in flight and one may be the build ahead;
+/// back within a view, so one is in flight and one may be the build ahead
+/// -- and, sealing before the finish, one more still finishing behind it;
 /// each is ~100 MB at 163,000 transactions (block, bundle state, receipts),
 /// and on a box whose page cache is the contended resource every retained
 /// hundred megabytes is a hundred megabytes of state pages evicted.
-const KEEP: usize = 2;
+const KEEP: usize = 3;
 
 /// How far a build that was sealed before it finished has come
 /// (docs/PHASE_D_DEFERRED_EXECUTION.md section 13).
@@ -120,12 +121,11 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
             entry.stage = stage;
             entry.execution = Some(execution);
         }
-        // Evicted, or never pending: kept as a build at this stage regardless.
+        // Evicted (a finish that ran longer than KEEP builds), or never
+        // pending: not re-filed -- that would evict a live build the engine
+        // or the next build still needs.
         None => {
-            while store.len() >= KEEP {
-                store.pop_front();
-            }
-            store.push_back((built_hash, Entry { stage, block: execution.block.clone(), execution: Some(execution) }));
+            tracing::debug!(target: "n42.built_executions", %built_hash, ?stage, "a build advanced after it left the store; dropped");
         }
     }
     drop(store);
@@ -147,6 +147,16 @@ fn store_get(built_hash: B256) -> Option<Entry> {
 
 fn execution_of(entry: &Option<Entry>) -> Option<BuiltExecution> {
     entry.as_ref().and_then(|entry| entry.execution.clone())
+}
+
+/// A pending build whose finish behind the seal failed: gone from the
+/// store, so its waiters return at once rather than at their deadline.
+pub fn fail(built_hash: B256) {
+    let (store, advanced) = store();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    store.retain(|(hash, _)| *hash != built_hash);
+    drop(store);
+    advanced.notify_all();
 }
 
 /// The stage `built_hash` has reached, if it is known here.
@@ -185,12 +195,12 @@ pub fn wait_for(built_hash: B256, stage: Stage) -> Option<BuiltExecution> {
 /// the transactions and the state they produced. The caller still proves the
 /// sealed header hashes to the hash it was given before trusting this. A
 /// build still finishing behind its seal is waited for, up to [`WAIT`].
-pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> Option<(B256, BuiltExecution)> {
-    find_at(parent, number, state_root, receipts_root, gas_used, Stage::Complete)
+pub fn find(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+    find_at(parent, number, state_root, receipts_root, gas_used, transactions_root, Stage::Complete)
 }
 
 /// [`find`] at a given stage.
-pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, stage: Stage) -> Option<(B256, BuiltExecution)> {
+pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
     let (store, advanced) = store();
     let deadline = std::time::Instant::now() + WAIT;
     let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
@@ -198,7 +208,7 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
         let found = guard
             .iter()
             .rev()
-            .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used))
+            .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
             .map(|(hash, entry)| (*hash, entry.stage, entry.execution.clone()));
         match found {
             Some((hash, at, Some(built))) if at >= stage => return Some((hash, built)),
@@ -216,10 +226,10 @@ pub fn find_at(parent: B256, number: u64, state_root: B256, receipts_root: B256,
 
 /// [`find`], taking the build out of the store: the caller becomes the
 /// block's only holder and can move it instead of cloning its body.
-pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> Option<(B256, BuiltExecution)> {
+pub fn take(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
     let taken = {
         // Complete first (waiting for a finish behind the seal), then out.
-        let (hash, built) = find(parent, number, state_root, receipts_root, gas_used)?;
+        let (hash, built) = find(parent, number, state_root, receipts_root, gas_used, transactions_root)?;
         let (store, _) = store();
         let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(at) = store.iter().rposition(|(h, _)| *h == hash) {
@@ -251,35 +261,39 @@ fn handed() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
 /// [`find`], also among the builds already taken by the engine's import --
 /// what a build on the sealed block wants, whichever of the two requests the
 /// execution layer served first.
-pub fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> Option<(B256, BuiltExecution)> {
-    find_kept_at(parent, number, state_root, receipts_root, gas_used, Stage::Complete)
+pub fn find_kept(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> Option<(B256, BuiltExecution)> {
+    find_kept_at(parent, number, state_root, receipts_root, gas_used, transactions_root, Stage::Complete)
 }
 
 /// [`find_kept`] at a given stage: the build on the sealed block needs the
 /// parent's post-state (`StateReady`), not its receipts.
-pub fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, stage: Stage) -> Option<(B256, BuiltExecution)> {
+pub fn find_kept_at(parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>, stage: Stage) -> Option<(B256, BuiltExecution)> {
     // The handed list first: a build the engine already took is complete,
     // and looking there costs nothing where a wait on the store would.
     {
         let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(found) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used)) {
+        if let Some(found) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
             return Some(found.clone());
         }
     }
-    find_at(parent, number, state_root, receipts_root, gas_used, stage)
+    find_at(parent, number, state_root, receipts_root, gas_used, transactions_root, stage)
 }
 
-fn matches_build(built: &BuiltExecution, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> bool {
-    matches_block(&built.block, parent, number, state_root, receipts_root, gas_used)
+fn matches_build(built: &BuiltExecution, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
+    matches_block(&built.block, parent, number, state_root, receipts_root, gas_used, transactions_root)
 }
 
-fn matches_block(block: &RecoveredBlock<Block>, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64) -> bool {
+/// Under deferred execution the state root, receipts root and gas are the
+/// parent's, the same for every sibling built on that parent: the
+/// transactions root, when the caller has it, is what tells them apart.
+fn matches_block(block: &RecoveredBlock<Block>, parent: B256, number: u64, state_root: B256, receipts_root: B256, gas_used: u64, transactions_root: Option<B256>) -> bool {
     let header = block.header();
     header.parent_hash == parent
         && header.number == number
         && header.state_root == state_root
         && header.receipts_root == receipts_root
         && header.gas_used == gas_used
+        && transactions_root.is_none_or(|root| header.transactions_root == root)
 }
 
 /// The sealed blocks this node has handed to the engine as executed, kept

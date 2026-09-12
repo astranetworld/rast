@@ -104,7 +104,7 @@ pub fn ed25519_batch_size() -> usize {
 /// the cache off. Bounded by sharding: each of 256 shards keeps at most
 /// `KEY_SHARD_CAP` keys and is cleared when full.
 const KEY_SHARDS: usize = 256;
-const KEY_SHARD_CAP: usize = 4096;
+const KEY_SHARD_CAP: usize = 1024; // 256 shards x 1024 keys x ~200 B: ~50 MB at most
 
 type KeyShard = std::sync::RwLock<std::collections::HashMap<[u8; 32], ed25519_dalek::VerifyingKey, FbBuildHasher<32>>>;
 

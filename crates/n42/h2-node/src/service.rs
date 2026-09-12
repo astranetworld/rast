@@ -1957,9 +1957,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
             DriverAction::Rejected { block_hash, reason } => {
-                // Consensus must not vote for it, and the engine learns that by
-                // never receiving a BlockImported for this hash.
+                // Consensus must not vote for it. Under deferred execution the
+                // vote may have gone out on the check already: the engine
+                // withdraws the block's import evidence, so the hash is
+                // checked again if it is ever proposed again.
                 warn!(target: "n42.h2.node", ?block_hash, reason, "execution layer rejected a block");
+                if let Err(err) = self.engine.process_event(ConsensusEvent::BlockRejected(block_hash)) {
+                    debug!(target: "n42.h2.node", %err, ?block_hash, "engine rejected the withdrawal of import evidence");
+                }
             }
             DriverAction::Finalized { .. } | DriverAction::Ignored => {}
         }
