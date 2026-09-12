@@ -765,6 +765,14 @@ where
     let mut deferred: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> = Vec::new();
     let mut par_reverts: Vec<(alloy_primitives::Address, revm::database::AccountRevert)> = Vec::new();
     let mut par_drained = false;
+    let mut par_prep_ms = 0u64;
+    let mut par_collect_ms = 0u64;
+    // Of the fold: the receipts loop, before the graft.
+    let mut par_commit_ms = 0u64;
+    let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
+    // What the seal-first path needs of the chain and the block, short of
+    // the block being full (known after the parallel step).
+    let seal_early_possible = early_seal.is_some() && deferred_now && hotstuff && !is_amsterdam && qmdb.is_some();
     if parallel_build() && pulled.is_some() {
         let par_at = std::time::Instant::now();
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
@@ -781,6 +789,7 @@ where
         // The queue had less than a block: nothing more will come this build.
         par_drained = cands.len() < budget;
         par_pull_ms = par_at.elapsed().as_millis() as u64;
+        let prep_at = std::time::Instant::now();
         if cands.len() > budget {
             let extra = cands.split_off(budget);
             for tx in extra.into_iter().rev() {
@@ -812,13 +821,16 @@ where
                 (recovered, env)
             };
             let open = || open_parent_state().ok().map(StateProviderDatabase::new);
+            par_prep_ms = prep_at.elapsed().as_millis() as u64;
             match crate::parallel_transfer::execute_for_build(&group_env, &keys, &convert, &open) {
                 Ok(run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
+                    par_collect_ms = run.phases.collect_ms;
                     let fold_at = std::time::Instant::now();
                     // The receipts and the gas, one transfer at a time, with
                     // no state to commit: the state comes in one piece below.
+                    let executed_count = run.executed.len();
                     for built in run.executed {
                         let recovered = built.tx;
                         let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
@@ -849,7 +861,12 @@ where
                     let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| {
                         ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address)))
                     });
-                    let keep_cache = !(build_graft_no_cache() && block_full && withdrawals_clear);
+                    // Sealed early, nothing after the graft reads the cache
+                    // either: the serial loop never runs.
+                    let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
+                    let keep_cache = !(sealing_early || (build_graft_no_cache() && block_full && withdrawals_clear));
+                    par_commit_ms = fold_at.elapsed().as_millis() as u64;
+                    let _ = executed_count;
                     let db = builder.evm_mut().db_mut();
                     let graft = crate::parallel_transfer::graft_bundles_with(db, run.bundles, beneficiary, keep_cache)
                         .map_err(PayloadBuilderError::other)?;
@@ -908,7 +925,6 @@ where
     // Full, or the queue had no more to give: either way the serial loop
     // would add nothing now.
     let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS || par_drained;
-    let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     if let Some(early) = early_seal.take() {
         if deferred_now && hotstuff && !is_amsterdam && block_full && par_txs > 0 && block_blob_count == 0 && qmdb.is_some() {
             use reth_evm::execute::BlockExecutor as _;
@@ -1090,8 +1106,11 @@ where
                     setup_ms = setup_took.as_millis() as u64,
                     par_ms,
                     par_pull_ms,
+                    par_prep_ms,
                     par_part_ms,
                     par_exec_ms,
+                    par_collect_ms,
+                    par_commit_ms,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,

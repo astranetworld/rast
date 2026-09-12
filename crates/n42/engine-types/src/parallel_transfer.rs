@@ -59,6 +59,8 @@ pub struct Phases {
     pub take_ms: u64,
     /// Of `merge_ms`: appending and sorting the grafted reverts.
     pub reverts_ms: u64,
+    /// The batches' results placed in candidate order (the build).
+    pub collect_ms: u64,
     /// Pre- and post-execution changes and the bundle.
     pub finish_ms: u64,
     /// How many groups there were.
@@ -632,19 +634,28 @@ where
     });
     phases.groups_ms = at.elapsed().as_millis() as u64;
 
+    let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
-    for r in results {
-        let (done, skipped, bundle) = r?;
-        run.executed.extend(done);
-        run.skipped.extend(skipped);
-        run.bundles.push(bundle);
-    }
-    run.skipped.sort_unstable();
     // Candidate order, as the serial builder would have laid the block out
     // (each sender's transfers were run in that order, and the graft does
     // not care): round 43's followers imported a sender-grouped block 35%
-    // slower than the serial builder's.
-    run.executed.sort_unstable_by_key(|built| built.index);
+    // slower than the serial builder's. Placed by index, one move each: a
+    // sort of 163,000 results (each a transaction and its outcome) was
+    // ~40 ms of the build.
+    let mut slots: Vec<Option<BuiltTransfer<T>>> = Vec::with_capacity(keys.len());
+    slots.resize_with(keys.len(), || None);
+    for r in results {
+        let (done, skipped, bundle) = r?;
+        for built in done {
+            let index = built.index;
+            slots[index] = Some(built);
+        }
+        run.skipped.extend(skipped);
+        run.bundles.push(bundle);
+    }
+    run.executed = slots.into_iter().flatten().collect();
+    run.skipped.sort_unstable();
+    run.phases.collect_ms = at.elapsed().as_millis() as u64;
     Ok(run)
 }
 
