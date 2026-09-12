@@ -869,12 +869,13 @@ where
                     // Sealed early, nothing after the graft reads the cache
                     // either: the serial loop never runs.
                     let sealing_early = seal_early_possible && block_blob_count == 0 && (block_full || par_drained);
-                    // ... but only with no withdrawal to a grafted account:
-                    // the executor's finish credits the block's withdrawals
-                    // through the cache, and a miss there loads the parent's
-                    // account over the graft's (the faucet, on a funding
-                    // block: audit 2026-09-12).
-                    let keep_cache = !((sealing_early && withdrawals_clear) || (build_graft_no_cache() && block_full && withdrawals_clear));
+                    // The executor's finish credits the block's withdrawals
+                    // through the cache, and a miss there would load the
+                    // parent's account over the graft's (the faucet, on a
+                    // funding block: audit 2026-09-12) -- so with the cache
+                    // skipped, the withdrawal recipients the graft touched
+                    // are put back into it below, and nothing else is.
+                    let keep_cache = !(sealing_early || (build_graft_no_cache() && block_full && withdrawals_clear));
                     par_commit_ms = fold_at.elapsed().as_millis() as u64;
                     let _ = executed_count;
                     // The transactions root beside the graft when the block
@@ -893,6 +894,20 @@ where
                     early_transactions_root = early_root;
                     let graft = graft.map_err(PayloadBuilderError::other)?;
                     let db = builder.executor.evm_mut().db_mut();
+                    if !keep_cache {
+                        if let Some(withdrawals) = attributes.withdrawals.as_ref() {
+                            for withdrawal in withdrawals {
+                                let grafted = db
+                                    .bundle_state
+                                    .state
+                                    .get(&withdrawal.address)
+                                    .and_then(|account| account.info.clone());
+                                if let Some(info) = grafted {
+                                    db.insert_account(withdrawal.address, info);
+                                }
+                            }
+                        }
+                    }
                     let fees = graft.beneficiary_delta;
                     par_committed = graft.committed;
                     par_reverts = graft.reverts;

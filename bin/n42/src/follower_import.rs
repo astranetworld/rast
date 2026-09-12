@@ -170,26 +170,6 @@ where
         if tx.authorization_list().is_some_and(|list| list.is_empty()) {
             return Err(format!("transaction {index}: empty authorization list"));
         }
-        // The intrinsic gas -- the transaction's kind, calldata, access list
-        // and authorizations under this fork -- must fit the gas limit, or
-        // the block fails at execution and the vote was wrong.
-        let (al_accounts, al_storages) = tx
-            .access_list()
-            .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
-            .unwrap_or((0, 0));
-        let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
-            spec,
-            tx.input(),
-            tx.kind().is_create(),
-            al_accounts,
-            al_storages,
-            tx.authorization_list().map_or(0, |list| list.len() as u64),
-            None,
-        );
-        let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
-        if tx.gas_limit() < needed {
-            return Err(format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()));
-        }
         gas_total = gas_total.saturating_add(tx.gas_limit());
         by_sender.entry(*sender).or_default().push(index);
     }
@@ -216,6 +196,28 @@ where
                         return Err(format!("transaction {index}: nonce {}, {sender} is at {nonce}", tx.nonce()));
                     }
                     nonce += 1;
+                    // The intrinsic gas -- the transaction's kind, calldata,
+                    // access list and authorizations under this fork -- must
+                    // fit the gas limit, or the block fails at execution and
+                    // the vote was wrong. Here on the worker pool: serially
+                    // it was ~40 ms of the check (loop143).
+                    let (al_accounts, al_storages) = tx
+                        .access_list()
+                        .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
+                        .unwrap_or((0, 0));
+                    let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+                        spec,
+                        tx.input(),
+                        tx.kind().is_create(),
+                        al_accounts,
+                        al_storages,
+                        tx.authorization_list().map_or(0, |list| list.len() as u64),
+                        None,
+                    );
+                    let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
+                    if tx.gas_limit() < needed {
+                        return Err(format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()));
+                    }
                     let gas = alloy_primitives::U256::from(tx.gas_limit()) * alloy_primitives::U256::from(tx.max_fee_per_gas());
                     let blobs = alloy_primitives::U256::from(tx.blob_gas_used().unwrap_or(0))
                         * alloy_primitives::U256::from(tx.max_fee_per_blob_gas().unwrap_or(0));

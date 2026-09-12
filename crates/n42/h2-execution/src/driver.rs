@@ -804,7 +804,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Whether `block_hash`'s import is in flight: a commit for it is not
     /// dropped as "not imported" but deferred to the import's success.
     pub fn is_importing(&self, block_hash: &B256) -> bool {
-        self.executing.contains(block_hash)
+        self.executing.contains(block_hash) || self.import_queue.contains(block_hash)
     }
 
     /// The blocks whose imports are in flight.
