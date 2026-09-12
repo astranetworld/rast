@@ -2041,6 +2041,41 @@ transactions root 42 and the seal ~10. Behind the seal: merge 2, state ready 26,
 results by index instead of sorting, skips the cache inserts in the fold when the block will
 seal early (nothing after the graft reads them), and times the fold in two.
 
+**loop139-140 (2026-09-12 03:24-04:16 EDT): the seal path cut to 295 ms; seal-first adopted --
+317,086 on window 1.** Same legs as loop137-138 (gated bench genesis, S = `N42_SEAL_FIRST=1`, C =
+without), loop139 with the results placed by index instead of sorted and the fold without cache
+inserts on the seal-first path, loop140 with the results written into their slots by the batch
+workers and the transactions root computed beside the graft:
+
+    round   leg  win1          win2     win3     blocks/window   round total
+    loop139 W    259,610 (48)  188,922  154,834  48 / 39 / 34    (the slow regime, pool 13.5k)
+    loop139 S1   304,668 (57)  216,718  130,267  57 / 42 / 39
+    loop139 C1   300,170 (56)  217,452  188,097  56 / 41 / 37
+    loop139 S2   289,372 (54)  214,839   90,139  54 / 40 / 40
+    loop139 C2   302,877 (56)  225,737  196,778  56 / 41 / 38
+    loop140 W    305,907 (57)  201,627  183,963  57 / 39 / 36    20,762,324
+    loop140 S1   306,494 (57)  213,466  207,750  57 / 41 / 40    21,839,756
+    loop140 C1   297,270 (55)  222,002  189,054  55 / 42 / 37    21,254,132
+    loop140 S2   317,086 (59)  209,773  199,811  59 / 41 / 39    21,805,124
+    loop140 C2   303,307 (56)  211,129  193,793  56 / 41 / 38    21,253,104
+
+The seal path, from the build's start to the seal (`sealed_at_ms`, medians over the S legs'
+early seals at full blocks): loop138 472, loop139 398 (the fold without cache inserts 63 instead
+of ~100, the collection still 81), loop140 295 (the collection 8, the transactions root 17
+beside the graft). What remains on it: pull 20, execution 83 (p90 216: the ingest's
+verification on the same cores), the receipts loop 45, the graft ~70, the seal ~10; behind it the
+finish is 127. loop140's S legs read 306k / 317k at 57-59 blocks against 297-303k at 55-56 on
+the C legs, and 21.8M rounds against 21.25M: window 1 +3-5%, the round +2.7%, the record
+317,086 at a 0.508 s cycle. Adopted: seal-first is on by default under the gate
+(`N42_SEAL_FIRST=0` turns it off). The S legs' third windows in loop139 (130k, 90k) were the
+queue drained -- blocks 40% full with the flood at 200-250k/s -- which is this box's supply,
+not the chain; on loop140 they held.
+
+Where the cycle is now: 0.508-0.526 s on both the C and S legs is the 450 ms pacing plus the
+proposal's overheads; with the follower's import beside the loop and the leader's seal at ~300
+ms after the previous one, the pacing is what holds the chain. loop141 sweeps it (350, 300 ms)
+under seal-first.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

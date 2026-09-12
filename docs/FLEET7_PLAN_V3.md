@@ -339,8 +339,11 @@ executed-fields registry and the dev-chain fork test -- is in, with the cross-cl
 with the next block's check overlapping this block's import (proposal section 11) -- is
 built, its four pipeline defects found and fixed on loop132-135 (`NATIVE_FLEET7.md`), and
 adopted on the bench genesis: window 1 299,865 / 302,811 at 56 blocks against 293k ungated on
-the same binary, the best round 22,200,112. The follower is off the critical path; the cycle is
-the leader's build chain (~430 ms a full block), which is the next lever.*
+the same binary, the best round 22,200,112. The follower is off the critical path. Stage 3 --
+the leader seals before it finishes (proposal section 13, loop137-140) -- took the leader's seal
+path to ~295 ms and window 1 to 317,086; the cycle is the 450 ms pacing now (loop141 sweeps it),
+and on this box the supply (~250-300k tx/s, every node verifying every transaction at ~23 us)
+is the wall the plan's section 5 named.*
 
 Everything above keeps "a follower executes the block before it votes". The
 fixed ~100 ms and the execute-then-vote coupling are then the wall: at

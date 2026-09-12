@@ -348,7 +348,11 @@ and do the rest behind the seal.
 - The requests hash: a block of transfers produces no EIP-7685 requests, so the header is
   sealed with the empty hash and the finish asserts it; a chain with system-contract requests
   would defer `requests_hash` too, which section 9's rule does not yet say.
-- Knob: `N42_SEAL_FIRST=1` (off until measured; the gate is a precondition).
+- Knob: `N42_SEAL_FIRST` (on by default since loop140; `0` turns it off; the gate is a
+  precondition). Measured on loop137-140 (`NATIVE_FLEET7.md`): the seal path from the
+  build's start 472 -> 398 -> 295 ms as the fold's cache inserts, the results' sort and the
+  transactions root left it; window 1 306k / 317k against 297-303k, the round +2.7%, no
+  failed finish in ~600 early seals; the cycle is the 450 ms pacing now.
 
 
 ## 14. gov5 proposal (2026-09-12): a BLAKE3 binary transactions root, fork-gated
@@ -386,3 +390,23 @@ on its seven-node fleet until the chainspec carries the field. If the
 domain bytes, the odd-promotion rule or the empty root should differ for
 the Rust side, say so here; otherwise it goes into the shared chainspec
 proposal next to `deferredExecutionTime`.
+
+## 15. gov5 side implemented behind the gate (2026-09-12 04:00 EDT)
+
+gov5 commit 93e31b89 on n42blockchain/N42 main: `config.deferredExecutionTime`
+(`IsDeferredExecution`), the stored per-block execution result
+(`rawdb.ExecutedResult`: root, receipts root, bloom, gas used, by block hash),
+`ExecutedResultOfHeader` (a pre-fork header's own fields, so the fork
+invariant needs no special case), the import's pre-execution header check,
+the builder stamping the parent's result (own sealed record for chained
+builds, stored result, or the parent header before the fork), and the vote:
+the sync layer's `CheckDeferredBlock` (header vs the parent's stored result,
+parent is the applied head, includability -- per sender nonces contiguous
+from the state, sum(value + gas x fee cap) within the balance, intrinsic
+gas within the gas limit, block gas within the limit) raises
+`EventBlockChecked`; the engine votes when the block is checked AND its
+JustifyQC block is imported, in either order, never twice. Not yet: the
+RPC/proof presentation of `executed_root_of`, the mobile receipt binding
+under N+1. First fleet round (35zzn, gov5-only) queued behind the BLAKE3
+tx-root round with a bench-only gate override; the fixture (F-2..F+3) from
+your side will go into our header tests as agreed.

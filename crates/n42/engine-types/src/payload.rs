@@ -485,12 +485,14 @@ impl std::fmt::Debug for EarlySeal {
     }
 }
 
-/// Whether `N42_SEAL_FIRST=1` is set: the build on the sealed block seals
-/// before it finishes (see [`EarlySeal`]); a precondition is the chain's
-/// `deferredExecutionTime`, checked per block.
+/// Whether the build on the sealed block seals before it finishes (see
+/// [`EarlySeal`]): on unless `N42_SEAL_FIRST=0` (adopted after loop137-140,
+/// `NATIVE_FLEET7.md`); a precondition is the chain's
+/// `deferredExecutionTime`, checked per block, so a chain before the fork
+/// builds as before.
 pub fn seal_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_SEAL_FIRST").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_SEAL_FIRST").map_or(true, |v| v != "0"))
 }
 
 /// Constructs an Ethereum transaction payload using the best transactions from the pool.
