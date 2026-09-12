@@ -194,13 +194,14 @@ where
 {
     use reth_engine_primitives::PayloadValidator as _;
     let v1 = data.payload.as_v1();
-    let (built_hash, built) = n42_engine_types::built_executions::take(
-        v1.parent_hash,
-        v1.block_number,
-        v1.state_root,
-        v1.receipts_root,
-        v1.gas_used,
-    )?;
+    let (parent_hash, number, state_root, receipts_root, gas_used) =
+        (v1.parent_hash, v1.block_number, v1.state_root, v1.receipts_root, v1.gas_used);
+    // On a thread: a build sealed before its finish is waited for.
+    let (built_hash, built) = tokio::task::spawn_blocking(move || {
+        n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used)
+    })
+    .await
+    .ok()??;
     let started = std::time::Instant::now();
     let expected_hash = data.payload.block_hash();
     // The sealed header, first from the fields alone: the payload carries
@@ -402,23 +403,20 @@ where
     // leader fell back to building on its critical path). Left in place, the
     // registry's own bound (two builds) retires it two blocks later; the
     // hand-off clones the body once (~10 ms, beside the leader's chain now).
-    let (built_hash, built) = if build_on_seal() {
-        n42_engine_types::built_executions::find(
-            header.parent_hash,
-            header.number,
-            header.state_root,
-            header.receipts_root,
-            header.gas_used,
-        )
-    } else {
-        n42_engine_types::built_executions::take(
-            header.parent_hash,
-            header.number,
-            header.state_root,
-            header.receipts_root,
-            header.gas_used,
-        )
-    }
+    // On a thread: a build that sealed before its finish is waited for
+    // (docs/PHASE_D_DEFERRED_EXECUTION.md section 13), and that wait must
+    // not hold a runtime worker.
+    let (parent_hash, number, state_root, receipts_root, gas_used) =
+        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used);
+    let (built_hash, built) = tokio::task::spawn_blocking(move || {
+        if build_on_seal() {
+            n42_engine_types::built_executions::find(parent_hash, number, state_root, receipts_root, gas_used)
+        } else {
+            n42_engine_types::built_executions::take(parent_hash, number, state_root, receipts_root, gas_used)
+        }
+    })
+    .await
+    .map_err(|err| format!("build lookup: {err}"))?
     .ok_or("unknown build")?;
     let sealed_hash = header.hash_slow();
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
@@ -482,13 +480,22 @@ async fn build_on_own_block(
     }
     let mut times = BuildOnOwnTimes::default();
     let at = std::time::Instant::now();
-    let (built_hash, built) = n42_engine_types::built_executions::find_kept(
-        header.parent_hash,
-        header.number,
-        header.state_root,
-        header.receipts_root,
-        header.gas_used,
-    )
+    // The parent's post-state is what the build needs (`StateReady`); a
+    // parent sealed before its finish is waited for, on a thread.
+    let (parent_hash, number, state_root, receipts_root, gas_used) =
+        (header.parent_hash, header.number, header.state_root, header.receipts_root, header.gas_used);
+    let (built_hash, built) = tokio::task::spawn_blocking(move || {
+        n42_engine_types::built_executions::find_kept_at(
+            parent_hash,
+            number,
+            state_root,
+            receipts_root,
+            gas_used,
+            n42_engine_types::built_executions::Stage::StateReady,
+        )
+    })
+    .await
+    .map_err(|err| format!("build lookup: {err}"))?
     .ok_or("unknown build")?;
     times.find_ms = at.elapsed().as_millis() as u64;
     let sealed_hash = header.hash_slow();
@@ -509,7 +516,11 @@ async fn build_on_own_block(
     }
     if let Some(qmdb) = &reuse.qmdb {
         let at = std::time::Instant::now();
-        qmdb.rename(built_hash, sealed_hash).map_err(|err| format!("qmdb rename: {err}"))?;
+        // A parent still finishing behind its seal has no tree yet; the
+        // build renames it under the sealed hash when it needs it.
+        if qmdb.root_of(&built_hash).is_some() {
+            qmdb.rename(built_hash, sealed_hash).map_err(|err| format!("qmdb rename: {err}"))?;
+        }
         times.rename_ms = at.elapsed().as_millis() as u64;
     }
     let at = std::time::Instant::now();

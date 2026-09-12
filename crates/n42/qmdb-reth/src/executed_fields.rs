@@ -58,11 +58,16 @@ struct Registry {
 }
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
+/// Signalled on every access, for [`wait_for`].
+static WRITTEN: std::sync::Condvar = std::sync::Condvar::new();
 
 fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
     let mut guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let registry = guard.get_or_insert_with(|| Registry { by_hash: HashMap::new(), order: VecDeque::new() });
-    f(registry)
+    let out = f(registry);
+    drop(guard);
+    WRITTEN.notify_all();
+    out
 }
 
 fn entry_mut(registry: &mut Registry, hash: B256) -> &mut Partial {
@@ -99,6 +104,29 @@ pub fn remember(block_hash: B256, fields: ExecutedFields) {
 /// A block's execution result, once both halves are in.
 pub fn get(block_hash: &B256) -> Option<ExecutedFields> {
     with_registry(|registry| registry.by_hash.get(block_hash).and_then(Partial::complete))
+}
+
+/// [`get`], waiting up to `timeout` for the fields to be recorded: a parent
+/// sealed before its finish (docs/PHASE_D_DEFERRED_EXECUTION.md section 13)
+/// records them a moment after its child's build has started.
+pub fn wait_for(block_hash: &B256, timeout: std::time::Duration) -> Option<ExecutedFields> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut guard = REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if let Some(found) = guard
+            .as_ref()
+            .and_then(|registry| registry.by_hash.get(block_hash))
+            .and_then(Partial::complete)
+        {
+            return Some(found);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let (g, _) = WRITTEN.wait_timeout(guard, deadline - now).unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard = g;
+    }
 }
 
 /// Seeds the registry with a block whose execution the chain already holds

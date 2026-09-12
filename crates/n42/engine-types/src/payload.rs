@@ -253,6 +253,7 @@ where
             self.cons.clone(),
             self.qmdb.clone(),
             None,
+            None,
         );
         let outcome = if result.is_ok() { "ok" } else { "error" };
         metrics::histogram!(
@@ -307,6 +308,7 @@ where
             self.cons.clone(),
             self.qmdb.clone(),
             None,
+            None,
         )?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
@@ -350,28 +352,87 @@ where
             .flatten()
             .unwrap_or_default();
         let payload_id = reth_payload_primitives::payload_id(&parent_hash, &attributes);
+        let parent_built = parent_execution.block.hash();
         let config = PayloadConfig::new(Arc::new(parent), attributes, payload_id);
         let args = BuildArguments::new(cached_reads, None, None, config, Default::default(), None);
-        let outcome = default_n42_payload(
+        let (evm_config, client, pool, builder_config, cons, qmdb) = (
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
             self.builder_config.clone(),
-            args,
-            |attributes| match n42_tx_queue::global::<Pool::Transaction>() {
-                Some(queue) => Box::new(queue.best_for_build(parent_hash)),
-                None => self.pool.best_transactions_with_attributes(attributes),
-            },
             self.cons.clone(),
             self.qmdb.clone(),
-            Some(opener),
-        )
-        .map_err(|err| err.to_string())?;
-        match outcome {
-            BuildOutcome::Better { payload, .. } | BuildOutcome::Freeze(payload) => Ok(payload),
-            BuildOutcome::Aborted { .. } => Err("the build was aborted".to_owned()),
-            BuildOutcome::Cancelled => Err("the build was cancelled".to_owned()),
+        );
+        let select_pool = pool.clone();
+        let select = move |attributes| match n42_tx_queue::global::<Pool::Transaction>() {
+            Some(queue) => Box::new(queue.best_for_build(parent_hash)) as BestTransactionsIter<Pool>,
+            None => select_pool.best_transactions_with_attributes(attributes),
+        };
+        let unwrap = |outcome: Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>| -> Result<EthBuiltPayload, String> {
+            match outcome.map_err(|err| err.to_string())? {
+                BuildOutcome::Better { payload, .. } | BuildOutcome::Freeze(payload) => Ok(payload),
+                BuildOutcome::Aborted { .. } => Err("the build was aborted".to_owned()),
+                BuildOutcome::Cancelled => Err("the build was cancelled".to_owned()),
+            }
+        };
+        if !seal_first() {
+            return unwrap(default_n42_payload(
+                evm_config, client, pool, builder_config, args, select, cons, qmdb, Some(opener), None,
+            ));
         }
+        // Sealed before it finishes (`EarlySeal`): the build runs on a thread
+        // of its own, the sealed payload comes back on the channel, and the
+        // thread finishes the block behind it. A build the builder could not
+        // seal early (the block not full, no gate) ends the ordinary way and
+        // the channel closes without a payload.
+        let (sealed_tx, sealed_rx) = std::sync::mpsc::sync_channel::<EthBuiltPayload>(1);
+        let early = EarlySeal {
+            hook: Box::new(move |payload| {
+                let _ = sealed_tx.send(payload);
+            }),
+            parent_built: Some(parent_built),
+        };
+        let started = std::time::Instant::now();
+        let worker = std::thread::Builder::new()
+            .name("build-on-own".into())
+            .spawn(move || {
+                default_n42_payload(
+                    evm_config, client, pool, builder_config, args, select, cons, qmdb, Some(opener), Some(early),
+                )
+            })
+            .map_err(|err| format!("build thread: {err}"))?;
+        // Whichever comes first: the early payload, or the build's end.
+        loop {
+            match sealed_rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(payload) => {
+                    let number = payload.block().header().number;
+                    let sealed_ms = started.elapsed().as_millis() as u64;
+                    // The thread finishes the block; its outcome is a log
+                    // line, its failure the handoff's problem to report.
+                    std::thread::Builder::new()
+                        .name("build-on-own-finish".into())
+                        .spawn(move || match worker.join() {
+                            Ok(Ok(_)) => debug!(target: "payload_builder", number, sealed_ms, "sealed early; finished behind the seal"),
+                            Ok(Err(err)) => warn!(target: "payload_builder", number, %err, "sealed early; the finish behind the seal FAILED"),
+                            Err(_) => warn!(target: "payload_builder", number, "sealed early; the finish behind the seal panicked"),
+                        })
+                        .ok();
+                    return Ok(payload);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if worker.is_finished() {
+                        // Not sealed early (or the seal came with the end):
+                        // one more look at the channel, then the outcome.
+                        if let Ok(payload) = sealed_rx.try_recv() {
+                            return Ok(payload);
+                        }
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        unwrap(worker.join().map_err(|_| "the build thread panicked".to_owned())?)
     }
 }
 
@@ -398,6 +459,35 @@ impl Drop for BuildStage {
 }
 
 
+/// The hook of a build that seals before it finishes
+/// (docs/PHASE_D_DEFERRED_EXECUTION.md section 13): under deferred execution
+/// the header carries the parent's execution, so once the parallel step has
+/// filled the block the header needs only the transactions root and the
+/// block can be sealed and handed out while its state is folded, finished and
+/// rooted behind it. `hook` receives the sealed payload; `parent_built` is
+/// the parent's hash under the builder (the parent may be finishing behind
+/// its own seal: its fields and its tree arrive under that hash).
+pub struct EarlySeal {
+    /// Receives the sealed payload, once.
+    pub hook: Box<dyn FnOnce(EthBuiltPayload) + Send>,
+    /// The parent's hash under the builder, when the parent was built here.
+    pub parent_built: Option<B256>,
+}
+
+impl std::fmt::Debug for EarlySeal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EarlySeal").field("parent_built", &self.parent_built).finish()
+    }
+}
+
+/// Whether `N42_SEAL_FIRST=1` is set: the build on the sealed block seals
+/// before it finishes (see [`EarlySeal`]); a precondition is the chain's
+/// `deferredExecutionTime`, checked per block.
+pub fn seal_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_SEAL_FIRST").is_ok_and(|v| v == "1"))
+}
+
 /// Constructs an Ethereum transaction payload using the best transactions from the pool.
 ///
 /// Given build arguments including an Ethereum client, transaction pool,
@@ -417,6 +507,8 @@ pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     // parent's hash: a build on an own block the engine has not imported yet
     // (`direct_build`). `None` reads the client's state at the parent.
     parent_state: Option<crate::direct_build::ParentStateOpener>,
+    // Seals before the finish when it can (`EarlySeal`).
+    mut early_seal: Option<EarlySeal>,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
     EvmConfig: ConfigureEvm<
@@ -795,6 +887,213 @@ where
             }
         }
         par_ms = par_at.elapsed().as_millis() as u64;
+    }
+
+    // Sealed before it finishes (`EarlySeal`, docs/PHASE_D_DEFERRED_EXECUTION.md
+    // section 13): under deferred execution the header carries the parent's
+    // execution, so a block the parallel step filled needs only its
+    // transactions root to be sealed. The seal goes out now; the fold is
+    // done (it ran in the parallel step), and the finish, the hashed
+    // post-state, the QMDB root and the receipts follow behind the seal --
+    // the next build on this block waits for the state, the engine's handoff
+    // for the rest.
+    let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
+    let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
+    if let Some(early) = early_seal.take() {
+        if deferred_now && hotstuff && !is_amsterdam && block_full && par_txs > 0 && block_blob_count == 0 && qmdb.is_some() {
+            use reth_evm::execute::BlockExecutor as _;
+            use reth_storage_api::HashedPostStateProvider as _;
+            let EarlySeal { hook, parent_built } = early;
+            let qmdb_state = qmdb.clone().expect("checked above");
+            let seal_at = std::time::Instant::now();
+            // Whatever was taken ahead and not built goes back to the queue,
+            // as the loop's end does; the puller stops at its next batch.
+            for pool_tx in lookahead.into_iter().rev().chain(deferred.into_iter().rev()) {
+                refuse!(
+                    &pool_tx,
+                    InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
+                );
+            }
+            drop(pulled.take());
+            // The transactions out of the builder: the body is the sealed
+            // block's; nothing here assembles a block from them again.
+            let txs = std::mem::take(&mut builder.transactions);
+            let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) =
+                txs.into_iter().map(|tx| tx.into_parts()).unzip();
+            let transactions_root = crate::assembler::parallel_transaction_root(&transactions);
+            let root_ms = seal_at.elapsed().as_millis() as u64;
+            let parent_sealed = parent_header.hash();
+            // The parent's execution, as this header carries it: recorded
+            // under its sealed hash, or -- a parent finishing behind its own
+            // seal -- arriving under the builder's hash a moment from now.
+            let parent_fields = crate::hotstuff_consensus::parent_executed_fields(chain_spec.genesis(), &parent_header)
+                .or_else(|| {
+                    let built = parent_built?;
+                    let fields = crate::executed_fields::wait_for(&built, std::time::Duration::from_secs(2))?;
+                    crate::executed_fields::remember(parent_sealed, fields);
+                    Some(fields)
+                })
+                .ok_or_else(|| {
+                    PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_sealed))
+                })?;
+            let fields_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms);
+            header.transactions_root = transactions_root;
+            header.state_root = parent_fields.state_root;
+            header.receipts_root = parent_fields.receipts_root;
+            header.logs_bloom = parent_fields.logs_bloom;
+            header.gas_used = parent_fields.gas_used;
+            header.ommers_hash = B256::ZERO;
+            header.difficulty = U256::ZERO;
+            header.gas_limit = block_gas_limit;
+            header.base_fee_per_gas = Some(base_fee);
+            let withdrawals = attributes.withdrawals.clone().map(alloy_eips::eip4895::Withdrawals::new);
+            header.withdrawals_root = withdrawals
+                .as_ref()
+                .map(|list| alloy_consensus::proofs::calculate_withdrawals_root(list));
+            if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp) {
+                // A block of transfers carries no blobs.
+                header.blob_gas_used = Some(0);
+                header.excess_blob_gas = group_env.block_env.blob_excess_gas_and_price.as_ref().map(|b| b.excess_blob_gas);
+            }
+            // A block of transfers produces no EIP-7685 requests; the finish
+            // below says so loudly if that ever stops being true.
+            header.requests_hash = chain_spec
+                .is_prague_active_at_timestamp(attributes.timestamp)
+                .then_some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+            header.timestamp = attributes.timestamp;
+            header.mix_hash = attributes.prev_randao;
+            header.parent_beacon_block_root = attributes.parent_beacon_block_root;
+            let block_number = header.number;
+            cons.seal(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+            let body = alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals };
+            let sealed_block = SealedBlock::seal_parts(header, body);
+            let block_hash = SealedBlock::hash(&sealed_block);
+            let recovered: Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>> =
+                Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
+            crate::built_executions::remember_pending(block_hash, recovered.clone());
+            let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
+            hook(payload.clone());
+            let sealed_ms = seal_at.elapsed().as_millis() as u64;
+            build_stage.at(5);
+
+            // ---- behind the seal ----
+            let finish_at = std::time::Instant::now();
+            let (evm, execution_result) = builder
+                .executor
+                .finish()
+                .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+            let (db, _evm_env) = reth_evm::Evm::finish(evm);
+            db.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
+            let merge_ms = finish_at.elapsed().as_millis() as u64;
+            // The post-state is final: the next block can be built on it.
+            // Receipts and hashed state come with `complete`.
+            let provisional = crate::built_executions::BuiltExecution {
+                block: recovered.clone(),
+                execution_output: Arc::new(reth_execution_types::BlockExecutionOutput {
+                    state: db.bundle_state.clone(),
+                    result: reth_execution_types::BlockExecutionResult {
+                        receipts: Vec::new(),
+                        gas_used: execution_result.gas_used,
+                        ..execution_result.clone()
+                    },
+                }),
+                hashed_state: Arc::new(Default::default()),
+                trie_updates: Arc::new(TrieUpdates::default()),
+            };
+            crate::built_executions::state_ready(block_hash, provisional);
+            let state_ready_ms = finish_at.elapsed().as_millis() as u64;
+            if !execution_result.requests.is_empty() {
+                tracing::error!(
+                    target: "payload_builder",
+                    number = block_number,
+                    requests = execution_result.requests.len(),
+                    "sealed with the empty requests hash, but the execution produced requests: the block is invalid"
+                );
+            }
+            // The parent's tree under its sealed hash: a parent that finished
+            // behind its seal after this build began has it under the
+            // builder's hash still.
+            if qmdb_state.root_of(&parent_sealed).is_none() {
+                if let Some(built) = parent_built {
+                    let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
+                    if qmdb_state.root_of(&parent_sealed).is_none() {
+                        qmdb_state.rename(built, parent_sealed).map_err(PayloadBuilderError::other)?;
+                    }
+                }
+            }
+            let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
+            let roots_at = std::time::Instant::now();
+            let bundle_ref = &db.bundle_state;
+            // The state provider is `Send` but not `Sync`: the hashed
+            // post-state stays on this thread while the root and the
+            // receipts run beside it.
+            let (hashed_state, prepared, (own_receipts_root, own_logs_bloom)) = std::thread::scope(|scope| {
+                let receipts = &execution_result.receipts;
+                let qmdb_job = &qmdb_state;
+                let root = scope.spawn(move || {
+                    let ops = n42_qmdb_reth::sorted_operations_from_execution(bundle_ref, prague);
+                    qmdb_job.compute_operations(parent_sealed, ops)
+                });
+                let receipts = scope.spawn(move || crate::hotstuff_consensus::gov5_receipt_root_bloom(receipts));
+                let hashed = state_provider.hashed_post_state(bundle_ref);
+                let prepared = root.join().expect("the QMDB root job does not panic");
+                let roots = receipts.join().expect("the receipts root job does not panic");
+                (hashed, prepared, roots)
+            });
+            let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
+            let prepared = prepared.map_err(PayloadBuilderError::other)?;
+            let own_state_root = prepared.root;
+            qmdb_state.insert(block_hash, block_number, prepared).map_err(PayloadBuilderError::other)?;
+            let roots_ms = roots_at.elapsed().as_millis() as u64;
+            crate::executed_fields::remember(
+                block_hash,
+                crate::executed_fields::ExecutedFields {
+                    state_root: own_state_root,
+                    receipts_root: own_receipts_root,
+                    logs_bloom: own_logs_bloom,
+                    gas_used: execution_result.gas_used,
+                },
+            );
+            let mut bundle = db.take_bundle();
+            crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
+            let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
+                state: bundle,
+                result: execution_result,
+            });
+            let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
+            crate::built_executions::complete(
+                block_hash,
+                crate::built_executions::BuiltExecution {
+                    block: recovered,
+                    execution_output,
+                    hashed_state: Arc::new(hashed_state),
+                    trie_updates: Arc::new(TrieUpdates::default()),
+                },
+            );
+            build_stage.at(7);
+            if tx_count >= 1000 {
+                tracing::info!(
+                    target: "payload_builder",
+                    number = block_number,
+                    txs = tx_count,
+                    par_pull_ms,
+                    par_exec_ms,
+                    par_fold_ms,
+                    tx_root_ms = root_ms,
+                    parent_fields_ms = fields_ms,
+                    sealed_ms,
+                    merge_ms,
+                    state_ready_ms,
+                    roots_ms,
+                    finish_ms = finish_at.elapsed().as_millis() as u64,
+                    total_ms = build_started.elapsed().as_millis() as u64,
+                    "seal-first build phases"
+                );
+            }
+            return Ok(BuildOutcome::Better { payload, cached_reads });
+        }
+        // Not sealable early: the hook goes unused and the caller waits for
+        // the ordinary outcome.
     }
 
     loop {

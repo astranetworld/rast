@@ -314,3 +314,39 @@ import ~400 ms beside the loop, the cycle's median 485 ms; the leader's build ch
 full block) is the cycle now. `n42_fleet7_bench.json` carries `deferredExecutionTime: 0`;
 `n42_fleet7.json` and the devnet stay ungated until the gov5 side has the rule (sections 8-9).
 
+## 13. Stage 3 (design, 2026-09-12): the leader seals before it finishes
+
+With the follower off the critical path (section 12) the cycle is the leader's build: on a
+full block ~430 ms, of which the parallel execution is ~60 and the rest is serial -- the fold
+of the batches' state (~115), the finish (~110: post-execution changes, the bundle merge, the
+hashed post-state, and the QMDB root ~57 beside the transactions root ~25), the assembly and
+seal (~30). Under deferred execution a header carries the *parent's* execution fields, so
+none of that serial work is needed to seal the block: the header needs the transactions root,
+the parent's fields, the attributes and the gas limit. The leader can therefore seal right
+after the parallel execution and the transactions root (~90 + 25 ms after the pull), publish,
+and do the rest behind the seal.
+
+- `default_n42_payload` takes an `early_seal` hook. With it, under the gate, when the parallel
+  step filled the block (nothing for the serial loop, no blobs, no Amsterdam access list), the
+  builder assembles the header itself -- `prepare` + transactions root + the parent's recorded
+  fields (waited for, since the parent's own finish may still be running) + gas limit, base
+  fee, withdrawals root, blob fields, `EMPTY_REQUESTS_HASH` -- seals it, files the block as
+  *pending* in `built_executions`, hands the payload to the hook, and continues: the fold,
+  the executor's finish (the rewards' withdrawals) and the bundle merge, then `state_ready`
+  (the next build reads this post-state), then the hashed post-state, the QMDB root and the
+  receipts root in parallel, then `complete` (the executed block for the engine's handoff,
+  the block's own fields in `executed_fields`, the cached reads).
+- `build_on_own` (build-on-seal, every block of a tenure but the first) runs the build on a
+  thread and answers the validator with the early payload; the thread finishes behind it.
+  The next `build_on_own` waits for the parent's `state_ready` (and its fields before the
+  header), the own-block handoff for `complete`; the QMDB root of N+1 waits for N's tree.
+- Expected chain per block: N's fold + merge (~150) then N+1's execution and root (~115), the
+  parent's fields ready in time: ~280-300 ms a block against 480, i.e. the follower's chain
+  (includability + import beside the loop, ~275) becomes the cycle again. On this box the
+  supply (each node verifying every transaction at ~25 us) caps what that is worth in
+  transactions; on a fleet with cores of its own it is the leader's 1.6x.
+- The requests hash: a block of transfers produces no EIP-7685 requests, so the header is
+  sealed with the empty hash and the finish asserts it; a chain with system-contract requests
+  would defer `requests_hash` too, which section 9's rule does not yet say.
+- Knob: `N42_SEAL_FIRST=1` (off until measured; the gate is a precondition).
+
