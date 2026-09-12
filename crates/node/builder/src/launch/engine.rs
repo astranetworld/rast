@@ -338,6 +338,7 @@ impl EngineNodeLauncher {
             let mut service_tick = tokio::time::interval(std::time::Duration::from_millis(250));
             service_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_branch_done = std::time::Instant::now();
+            let mut last_tick = std::time::Instant::now();
             let slow_branch = |name: &str, started: std::time::Instant, since_previous: std::time::Duration| {
                 let took = started.elapsed();
                 if took > std::time::Duration::from_millis(300) || since_previous > std::time::Duration::from_secs(3) {
@@ -348,6 +349,13 @@ impl EngineNodeLauncher {
                 tokio::select! {
                     _ = service_tick.tick() => {
                         // Nothing to do: the next iteration polls the orchestrator.
+                        // A tick that comes late says the task itself was not
+                        // polled for that long, whatever it was waiting on.
+                        let gap = last_tick.elapsed();
+                        if gap > std::time::Duration::from_secs(1) {
+                            warn!(target: "reth::cli", gap_ms = gap.as_millis() as u64, "engine service loop: the tick came late; the task was not polled");
+                        }
+                        last_tick = std::time::Instant::now();
                     }
                     event = orchestrator.next() => {
                         let branch_started = std::time::Instant::now();

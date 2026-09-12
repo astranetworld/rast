@@ -268,3 +268,39 @@ async fn the_payload_cache_is_bounded() {
     assert!(driver.has_payload(&b));
     assert!(driver.has_payload(&c));
 }
+
+/// A follower can hear the Decide before the body channel delivers the
+/// block. The commit then runs a forkchoice for a block the engine does
+/// not have, which the engine answers SYNCING. That is not "done": the
+/// commit waits for the import and runs once it lands (loop149: taken as
+/// done, the block was imported but never canonical, the next block's
+/// direct import could not see its parent, and the node fell 3 s a block
+/// behind for the rest of the leg).
+#[tokio::test]
+async fn a_commit_the_engine_does_not_have_yet_waits_for_the_import() {
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        forkchoice_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let hash = B256::repeat_byte(0x33);
+
+    // The Decide first: the forkchoice is refused with SYNCING, nothing is final.
+    let action = driver.handle_output(&committed(hash)).await;
+    assert_eq!(action.finalized_block(), None);
+    assert_eq!(driver.head(), GENESIS);
+
+    // The body arrives and the block imports: the engine now has it, and the
+    // commit that waited runs.
+    el.set_behaviour(MockBehaviour::default());
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    let action = driver.handle_output(&execute(hash)).await;
+    assert_eq!(action.imported_block(), Some(hash));
+    assert_eq!(driver.head(), hash);
+    let forkchoices = el
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == hash))
+        .count();
+    assert_eq!(forkchoices, 2, "the refused forkchoice and the one after the import");
+}

@@ -2234,6 +2234,30 @@ harmless and the persistence cycle is slow), the reorg-path defects (section 16.
 the stall into a dead chain: A1 survived its stall because no TC formed.
 
 
+**loop149 (2026-09-12 07:25-07:37 EDT): the engine service loop timed and ticked; a follower's lost
+commit found.** Two legs on the loop with branch timings and a 250 ms tick:
+
+    leg          win1          win2          win3          round     what happened
+    loop149 A1   314,813 (58)   11,433 (47)        0 (26)   9.80M    node4 fell 3 s a block behind at 11:27:21; its ingest gate closed; the flood stalled; every queue ran dry
+    loop149 A2   304,042 (56)  157,113 (39)  244,428 (45)  21.18M    the same on a smaller scale in window 2, recovered by window 3
+
+Neither leg had the leader's stall (no transport error, no `has not progressed`; two legs against
+about one stall a leg before), which is what the tick was for, and no branch of the loop was
+slow (`took_ms=0` on every warning; the "long idle" ones are an engine with nothing to do).
+What both legs had instead is a follower falling behind and dragging the fleet down with it:
+node4 received the Decide for block 169 (`received Decide, committing block`) 21 ms *before* the
+block's body arrived, so the driver's commit ran a forkchoice for a block its engine did not have;
+the engine answered SYNCING, which the driver took as done. The body then arrived and the block
+was imported, but nothing ever made it canonical, so the next block's direct import waited 3 s
+for a parent it could not see (`parent ... not imported within 3s`), fell to the ordinary import
+(4 s a block), and from then on every block did the same. A follower 3 s a block behind stops
+pruning its queue, the queue crosses the ingest gate (407,500), the flood -- which waits for every
+node's answer -- stops, and the leader's queue runs dry: 47 empty blocks in A1's second window.
+Fixed: a commit the engine answers SYNCING to waits for the block's import like one that arrived
+while importing (`pending_commits`). The follower-drags-the-fleet coupling itself (one slow node's
+gate throttles the whole flood) is the bench's shape and stays; it is what a real network's
+mempool gossip would not do.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

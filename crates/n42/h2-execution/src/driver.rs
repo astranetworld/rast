@@ -1123,6 +1123,19 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     warn!(target: "n42.h2.el", block = ?block_hash, %validation_error, "forkchoice to a committed block refused");
                     DriverAction::Ignored
                 }
+                PayloadStatusEnum::Syncing => {
+                    // The engine does not have the block: the Decide came
+                    // before the body (a follower hears consensus before the
+                    // body channel delivers). Taking this as done left the
+                    // block imported but never canonical, so the next block's
+                    // direct import could not find its parent, fell to the
+                    // ordinary path, and the node dropped 3 s behind for the
+                    // rest of the leg (loop149 A1, node4). The commit waits
+                    // for the import that follows.
+                    info!(target: "n42.h2.el", block = ?block_hash, "forkchoice to a committed block the engine does not have yet; the commit waits for its import");
+                    self.pending_commits.insert(block_hash);
+                    DriverAction::Ignored
+                }
                 _ => {
                     self.head = block_hash;
                     // Committed blocks never need re-execution.
