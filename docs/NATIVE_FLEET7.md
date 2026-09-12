@@ -2278,6 +2278,70 @@ the rewind -- `a_switch_to_a_shorter_sibling_rewinds_the_persisted_cursor`). The
 SYNCING commit fix from loop149 fired three times in A2 (`the commit waits for its import`).
 loop151 measures the reorg fixes: a stall and a TC must cost their seconds and nothing more.
 
+**loop151 (2026-09-12 07:54-08:04 EDT): the reorg fixes hold, and the third defect behind the
+sibling shows.** With the sealed block found rather than taken and the forest rewinding, A1 still
+stood after the stall: the fork insert of the sibling no longer executed an empty body and the
+forest followed the switch (`could not follow` 0, `fork chain` 1), but the leader's engine
+executed the header-only `newPayload` of the sibling *while* the hand-off's executed insert of
+the same block landed a few milliseconds earlier, reth's payload processor aborted that execution
+part way ("receipt root task received incomplete receipts"), and `validate_block_post_execution`
+recorded the partial result -- receipts root empty, gas 0 -- over the build's fields. Every header
+after it was rejected as before. A result whose receipts do not cover the block's transactions is
+not recorded now (`8e513160b`); loop152 measures it.
+
+    leg          win1          win2          win3          round     what happened
+    loop151 A1   260,743 (48)        0             0        7.82M    stall, TC, sibling; the partial result recorded; chain stood at 129
+    loop151 A2   282,260 (52)  189,717 (37)  151,940 (28)  18.73M    a stall and three TCs, no sibling, no rejection; full round
+
+
+**loop152 (2026-09-12 08:09-08:20 EDT): the fourth and fifth defects behind the sibling, and the
+second form of the follower's lost commit.** Two legs:
+
+    leg          win1          win2          win3      what happened
+    loop152 A1   307,250 (57)   21,383 (39)   0 (49)   a follower's Decide 49 ms before the body; its early forkchoice answered as done; 42 parent waits; flood stalled
+    loop152 A2   282,402 (52)   92,323 (17)        0    stall, TC, sibling: the incomplete result was not recorded (guard fired), the chain still stood
+
+A2 showed why: the guard kept the registry clean, but the engine's canonical state for the sibling
+was still the aborted execution's -- reth's tree drops an executed insert whose number is not above
+its canonical block number ("outdated block"), so the hand-off of a sibling at the height of the
+own block already made canonical was skipped, the header-only `newPayload` executed it on the
+fork path, and on QMDB that execution ran against the head's state (every transaction refused,
+0 receipts, gas 0). The next build ran on that state and its root differed from the followers'.
+The hand-off now moves the engine's head to the sibling's parent first (`5e7e50669`), so the
+executed insert extends the head and the payload finds the block already known. A1 was the
+follower cascade of loop149 in its second form -- the early forkchoice was answered as done, not
+SYNCING -- so the driver now repeats the forkchoice when an import lands for the block consensus
+last committed (`7cfa757ab`). loop154 measures both.
+
+**loop154 (2026-09-12 08:24-08:36 EDT): a stall and a TC cost their seconds; the follower's
+lost commit in its third form.** Two legs with the engine's head moved to the parent before a
+forking own block is handed off:
+
+    leg          win1          win2          win3          round     what happened
+    loop154 A1   298,713 (55)  146,632 (27)  113,253 (45)  16.77M    a stall + 2 TCs, no sibling, 0 rejected; then node5's lost commit (20 parent waits)
+    loop154 A2   322,920 (60)  228,051 (42)  173,727 (46)  21.76M    clean: no stall, 1 TC, 0 rejected, 0 parent waits
+
+A1's stall and TCs no longer took the chain with them (the first legs since loop146 A1 where
+that is true), but a follower again heard each Decide tens of milliseconds before the body,
+block after block, and the repeat-on-import rule keyed on "the block consensus last committed"
+never matched -- by the time an import landed the next block's commit had moved on, so no
+forkchoice ever followed an import on that node. The driver now keeps the imports that landed
+and the commits that ran for blocks it had not imported, and repeats each of those when its
+block lands (`4e57e8823`,
+`commits_ahead_of_their_imports_are_each_repeated_when_the_import_lands`). loop155 measures it.
+
+**loop155 (2026-09-12 08:38-08:50 EDT): every commit ahead of its import repeated.** Two legs:
+
+    leg          win1          win2          win3          round     what happened
+    loop155 A1   298,718 (55)  228,056 (42)  183,903 (43)  21.35M    clean: no stall, 1 TC, 0 rejected, 0 parent waits
+    loop155 A2   314,915 (58)  233,487 (43)  152,065 (37)  21.03M    clean: no stall, 1 TC, 0 rejected; 9 parent waits late in window 3
+
+Four legs in a row since `5e7e50669` ran to the end with no header rejected (loop154 A1 through
+its stall and two TCs, loop154 A2, loop155 A1, loop155 A2), against one dead leg in two from
+loop147 to loop152. Adopted on main. What the round loses now is the stall itself when it
+happens (7-10 s and a TC at a tenure change, still open) and the late-window memory phase.
+
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
