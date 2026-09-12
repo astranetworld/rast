@@ -2015,6 +2015,32 @@ runs the same legs with those timed (`setup_ms`, `par_ms`, `sealed_at_ms`, and t
 QMDB root): 40-65 ms of a ~230 ms path, a parallel trie over 163,000 encodings; the fold (97-130)
 is the other half.
 
+**loop138 (2026-09-12 02:55-03:17 EDT): the seal-first path timed from the build's start -- and a
+box in its slow state.** Same legs as loop137 with the timings added (`setup_ms`, `par_ms`,
+`sealed_at_ms`, the pre-work in `build_on_own`):
+
+    leg  win1          win2     win3     blocks/window   pool order9+ at start
+    W    260,709 (48)  199,958  182,468  48 / 39 / 37    13,446
+    S1   278,824 (53)  217,808  186,311  53 / 42 / 38    12,610
+    C1   264,499 (49)  195,788  205,076  49 / 38 / 40    12,707
+    S2   252,677 (47)  190,562  210,064  47 / 38 / 41    12,926
+    C2   293,229 (55)  203,111  173,345  55 / 40 / 36    12,316
+
+Every leg but the last read 250-280k where loop137 read 297-307k: the huge-page pool at the
+legs' start was 33-35 GB against 37-42 GB, the box's swap is full (7 GB of tmpfs), kcompactd
+busy -- the bimodal regime of round 43, not the code (C2, the last leg, came back to 293k). The
+legs are not comparable and the round says nothing about seal-first beyond loop137. What it
+does say, from S1's 211 early seals at full blocks (medians): the validator's request is
+answered 469 ms later; of that the pre-work in `build_on_own` (the parent's body cloned for the
+overlay, the opener, the cached reads) is 24, `setup` 0, the parallel step 405 -- pull 23,
+partition 2, execution 90 (p90 241, contended), fold 138 (the receipts loop and the graft),
+and ~150 not on any phase line: the results' collection and their sort by index (163,000
+entries of a transaction and its outcome), the keys and the checks around the step -- then the
+transactions root 42 and the seal ~10. Behind the seal: merge 2, state ready 26, the roots 64
+(QMDB, hashed state and receipts in parallel), the finish 119 in all. loop139 places the
+results by index instead of sorting, skips the cache inserts in the fold when the block will
+seal early (nothing after the graft reads them), and times the fold in two.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the

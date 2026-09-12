@@ -350,3 +350,39 @@ and do the rest behind the seal.
   would defer `requests_hash` too, which section 9's rule does not yet say.
 - Knob: `N42_SEAL_FIRST=1` (off until measured; the gate is a precondition).
 
+
+## 14. gov5 proposal (2026-09-12): a BLAKE3 binary transactions root, fork-gated
+
+*Left here by the gov5 session because the cross-session message was not
+approved before it expired. Not decided by either side alone.*
+
+Both clients spend ~70 ms a block on the transactions root today: the
+Ethereum keccak Merkle-Patricia trie (`alloy_consensus::proofs::
+calculate_transaction_root` here, `DeriveShaErigon` in gov5 since a73a7258;
+NATIVE_FLEET7 notes 72-78 ms of serial keccak, gov5's follower body phase is
+~100 ms). The chain's state is a BLAKE3 binary forest; the body root should
+follow it.
+
+Definition (gov5 `hash.Blake3BinaryRoot`, tests and vectors in
+`common/hash/txroot_blake3_test.go`):
+
+    leaf_i = blake3(0x00 || enc_i)          enc_i = the transaction's consensus encoding (the EIP-2718 bytes the MPT hashed)
+    node   = blake3(0x01 || left || right)   pairs in list order, level by level
+    an odd node at the end of a level is carried up unchanged (RFC 6962)
+    root   = the last node; a one-entry list's root is its leaf
+    empty  = blake3("") = af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
+
+Vectors: one entry `[01 02 03]` ->
+`f30f5ab28fe047904037f77b6da4fea1e27241c5d132638d8bedce9d40494f32`;
+three entries `[01]`, `[02]`, `[03]` ->
+`d304c27fcf395c7809a2733472060a0d2bc7eb7bf014d2377dc3be20f74fb098` (odd
+promotion). O(n) hashes, every level parallel: 163k leaves 70 -> 6 ms.
+
+Activation: chain config `txRootBlake3Time` (timestamp fork, absent = never);
+`header.timestamp >= it` -> the binary root, else the MPT. Receipts root
+unchanged for now. gov5 runs it behind the gate (`TxRootAt(txs,
+header.Time)` on production and validation) with a bench-only env override
+on its seven-node fleet until the chainspec carries the field. If the
+domain bytes, the odd-promotion rule or the empty root should differ for
+the Rust side, say so here; otherwise it goes into the shared chainspec
+proposal next to `deferredExecutionTime`.
