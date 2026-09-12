@@ -326,3 +326,29 @@ async fn a_commit_that_ran_before_the_import_is_repeated_when_the_import_lands()
         .count();
     assert_eq!(forkchoices, 2, "the early forkchoice and the one after the import");
 }
+
+/// Block after block with the Decide ahead of the body (loop154: the
+/// follower's forkchoice for the next block ran before this one's import
+/// landed, so no forkchoice ever ran after an import): every commit that
+/// ran before its block arrived is repeated when that block's import lands.
+#[tokio::test]
+async fn commits_ahead_of_their_imports_are_each_repeated_when_the_import_lands() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let a = B256::repeat_byte(0x55);
+    let b = B256::repeat_byte(0x56);
+    driver.handle_output(&committed(a)).await;
+    driver.handle_output(&committed(b)).await;
+    driver.cache_payload(a, MockExecutionLayer::payload_for(a, 1));
+    driver.cache_payload(b, MockExecutionLayer::payload_for(b, 2));
+    assert_eq!(driver.handle_output(&execute(a)).await.imported_block(), Some(a));
+    assert_eq!(driver.handle_output(&execute(b)).await.imported_block(), Some(b));
+    let forkchoices_to = |hash: B256| {
+        el.calls()
+            .into_iter()
+            .filter(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == hash))
+            .count()
+    };
+    assert_eq!(forkchoices_to(a), 2, "A: the early forkchoice and the one after its import");
+    assert_eq!(forkchoices_to(b), 2, "B: the same, although A's import landed after B's commit");
+}

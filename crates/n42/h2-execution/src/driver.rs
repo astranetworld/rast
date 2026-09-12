@@ -293,6 +293,15 @@ pub struct ExecutionDriver<E> {
     /// another path (the leader's own block by header, a synced range)
     /// commits at once, as before.
     pending_commits: std::collections::HashSet<B256>,
+    /// Blocks whose import landed here (any path), newest last, bounded:
+    /// what a commit checks to know whether the engine had the block.
+    imported: std::collections::VecDeque<B256>,
+    /// Commits that ran before the block reached this node at all -- a
+    /// follower hears the Decide before the body channel delivers (tens of
+    /// milliseconds apart under load, and block after block: loop152-154).
+    /// The forkchoice the engine answered then made nothing canonical; it
+    /// runs again when the block's import lands.
+    commits_ahead: std::collections::HashSet<B256>,
     /// Bounds `payloads` so a peer cannot make us buffer without limit.
     max_cached_payloads: usize,
     /// Insertion order, for evicting the oldest cached payload.
@@ -323,6 +332,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             finalized: genesis,
             executing: std::collections::HashSet::new(),
             pending_commits: std::collections::HashSet::new(),
+            imported: std::collections::VecDeque::new(),
+            commits_ahead: std::collections::HashSet::new(),
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
         }
@@ -920,7 +931,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         actions.push(match verdict {
             ImportVerdict::Imported => {
                 self.head = block_hash;
-                if self.pending_commits.remove(&block_hash) || self.finalized == block_hash {
+                self.note_imported(block_hash);
+                if self.pending_commits.remove(&block_hash) || self.commits_ahead.remove(&block_hash) {
                     // The commit that waited for this import -- or one that
                     // ran before the body arrived, against an engine that
                     // did not have the block (loop152: the forkchoice was
@@ -1078,7 +1090,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     self.head = block_hash;
-                    if self.pending_commits.remove(&block_hash) || self.finalized == block_hash {
+                    self.note_imported(block_hash);
+                    if self.pending_commits.remove(&block_hash) || self.commits_ahead.remove(&block_hash) {
                         // The commit that waited for this import, or one that
                         // ran before the block arrived (see `finish_execute`);
                         // its own action is a log line the node does nothing
@@ -1106,6 +1119,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     }
 
     /// Commit path: makes a committed block the head and the finalised block.
+    /// Records an import that landed, bounded to the last 256.
+    fn note_imported(&mut self, block_hash: B256) {
+        if self.imported.contains(&block_hash) {
+            return;
+        }
+        self.imported.push_back(block_hash);
+        while self.imported.len() > 256 {
+            self.imported.pop_front();
+        }
+    }
+
     async fn commit(&mut self, block_hash: B256) -> DriverAction {
         if self.is_importing(&block_hash) {
             // Still importing, or queued behind the imports in flight: the
@@ -1114,6 +1138,19 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             return DriverAction::Ignored;
         }
         self.finalized = block_hash;
+        if !self.imported.contains(&block_hash) {
+            // The block has not reached this node: whatever the engine says
+            // to this forkchoice, it runs again when the import lands. A
+            // block imported by a path the driver does not see (a synced
+            // range) stays in the set until it is bounded away, harmlessly.
+            self.commits_ahead.insert(block_hash);
+            if self.commits_ahead.len() > 64 {
+                let stale: Vec<B256> = self.commits_ahead.iter().copied().take(self.commits_ahead.len() - 64).collect();
+                for hash in stale {
+                    self.commits_ahead.remove(&hash);
+                }
+            }
+        }
         let state = ForkchoiceState {
             head_block_hash: block_hash,
             safe_block_hash: block_hash,
