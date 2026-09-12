@@ -304,3 +304,25 @@ async fn a_commit_the_engine_does_not_have_yet_waits_for_the_import() {
         .count();
     assert_eq!(forkchoices, 2, "the refused forkchoice and the one after the import");
 }
+
+/// The same order with an engine that answers the early forkchoice as if it
+/// had the block (loop152: no SYNCING, and the block still never became
+/// canonical): the import that follows a commit of the same block runs the
+/// forkchoice again.
+#[tokio::test]
+async fn a_commit_that_ran_before_the_import_is_repeated_when_the_import_lands() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let hash = B256::repeat_byte(0x44);
+    let action = driver.handle_output(&committed(hash)).await;
+    assert_eq!(action.finalized_block(), Some(hash));
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    let action = driver.handle_output(&execute(hash)).await;
+    assert_eq!(action.imported_block(), Some(hash));
+    let forkchoices = el
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == hash))
+        .count();
+    assert_eq!(forkchoices, 2, "the early forkchoice and the one after the import");
+}

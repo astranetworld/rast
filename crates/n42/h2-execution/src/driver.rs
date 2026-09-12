@@ -920,7 +920,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         actions.push(match verdict {
             ImportVerdict::Imported => {
                 self.head = block_hash;
-                if self.pending_commits.remove(&block_hash) {
+                if self.pending_commits.remove(&block_hash) || self.finalized == block_hash {
+                    // The commit that waited for this import -- or one that
+                    // ran before the body arrived, against an engine that
+                    // did not have the block (loop152: the forkchoice was
+                    // answered, the block was imported a moment later and
+                    // never made canonical, the next block's direct import
+                    // could not see its parent, the node fell behind). The
+                    // forkchoice is idempotent; it runs again now.
                     let _ = self.commit(block_hash).await;
                 }
                 DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
@@ -1071,9 +1078,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     self.head = block_hash;
-                    if self.pending_commits.remove(&block_hash) {
-                        // The commit that waited for this import; its own
-                        // action is a log line the node does nothing with.
+                    if self.pending_commits.remove(&block_hash) || self.finalized == block_hash {
+                        // The commit that waited for this import, or one that
+                        // ran before the block arrived (see `finish_execute`);
+                        // its own action is a log line the node does nothing
+                        // with.
                         let _ = self.commit(block_hash).await;
                     }
                     DriverAction::Consensus(Box::new(ConsensusEvent::BlockImported(block_hash)))
