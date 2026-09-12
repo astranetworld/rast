@@ -99,11 +99,22 @@ where
         let expected_hash = payload.block_hash();
         // A block this node built and has just handed to the engine as
         // executed: the payload is its own, and the block is already made.
-        if let Some(block) = crate::built_executions::take_sealed(expected_hash) {
+        if let Some(block) = crate::built_executions::find_sealed(expected_hash) {
             return Ok(block);
         }
         let started = std::time::Instant::now();
         let tx_count = payload.payload.as_v1().transactions.len();
+        // The header-only own-block payload carries no transactions at all;
+        // its body is the sealed block above. Without it there is nothing to
+        // execute -- decoding the empty list made a block with an empty body
+        // under the announced header, and the engine executed it (loop147:
+        // receipts root empty, gas 0 recorded for the block, every header
+        // after it rejected). The validator's fallback sends the full payload.
+        if tx_count == 0 && crate::built_executions::sealed_here_with_transactions(expected_hash) {
+            return Err(NewPayloadError::Other(
+                format!("header-only own-block payload {expected_hash}: the sealed block is no longer kept; send the full payload").into(),
+            ));
+        }
 
         // Decoded once. This used to be three full conversions of the same
         // payload -- the reconstruction, a second to learn the Ethereum-shaped

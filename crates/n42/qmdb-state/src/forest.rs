@@ -782,7 +782,13 @@ impl QmdbForest {
         let head = self.head.1;
         self.move_to(head)?;
         let next_slot = self.tree.next_slot();
-        if base_next_slot > next_slot {
+        // A tree shorter than the persisted state is a branch switch that
+        // reverted persisted appends and re-appended fewer (a sibling with
+        // fewer entries than the block it replaced: loop147-150, the
+        // leader's re-proposal after a TC) -- legitimate when a move
+        // rewound the cursor below it, which the low-water mark records.
+        // Otherwise nothing explains it, and the delta is refused.
+        if base_next_slot > next_slot && self.min_cursor > next_slot {
             return Err(StateError::DeltaBase {
                 expected: next_slot,
                 found: base_next_slot,
@@ -1216,6 +1222,38 @@ mod tests {
         let measured = forest.delta_since(first[0].next_slot).unwrap();
         replayed.apply_delta(&measured).unwrap();
         assert_eq!(replayed.tree, forest.snapshot().unwrap().tree);
+    }
+
+    /// A sibling with fewer entries than the persisted block it replaces
+    /// leaves the tree shorter than the persisted state (the leader's
+    /// re-proposal after a TC, loop147-150): the measured delta rewinds the
+    /// persisted cursor to the low-water mark of the move and re-appends
+    /// from there, instead of refusing the base.
+    #[test]
+    fn a_switch_to_a_shorter_sibling_rewinds_the_persisted_cursor() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let mut replayed = forest.snapshot().unwrap();
+        let cursor = forest.next_slot();
+        let mut big = BlockChanges::new();
+        for byte in 0x10u8..0x18 {
+            big.set_account(
+                Address::with_last_byte(byte),
+                AccountState { nonce: 1, balance: U256::from(byte), code_hash: B256::ZERO },
+            );
+        }
+        forest.apply(GENESIS, h(0x0A), 1, &big).unwrap();
+        forest.set_canonical(h(0x0A)).unwrap();
+        let first = forest.delta_since(cursor).unwrap();
+        replayed.apply_delta(&first).unwrap();
+
+        forest.apply(GENESIS, h(0x0B), 1, &changes(2)).unwrap();
+        forest.set_canonical(h(0x0B)).unwrap();
+        assert!(forest.next_slot() < first.next_slot, "the sibling appended fewer entries than the block it replaced");
+        let measured = forest.delta_since(first.next_slot).unwrap();
+        assert!(measured.base_next_slot < first.next_slot, "the delta rewinds the persisted cursor");
+        replayed.apply_delta(&measured).unwrap();
+        assert_eq!(replayed.tree, forest.snapshot().unwrap().tree);
+        assert_eq!(QmdbForest::from_snapshot(&replayed).unwrap().root(), forest.root());
     }
 
     /// A delta is refused by the state it does not describe. Applying one to

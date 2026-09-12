@@ -309,6 +309,14 @@ fn sealed_store() -> &'static Mutex<VecDeque<(B256, SealedBlock<Block>)>> {
 
 /// Keeps the sealed block under its sealed hash.
 pub fn remember_sealed(sealed_hash: B256, block: SealedBlock<Block>) {
+    {
+        let mut hints = sealed_hints().lock().unwrap_or_else(|p| p.into_inner());
+        hints.retain(|(hash, _)| *hash != sealed_hash);
+        while hints.len() >= SEALED_HINTS {
+            hints.pop_front();
+        }
+        hints.push_back((sealed_hash, block.body().transactions.len()));
+    }
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     store.retain(|(hash, _)| *hash != sealed_hash);
     while store.len() >= KEEP {
@@ -317,10 +325,40 @@ pub fn remember_sealed(sealed_hash: B256, block: SealedBlock<Block>) {
     store.push_back((sealed_hash, block));
 }
 
+/// How many sealed hashes [`sealed_here_with_transactions`] remembers: the
+/// sealed blocks themselves are retired after [`KEEP`], their hashes and
+/// transaction counts stay much longer, so a header-only payload for a
+/// block whose body is gone is recognised as such.
+const SEALED_HINTS: usize = 256;
+
+fn sealed_hints() -> &'static Mutex<VecDeque<(B256, usize)>> {
+    static HINTS: OnceLock<Mutex<VecDeque<(B256, usize)>>> = OnceLock::new();
+    HINTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(SEALED_HINTS)))
+}
+
+/// Whether this node sealed `hash` itself with a non-empty body: a payload
+/// for it that carries no transactions is the header-only own-block payload
+/// (`request::OWN_BLOCK`) whose sealed block the store no longer holds, not
+/// an empty block.
+pub fn sealed_here_with_transactions(hash: B256) -> bool {
+    let hints = sealed_hints().lock().unwrap_or_else(|p| p.into_inner());
+    hints.iter().any(|(sealed, transactions)| *sealed == hash && *transactions > 0)
+}
+
 /// The sealed block under this hash, if one was kept; taken out, so a
 /// payload converted twice decodes the second time.
 pub fn take_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
     let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
     store.remove(at).map(|(_, block)| block)
+}
+
+/// The sealed block under this hash, left in the store: the engine converts
+/// a header-only own-block payload more than once on some paths (a sibling
+/// re-proposed after a TC was converted, then executed with the *empty*
+/// transaction list the payload carries: loop147-150), and every conversion
+/// must find the body. The store's bound (`KEEP`) retires it.
+pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
+    let store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.clone())
 }
