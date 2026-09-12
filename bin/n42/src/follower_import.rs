@@ -59,7 +59,7 @@ pub fn note_import_landed() {
 
 /// How long a check waits for the block's parent to land before giving the
 /// block up to the engine's ordinary path (which answers SYNCING).
-const PARENT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const PARENT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The parent's sealed header once the parent is in: known to the provider
 /// and, under deferred execution, executed here (its result recorded), so

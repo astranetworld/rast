@@ -750,6 +750,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.executing.contains(block_hash)
     }
 
+    /// The blocks whose imports are in flight.
+    pub fn importing(&self) -> impl Iterator<Item = &B256> {
+        self.executing.iter()
+    }
+
     /// Whether a block stamped `timestamp` is under deferred execution.
     fn deferred_at(&self, timestamp: u64) -> bool {
         self.deferred_execution_time.is_some_and(|at| timestamp >= at)

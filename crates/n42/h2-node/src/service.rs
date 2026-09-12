@@ -2246,11 +2246,28 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// synchronously with the import, so its height is the truthful answer when
     /// the header is known; `imported_height` remains the fallback for a head
     /// this node never saw a header for.
+    ///
+    /// Under deferred execution a block is checked, voted for and then
+    /// imported beside the loop, and the next block arrives while it is
+    /// still executing: the blocks in flight count as the tip too, or every
+    /// second block would be held until the first one lands (loop133 A1:
+    /// ~250 ms of every cycle).
     fn imported_tip(&self) -> Option<u64> {
-        self.block_headers
+        let head = self
+            .block_headers
             .get(&self.driver.head())
             .map(|header| header.number)
-            .or(self.imported_height)
+            .or(self.imported_height);
+        let in_flight = self
+            .driver
+            .importing()
+            .filter_map(|hash| self.block_headers.get(hash))
+            .map(|header| header.number)
+            .max();
+        match (head, in_flight) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
 
