@@ -1861,6 +1861,52 @@ are 1-6 ms of a direct import with the ingest's cache). Not adopted. The stage-2
 of deferred execution (loop132, `docs/PHASE_D_DEFERRED_EXECUTION.md` section 11) follows on
 the same box state.
 
+**loop132-133 (2026-09-11 19:23-20:12 EDT): deferred execution's first bench legs -- two defects
+of the pipeline, and the follower's numbers at full blocks.** The stage-2 build (`target/deferred`,
+`docs/PHASE_D_DEFERRED_EXECUTION.md` section 11) on the bench genesis (C legs, the fork never
+reached) and on the same genesis with `deferredExecutionTime: 0` (A legs), record configuration:
+
+    round   leg  win1          win2     win3     blocks/window   note
+    loop132 W    293,384 (54)  208,314  200,959  54 / 39 / 38    ungated: parity with target/release (loop131 A: 292k)
+    loop132 C1   287,140 (53)  204,544  196,415  53 / 39 / 37
+    loop132 A1     3,317 (3)    10,866   10,866   3 /  6 /  6    gated: stalled, 10 s cycle (defect 1)
+    loop132 C2   282,932 (52)  ...                               (post-processing; not read)
+    loop132 A2     4,067 (3)                                     gated: stalled (defect 1)
+    loop133 W    290,806 (54)  208,034  197,634  54 / 39 / 37    rebuilt with the fix for defect 1
+    loop133 C1   287,955 (53)  212,552   16,414  53 / 41 / 46    window 3: empty blocks with the flood at 194k/s
+    loop133 A1   169,851 (45)   44,125   27,166  45 / 9 / 4      gated: a 31 s stall at a tenure change (defect 2)
+    loop133 C2   295,222 (55)  220,139   14,862  55 / 40 / 46    window 3 as C1
+    loop133 A2   245,133 (46)   10,864        0  46 / 6 / 0      gated: 0.652 s cycle at 95.9% full; the flood stopped at +60 s
+
+Defect 1 (loop132 A1/A2): with the vote sent on the check, the Decide for a block arrives while
+the block is still executing, and the validator's service dropped that commit as "a block the
+execution layer has not imported"; the block never got its forkchoice, never became canonical,
+and the next block's check waited the whole parent timeout. Fixed (d628d085d): a commit for a
+block in flight goes to the driver, which runs the forkchoice when the import lands. Blocks
+1-81 of every gated leg (the base-fee decay) had passed because empty blocks import before the
+Decide, and the smoke run for the same reason.
+
+Defect 2 (loop133 A1/A2): the service holds a block that is more than one past the execution
+layer's tip, and the tip was the driver's head, which moves when an import *lands* -- so from
+the fork on every second block was held until the previous one landed (node2's followers:
+`import starting since_body_ms=200-340` on every block, a serial chain again), and a follower
+that fell behind at a tenure change stalled the fleet 31 s. Fixed (568ded61c): the imports in
+flight count as the tip; loop134 measures it.
+
+What A2 says about the follower at full blocks (163,000 0x50 transfers, every node's execution
+layer log): the check -- header rules, body, sender recovery, the parent's fields, the
+includability pass -- takes 123-138 ms (median per node; the sender recovery is most of it), the
+import after it 330-375 ms; the vote leaves 130 ms after the body, the Decide follows ~10 ms
+later, and the parent's import is what the next check waits for. With the hold of defect 2 the
+cycle read 0.652 s at 95.9% occupancy (245k); without it the follower's serial chain is the
+import plus the includability pass, ~370-400 ms at this shape, if the supply keeps up.
+
+Two anomalies of windows 2-3, on both chains: loop133 C1/C2 built near-empty blocks in window
+3 with the flood still delivering 194-236k/s and the queue at 410k; loop133 A2's flood stopped
+sending at +60 s (0/s, no replies, the ingest at 8% busy and the queue draining). Neither is in
+loop131 or loop132 on the same box state; both are after the gov5 fleet's departure (7 GB of
+swapped tmpfs, 16.6 GB shmem). Not attributed yet; window 1 is the metric here.
+
 ### Is 147,000 accounts per 163,000 transfers a realistic shape? (2026-09-07)
 
 (The standalone note is `docs/BLOCK_SHAPE_SURVEY.md`; it also carries the
