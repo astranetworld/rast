@@ -154,6 +154,16 @@ pub struct OwnBlockReuse {
     /// did not. Round 38 measured the plain executor at 121 ms a block
     /// against ~340 ms in the engine's payload-processor path.
     pub import_foreign: Option<std::sync::Arc<ForeignImport>>,
+    /// The engine's canonical head, for the own block that forks from it.
+    ///
+    /// reth's tree drops an executed insert whose number is not above its
+    /// canonical block number ("outdated block"): a sibling the leader
+    /// re-proposes after a TC, at the height of the own block it already
+    /// made canonical, was skipped, and the header-only `newPayload` that
+    /// followed executed the sibling on the fork path -- on QMDB, against
+    /// the wrong state (loop147-152: every header after it rejected). The
+    /// head is moved to the sibling's parent first, so the insert extends it.
+    pub canonical_head: Option<std::sync::Arc<dyn Fn() -> Option<B256> + Send + Sync>>,
 }
 
 /// Executes and checks another node's block; see [`OwnBlockReuse::import_foreign`].
@@ -423,6 +433,33 @@ where
     let sealed_hash = header.hash_slow();
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = built.block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
+    // A block that forks from the engine's head (a sibling re-proposed
+    // after a TC): the head goes back to the parent first, or the tree
+    // drops the executed insert as outdated and executes the payload
+    // itself, on the fork path. See `OwnBlockReuse::canonical_head`.
+    if let Some(head) = reuse.canonical_head.as_ref().and_then(|current| current()) {
+        if head != header.parent_hash {
+            let moved_at = std::time::Instant::now();
+            let state = alloy_rpc_types_engine::ForkchoiceState {
+                head_block_hash: header.parent_hash,
+                safe_block_hash: header.parent_hash,
+                finalized_block_hash: header.parent_hash,
+            };
+            match engine.fork_choice_updated(state, None).await {
+                Ok(updated) => info!(
+                    target: "n42.payload_serve",
+                    number, parent = ?header.parent_hash, engine_head = ?head, status = ?updated.payload_status.status,
+                    moved_ms = moved_at.elapsed().as_millis() as u64,
+                    "own block forks from the engine's head; the head was moved to its parent first"
+                ),
+                Err(err) => warn!(
+                    target: "n42.payload_serve",
+                    number, parent = ?header.parent_hash, engine_head = ?head, %err,
+                    "own block forks from the engine's head and the head could not be moved to its parent"
+                ),
+            }
+        }
+    }
     let handoff_at = std::time::Instant::now();
     stage.at(2);
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, std::time::Duration::ZERO)

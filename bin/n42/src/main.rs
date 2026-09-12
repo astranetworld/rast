@@ -263,6 +263,10 @@ fn main() {
                                 ),
                                 qmdb: qmdb_for_startup.clone(),
                                 inserts: reth_node_builder::executed_inserts::sender(),
+                                canonical_head: Some(std::sync::Arc::new({
+                                    let provider = node.provider.clone();
+                                    move || reth_provider::BlockNumReader::chain_info(&provider).ok().map(|info| info.best_hash)
+                                })),
                                 // Opt-in (N42_PRUNE_POOL_ON_IMPORT=1), measured and not
                                 // adopted: removing a block's 163,000 transactions from
                                 // reth's pool costs 260-293 ms under its write lock -- the
