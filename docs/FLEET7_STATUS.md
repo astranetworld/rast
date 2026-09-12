@@ -1,5 +1,8 @@
 # Fleet7 status (living note; last updated 2026-09-09 14:30 EDT)
 
+> **Superseded for current state by `docs/FLEET7_HANDOFF.md` (2026-09-12 08:55 EDT)**: records,
+> what is on main, what is open and the next steps. This note is kept for its history.
+
 The one-page state of the native seven-node fleet work: what is true now, how
 it is measured, what has been cut, what is in flight and what is next. The
 measurements behind every claim are in `docs/NATIVE_FLEET7.md` (rounds 40-43,

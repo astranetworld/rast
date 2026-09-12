@@ -468,7 +468,7 @@ finish replaces it.
 - Not deferred execution's, but found by these legs: the transaction queue stranded the sender
   whose run a full block cut short (`5e52dcd64`, `NATIVE_FLEET7.md` loop143-145).
 
-### 16.2 Open: the reorg path after a sibling re-proposal (loop147)
+### 16.2 The reorg path after a sibling re-proposal (loop147-154), fixed
 
 A leader whose tenure is cut by a TC after it handed a block to its engine re-proposes the
 height with a different block. loop147 showed two defects behind that (`NATIVE_FLEET7.md`
@@ -486,10 +486,41 @@ loop147), neither reachable while the chain does not fork:
   bookkeeping assumes the file's tail is the branch being extended.
 
 Both fixed in `0a8dfc2e2` (`built_executions::find_sealed` + the header-only guard in
-`engine_validator`; `QmdbForest::delta_since` rewinding to the move's low-water mark), measured
-by loop151. The stall that triggers the TC (7-10 s before the leader's own-block `newPayload`
-is answered, at some tenure changes) is still open: it is not reth's persistence backpressure
-(count 0), not a slow branch of the node launcher's engine service loop, and not that loop
-going unpolled (its 250 ms tick never came late); what remains is the request not reaching the
-channel in time or the tree's handling of what precedes it. The case to exercise on purpose is a
-TC during a leader's tenure with a fresh build in its engine.
+`engine_validator`; `QmdbForest::delta_since` rewinding to the move's low-water mark). loop151-152
+then showed two more on the same path:
+
+- The hand-off's executed insert and the header-only `newPayload` of the same sibling raced in the
+  tree; the payload's execution was aborted part way and `validate_block_post_execution` recorded
+  the partial result (receipts root empty, gas 0). A result whose receipts do not cover the
+  block's transactions is not recorded (`8e513160b`).
+- reth's tree drops an executed insert whose number is not above its canonical block number
+  ("outdated block"), so a sibling at the height of the own block already made canonical was never
+  inserted and the payload executed it on the fork path, against the head's QMDB state. The
+  hand-off now moves the engine's head to the sibling's parent first (`5e7e50669`).
+
+With all four in, loop154 A1 went through a stall and two TCs with no header rejected, and
+loop154 A2, loop155 A1 and A2 ran clean (`NATIVE_FLEET7.md` loop154-155).
+
+### 16.3 Found on the way: a follower's commit that runs before the block arrives
+
+A follower can hear the Decide for a block before the body channel delivers it (1-50 ms under
+load, sometimes block after block). The commit's forkchoice then names a block the engine does
+not have; nothing makes the block canonical after its import lands; the next block's direct
+import waits `PARENT_WAIT` (3 s) for a parent the provider cannot see and falls to the ordinary
+path; the node falls behind, its queue crosses the ingest gate, and the flood (which waits for
+every node) stops. Three forms, three fixes: the engine answers SYNCING (`7a469e2f5`: the commit
+waits for the import); the engine answers as if done and the import lands for the last committed
+block (`7cfa757ab`); commits run ahead of several imports in a row (`4e57e8823`: the driver keeps
+the imports that landed and the commits that ran for blocks it had not imported, and repeats each
+when its block lands). loop155 A2 still showed one 3 s parent wait late in window 3, on an empty
+block (open; `docs/FLEET7_HANDOFF.md`).
+
+### 16.4 Open: the leader's stall
+
+7-10 s before the leader's own-block `newPayload` is answered, about once a leg at a tenure change;
+the validator's 8 s HTTP timeout then forms a TC (survivable since 16.2's fixes, but it costs the
+seconds). Ruled out: reth's persistence backpressure (`backpressure_stall_duration_count` 0 on
+every node), a slow branch of the node launcher's engine service loop (`took_ms=0`), and that loop
+going unpolled (its 250 ms tick never came late). Left: the request not reaching the engine's
+channel in time, or the tree busy with something unlogged before it. The case to exercise on
+purpose is a TC during a leader's tenure with a fresh build in its engine.
