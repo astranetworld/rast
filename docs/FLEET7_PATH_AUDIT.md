@@ -77,3 +77,10 @@ runs.
 | one WAL sync per RocksDB commit | `rocksdb/provider.rs` `commit_batches` | two fsyncs per save |
 | QMDB delta log and checkpoints durable | `crates/n42/qmdb-reth/src/node_state.rs` | correctness after an OS crash; one small fsync per block |
 | no keccak before the QMDB reader answers | `providers/state/latest.rs` | one keccak per read in `N42_QMDB_READS=on` |
+
+## 5. Behind a switch, off until a fleet leg measures it
+
+| change | switch | expected effect |
+| --- | --- | --- |
+| a follower's check of block N+1 reads its senders from block N's execution output, published by N's import as soon as N's QMDB root is filed, instead of waiting for N to land in the engine; untouched senders are read at N's parent, which is in the engine; N+1's execution still waits for N's insert | `N42_CHECK_ON_PARENT_OUTPUT=1` (`bin/n42/src/follower_import.rs`) | N's engine insert and hand-off bookkeeping (~60-80 ms) off every vote's path |
+

@@ -83,6 +83,87 @@ pub fn note_import_landed() {
     landed.notify_all();
 }
 
+/// The execution output of a block imported here, as its child's check reads it.
+type ParentOutput = Arc<reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>>;
+
+/// The last blocks imported here, published once their QMDB root is filed and
+/// before the engine takes them (`N42_CHECK_ON_PARENT_OUTPUT`).
+static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_traits::SealedHeader, ParentOutput)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// How many published outputs are kept: the check reads only the parent's.
+const PARENT_OUTPUTS_KEPT: usize = 4;
+
+/// `N42_CHECK_ON_PARENT_OUTPUT=1`: under deferred execution a block's check
+/// reads its senders from the parent's execution output, published by the
+/// parent's import as soon as its root is filed, instead of waiting for the
+/// parent to land in the engine. A follower's vote waited ~200 ms for the
+/// previous import to finish (loop155 A2: its carry, hashed post-state and
+/// engine insert included) although the check reads ~6,000 senders' nonces and
+/// balances, all in the parent's bundle after execution. The parent's
+/// execution fields must still be recorded, and this block's execution still
+/// waits for the parent in the engine. Off until a fleet leg measures it.
+fn check_on_parent_output() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_CHECK_ON_PARENT_OUTPUT").is_ok_and(|v| v == "1"))
+}
+
+/// Publishes a block's execution output for its child's check.
+fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::SealedHeader, output: ParentOutput) {
+    {
+        let mut outputs = PARENT_OUTPUTS.lock().unwrap_or_else(|p| p.into_inner());
+        outputs.retain(|(hash, _, _)| *hash != block_hash);
+        while outputs.len() >= PARENT_OUTPUTS_KEPT {
+            outputs.pop_front();
+        }
+        outputs.push_back((block_hash, header, output));
+    }
+    note_import_landed();
+}
+
+/// The parent's header and published execution output, once its execution
+/// fields are recorded; `None` if they do not appear within [`PARENT_WAIT`].
+fn wait_for_parent_output(parent_hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
+    let deadline = std::time::Instant::now() + PARENT_WAIT;
+    let (count, landed) = &IMPORT_LANDED;
+    let mut seen = *count.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        let found = PARENT_OUTPUTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(hash, _, _)| *hash == parent_hash)
+            .map(|(_, header, output)| (header.clone(), Arc::clone(output)));
+        if let Some(found) = found {
+            if n42_engine_types::executed_fields::get(&parent_hash).is_some() {
+                return Some(found);
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let guard = count.lock().unwrap_or_else(|p| p.into_inner());
+        let (guard, _) = landed
+            .wait_timeout_while(guard, (deadline - now).min(std::time::Duration::from_millis(20)), |c| *c == seen)
+            .unwrap_or_else(|p| p.into_inner());
+        seen = *guard;
+    }
+}
+
+/// A sender's account after the parent, from the parent's execution output:
+/// `None` when the parent did not touch it (its state is then the
+/// grandparent's), a default account when the parent destroyed it.
+fn account_after_parent(bundle: &reth_revm::db::BundleState, sender: &Address) -> Option<reth_primitives_traits::Account> {
+    bundle.account(sender).map(|account| {
+        account
+            .info
+            .as_ref()
+            .map(|info| reth_primitives_traits::Account { nonce: info.nonce, balance: info.balance, bytecode_hash: None })
+            .unwrap_or_default()
+    })
+}
+
 /// How long a check waits for the block's parent to land before giving the
 /// block up to the engine's ordinary path (which answers SYNCING).
 const PARENT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -164,6 +245,7 @@ fn spec_for_intrinsic_gas<ChainSpec: reth_chainspec::EthereumHardforks>(chain_sp
 fn check_includable<Provider>(
     provider: &Provider,
     parent_hash: B256,
+    parent_output: Option<(&reth_revm::db::BundleState, B256)>,
     block: &RecoveredBlock<Block>,
     chain_id: u64,
     spec: reth_revm::primitives::hardfork::SpecId,
@@ -209,12 +291,20 @@ where
     let checked: Vec<Result<(), String>> = groups
         .par_chunks(chunk)
         .map(|chunk| {
-            let state = provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}"))?;
+            // With the parent's output, an untouched sender is read at the
+            // grandparent, which is in the engine: the parent's own execution
+            // read its state there.
+            let state_at = parent_output.map_or(parent_hash, |(_, grandparent)| grandparent);
+            let state = provider.state_by_block_hash(state_at).map_err(|err| format!("parent state: {err}"))?;
             for (sender, indexes) in chunk {
-                let account = state
-                    .basic_account(sender)
-                    .map_err(|err| format!("account {sender}: {err}"))?
-                    .unwrap_or_default();
+                let after_parent = parent_output.and_then(|(bundle, _)| account_after_parent(bundle, sender));
+                let account = match after_parent {
+                    Some(account) => account,
+                    None => state
+                        .basic_account(sender)
+                        .map_err(|err| format!("account {sender}: {err}"))?
+                        .unwrap_or_default(),
+                };
                 let mut nonce = account.nonce;
                 let mut cost = alloy_primitives::U256::ZERO;
                 for &index in indexes {
@@ -405,16 +495,26 @@ where
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
     // against its post-state.
-    let parent = match parent_known {
-        Some(parent) => parent,
-        None => wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?,
+    let (parent, parent_output) = match parent_known {
+        Some(parent) => (parent, None),
+        None => match (deferred && check_on_parent_output()).then(|| wait_for_parent_output(parent_hash)).flatten() {
+            Some((parent, output)) => (parent, Some(output)),
+            None => (wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?, None),
+        },
     };
     consensus
         .validate_header_against_parent(recovered.sealed_header(), &parent)
         .map_err(|err| format!("header against parent: {err}"))?;
     if deferred {
         let check_at = std::time::Instant::now();
-        check_includable(provider, parent_hash, &recovered, chain_spec.chain().id(), spec_for_intrinsic_gas(chain_spec, recovered.timestamp))?;
+        check_includable(
+            provider,
+            parent_hash,
+            parent_output.as_ref().map(|output| (&output.state, parent.parent_hash)),
+            &recovered,
+            chain_spec.chain().id(),
+            spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
+        )?;
         tracing::debug!(
             target: "n42.follower_import",
             number,
@@ -425,6 +525,13 @@ where
             let _ = checked.send(());
         }
     }
+
+    // Checked on the parent's published output: its execution still needs
+    // the parent in the engine.
+    if parent_output.is_some() {
+        wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+    }
+    drop(parent_output);
 
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header.
@@ -569,6 +676,9 @@ where
     };
 
     let execution_output = Arc::new(output);
+    if deferred && check_on_parent_output() {
+        publish_parent_output(block_hash, recovered.clone_sealed_header(), Arc::clone(&execution_output));
+    }
     if carry_async && !parallel_executed {
         let state = Arc::clone(&execution_output);
         let carry = Arc::clone(carry);
@@ -670,3 +780,35 @@ pub fn parallel_state_commit() -> bool {
     *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").map_or(true, |v| v != "0"))
 }
 
+
+#[cfg(test)]
+mod parent_output_tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use reth_revm::db::BundleState;
+    use reth_revm::revm::state::AccountInfo;
+
+    /// A sender the parent changed reads its post-state; one it destroyed
+    /// reads empty; one it never touched is left to the grandparent's state.
+    #[test]
+    fn a_senders_account_after_the_parent_comes_from_its_bundle_when_touched() {
+        let changed = Address::with_last_byte(1);
+        let destroyed = Address::with_last_byte(2);
+        let untouched = Address::with_last_byte(3);
+        let before = AccountInfo { nonce: 4, balance: U256::from(10), ..Default::default() };
+        let after = AccountInfo { nonce: 5, balance: U256::from(7), ..Default::default() };
+        let bundle = BundleState::new(
+            [
+                (changed, Some(before.clone()), Some(after), Default::default()),
+                (destroyed, Some(before), None, Default::default()),
+            ],
+            Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
+            Vec::new(),
+        );
+        let account = account_after_parent(&bundle, &changed).expect("changed by the parent");
+        assert_eq!((account.nonce, account.balance), (5, U256::from(7)));
+        let account = account_after_parent(&bundle, &destroyed).expect("destroyed by the parent");
+        assert_eq!((account.nonce, account.balance), (0, U256::ZERO));
+        assert!(account_after_parent(&bundle, &untouched).is_none());
+    }
+}
