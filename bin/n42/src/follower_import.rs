@@ -534,14 +534,12 @@ where
     // value; both jobs borrow the bundle, which is plain data.
     //
     // `N42_HASHED_STATE=0` skips the pass entirely -- and stops the chain; see
-    // `hashed_state_enabled`. It exists for reth's
-    // Merkle-Patricia trie -- `MemoryOverlayStateProvider::trie_input` feeds
-    // it to `state_root`, `proof`, `multiproof` and `witness`, and
-    // `save_blocks` writes it to `HashedAccounts`/`HashedStorages` -- and this
-    // chain's state root and proofs come from QMDB instead, so on the paths
-    // the node actually runs nothing reads it. Ordinary account and storage
-    // reads do not: the overlay answers those from the bundle. It costs 26 ms
-    // of every import and holds ~15 MB a block until the block is persisted.
+    // `hashed_state_enabled`. Besides reth's Merkle-Patricia trie methods
+    // (`MemoryOverlayStateProvider::trie_input`), `save_blocks` writes it to
+    // `HashedAccounts`/`HashedStorages`, which under storage v2 are the
+    // persisted latest state every account and storage read falls back to
+    // once a block leaves the in-memory overlay. It costs 26 ms of every
+    // import and holds ~15 MB a block until the block is persisted.
     let hashed_job = move || {
         if hashed_state_enabled() {
             state.hashed_post_state(bundle).map_err(|err| format!("hashed state: {err}"))
@@ -616,15 +614,15 @@ fn fill_carry(
 /// `block gas used mismatch: got 0, expected 3423000000; gas spent by each
 /// transaction: []` -- the engine validating an executed block that has no
 /// receipts at all -- while the same binary with the pass left in read 199,751
-/// and 249,924. Reading the code says nothing on this chain's paths consumes
-/// the hashed state (the state root and the proofs come from QMDB; the
-/// overlay answers account and storage reads from the bundle; only reth's
-/// trie methods, two debug RPCs and the `HashedAccounts`/`HashedStorages`
-/// tables touch it). The fleet says otherwise, and the failure is a hard
-/// rejection rather than a missing index, so the dependency is somewhere in
-/// the engine's insert-and-validate path. Removing this pass -- 26 ms of every
-/// import and ~15 MB a block -- needs that path understood first, and the
-/// leader's own build handled too.
+/// and 249,924. The dependency: under storage v2 (the default) the
+/// `HashedAccounts`/`HashedStorages` tables are the persisted latest state --
+/// `LatestStateProviderRef` reads `basic_account` and `storage` from them, and
+/// `save_blocks` fills them only from each block's hashed post-state. Skipped,
+/// persisted blocks change no state table; once the in-memory overlay drops
+/// them, the senders they funded read as absent and the first full block
+/// executes to gas 0 (`docs/QMDB_UPGRADE_PLAN.md`, stage 6). Removing this
+/// pass -- 26 ms of every import and ~15 MB a block -- needs QMDB to serve
+/// those reads first, and the leader's own build handled too.
 fn hashed_state_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_HASHED_STATE").map_or(true, |v| v != "0"))
