@@ -20,7 +20,7 @@
 //!
 //! The window of held blocks is bounded, so it stays a window.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
@@ -275,7 +275,14 @@ pub struct QmdbForest {
     /// record names exactly the slots it flips, so recording them here — on the
     /// way in and on the way out — describes that half of the move without
     /// comparing two trees.
-    dirty_slots: BTreeSet<u64>,
+    ///
+    /// Appended to on every move (~147,000 slots a full block) and sorted
+    /// only when a delta is measured from it; `forget_changes` after a
+    /// block's own delta clears it without sorting. Deduplicated in place
+    /// when it doubles, so a forest that is never persisted stays bounded.
+    dirty_slots: Vec<u64>,
+    /// `dirty_slots.len()` after its last deduplication.
+    dirty_slots_deduped: usize,
     /// Trim long-dead twigs to their root on every head move.
     trim_twigs: bool,
     /// The lowest the append cursor has been since the last delta was taken.
@@ -406,7 +413,8 @@ impl QmdbForest {
             head: (number, hash),
             retain_depth: DEFAULT_RETAIN_DEPTH,
             trim_twigs: true,
-            dirty_slots: BTreeSet::new(),
+            dirty_slots: Vec::new(),
+            dirty_slots_deduped: 0,
             min_cursor: next_slot,
         }
     }
@@ -414,7 +422,12 @@ impl QmdbForest {
     /// Records what a move touched: the slots the undo names, and how far back
     /// it left the append cursor.
     fn note_move(&mut self, undo: &BlockUndo) {
-        self.dirty_slots.extend(undo.entries.iter().map(|entry| entry.slot));
+        self.dirty_slots.extend(undo.retired_slots());
+        if self.dirty_slots.len() > 2 * self.dirty_slots_deduped.max(1 << 20) {
+            self.dirty_slots.sort_unstable();
+            self.dirty_slots.dedup();
+            self.dirty_slots_deduped = self.dirty_slots.len();
+        }
         self.min_cursor = self.min_cursor.min(self.tree.next_slot());
     }
 
@@ -592,15 +605,11 @@ impl QmdbForest {
         };
         // The block only ever deactivates the slots its undo names (a
         // revival is a move, not a block), so no read: the flag is false.
-        let changed: Vec<(u64, bool)> = undo
-            .entries
-            .iter()
-            .map(|entry| entry.slot)
-            .filter(|slot| *slot < base_next_slot)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|slot| (slot, false))
-            .collect();
+        let mut slots: Vec<u64> =
+            undo.retired_slots().filter(|slot| *slot < base_next_slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let changed: Vec<(u64, bool)> = slots.into_iter().map(|slot| (slot, false)).collect();
         ForestDelta {
             version: ForestDelta::VERSION,
             head_number: 0,
@@ -813,16 +822,16 @@ impl QmdbForest {
                 .map(|slot| self.tree.entry_at(slot).ok_or(StateError::DeltaSlot(slot)))
                 .collect::<Result<Vec<_>, _>>()?
         };
+        self.dirty_slots.retain(|slot| *slot < base);
+        self.dirty_slots.sort_unstable();
+        self.dirty_slots.dedup();
         let changed = self
             .dirty_slots
             .iter()
-            .copied()
-            .filter(|slot| *slot < base)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|slot| self.tree.slot_active(slot).map(|active| (slot, active)).ok_or(StateError::DeltaSlot(slot)))
+            .map(|slot| self.tree.slot_active(*slot).map(|active| (*slot, active)).ok_or(StateError::DeltaSlot(*slot)))
             .collect::<Result<Vec<_>, _>>()?;
         self.dirty_slots.clear();
+        self.dirty_slots_deduped = 0;
         self.min_cursor = next_slot;
         Ok(ForestDelta {
             version: ForestDelta::VERSION,
@@ -849,6 +858,7 @@ impl QmdbForest {
     /// same, at the cost of copying every changed entry to discard it.
     pub fn forget_changes(&mut self) {
         self.dirty_slots.clear();
+        self.dirty_slots_deduped = 0;
         self.min_cursor = self.tree.next_slot();
     }
 

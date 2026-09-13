@@ -107,7 +107,8 @@ hashed tables cannot be dropped until that dependency is found.
 | 1b | done: 256 shards of `u64` buckets (24-bit seeded fingerprint, whose top bits are the home, and slot + 1), linear probing, load <= 3/4, growth without key reads, every match confirmed against the entry store. L RSS 7.09 -> 4.73 GB (prefill 6.30 -> 4.11), S 1.16 -> 1.01 GB; L block p50/p99 95.9/106.8 -> 98.9/112.5 ms (the confirm read); roots unchanged | `/data/blockchain/qmdb-compare/stage1b` |
 | 4a | deferred: after 3a/3b the real state restarts in 0.74-0.94 s at 1.6 GB, which was 4a's latency motive; its other motive, dropping dead byte ranges (4b), has nothing to reclaim on this workload (section 6.2). Revisit when a larger state makes restart matter | -- |
 | 5a | done: the forest applies a block from the slice its record keeps (values copied once, into the store), no clone of the block's operations. L prefill p50 236 -> 179 ms, L blocks p50/p99 98.9/112.5 -> 87.7/103.0 ms, S p50 62.8 -> 52.4 ms; roots unchanged | `/data/blockchain/qmdb-compare/stage5a` |
-| 5b | next: move bookkeeping without ordered sets; file-mode undo records as slot lists; then retention depth | -- |
+| 5b | done: move bookkeeping in a `Vec` sorted only when a delta is measured (cleared unsorted on the block-delta path); a block's delta slots sorted instead of set-built; file-mode undo records name retired slots as `u64`s (8 B instead of 64). Roots unchanged. The harness never persisted, so its forest kept every block's dirty slots in a growing `BTreeSet` -- an artifact the node (which clears them every block) never paid; harness numbers from here on are taken node-like (`QMDBCMP_PERSIST=1`) | `/data/blockchain/qmdb-compare/stage5b`, `persist-ab` |
+| 5c | next: retention depth (64 -> 16) measured on node-like runs | -- |
 
 ## Recommended approach
 
@@ -172,7 +173,14 @@ uncommitted depth.
 - 6b vendored `crates/storage/provider/src/providers/state/latest.rs` (`basic_account` 73-82, `storage` 300-320) and
   the `InPlainState` fallbacks in `historical.rs` (248-260, 352-373) branch on `N42_QMDB_READS=off|verify|on|only`;
   gov5 MarshalV2 decoded into reth's `Account`; bytecode stays in MDBX `Bytecodes`.
-- 6c, only after the `N42_HASHED_STATE=0` failure is understood: stop `write_hashed_state` in `save_blocks`
+- Root cause of the `N42_HASHED_STATE=0` failure (found in code 2026-09-13): under storage v2, which is the default
+  (`StorageSettings::base()` is `v2()`), `use_hashed_state()` is true, so the vendored `LatestStateProviderRef` reads
+  `basic_account` from `HashedAccounts` and `storage` from `HashedStorages`, and `save_blocks` fills those tables only
+  from each executed block's hashed post-state (`database/provider.rs` "Write all hashed state"). The hashed tables
+  *are* the persisted latest state. With the pass skipped, persisted blocks change no state table; once the overlay
+  drops them, the senders funded in them read as absent and the first full block executes to gas 0. So 6c needs 6b
+  serving every latest-state read (and the historical fallbacks) from QMDB first; nothing else hides behind it.
+- 6c, only after 6b serves every latest-state read: stop `write_hashed_state` in `save_blocks`
   (`database/provider.rs:774-790`) and the hashed post-state passes (`follower_import.rs`,
   `engine-types/src/payload.rs`, `direct_build.rs`) behind an N42 storage flag. Archive history keeps coming from
   changesets and history indices.

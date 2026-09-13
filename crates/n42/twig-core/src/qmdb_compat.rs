@@ -1101,13 +1101,32 @@ pub struct BlockUndo {
     /// reads a retired slot's key at revival, the only time it is needed,
     /// instead of 133,000 random reads on every block (loop123).
     pub entries: Vec<UndoEntry>,
-    /// `entries` carry slots only (key and value left empty).
+    /// The record names retired slots only, in `slots` (`entries` stays
+    /// empty): a file-backed tree reads a retired slot's key at revival.
     #[serde(default)]
     pub slots_only: bool,
+    /// With `slots_only`, the slots the block deactivated. Eight bytes a
+    /// slot where an `UndoEntry` with an empty key and value took 64: a full
+    /// block retires ~147,000 slots and the forest keeps a record per block
+    /// in its window.
+    #[serde(default)]
+    pub slots: Vec<u64>,
     /// `appended_keys[i]` is the key appended at slot `prev_next_slot + i`.
     /// Not needed to revert an in-memory tree, whose entries are always
     /// readable; carried so the record is self-describing, as gov5's is.
     pub appended_keys: Vec<Hash>,
+}
+
+impl BlockUndo {
+    /// Every slot the block deactivated, whichever form the record takes.
+    pub fn retired_slots(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().map(|entry| entry.slot).chain(self.slots.iter().copied())
+    }
+
+    /// How many slots the block deactivated.
+    pub fn retired_len(&self) -> usize {
+        self.entries.len() + self.slots.len()
+    }
 }
 
 /// Why an undo record could not be applied.
@@ -1492,6 +1511,7 @@ impl QmdbCompatTree {
             entries: Vec::new(),
             appended_keys: Vec::new(),
             slots_only: self.entries.file_path().is_some(),
+            slots: Vec::new(),
         });
     }
 
@@ -1639,9 +1659,12 @@ impl QmdbCompatTree {
         // 3. Revive the slots the block deactivated. Only those below the
         //    cursor: a slot the block both appended and killed is gone with
         //    the truncation.
-        for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
-            let slot = entry.slot;
-            let key = if undo.slots_only { self.entries.key(slot as usize) } else { entry.key };
+        let revived: Vec<(u64, Hash)> = if undo.slots_only {
+            undo.slots.iter().filter(|slot| **slot < prev).map(|slot| (*slot, self.entries.key(*slot as usize))).collect()
+        } else {
+            undo.entries.iter().filter(|entry| entry.slot < prev).map(|entry| (entry.slot, entry.key)).collect()
+        };
+        for (slot, key) in revived {
             self.entries.set_active(slot as usize, true);
             self.index.insert(key, slot, |slot| self.entries.key(slot as usize));
             let twig_id = (slot as usize) / TWIG_SIZE;
@@ -1665,10 +1688,14 @@ impl QmdbCompatTree {
             Some(record) => record.slots_only,
             None => return,
         };
-        let entry = if slots_only { UndoEntry { slot, key: NULL_HASH, value: Vec::new() } } else {
-            let e = self.entries.entry(slot as usize);
-            UndoEntry { slot, key: e.key, value: e.value }
-        };
+        if slots_only {
+            if let Some(record) = self.recording.as_mut() {
+                record.slots.push(slot);
+            }
+            return;
+        }
+        let e = self.entries.entry(slot as usize);
+        let entry = UndoEntry { slot, key: e.key, value: e.value };
         if let Some(record) = self.recording.as_mut() {
             record.entries.push(entry);
         }
@@ -1747,13 +1774,15 @@ impl QmdbCompatTree {
         // The undo record's entries -- what every retired slot held -- built
         // on the worker pool rather than cloned one at a time in the loop.
         if let Some(slots_only) = self.recording.as_ref().map(|record| record.slots_only) {
-            let retired = if slots_only {
-                held.iter().flatten().map(|slot| UndoEntry { slot: *slot, key: NULL_HASH, value: Vec::new() }).collect()
+            if slots_only {
+                if let Some(record) = self.recording.as_mut() {
+                    record.slots.extend(held.iter().flatten().copied());
+                }
             } else {
-                undo_entries(&self.entries, &held)
-            };
-            if let Some(record) = self.recording.as_mut() {
-                record.entries.extend(retired);
+                let retired = undo_entries(&self.entries, &held);
+                if let Some(record) = self.recording.as_mut() {
+                    record.entries.extend(retired);
+                }
             }
         }
         phases.undo_us = at.elapsed().as_micros() as u64;

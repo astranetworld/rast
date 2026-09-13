@@ -643,8 +643,8 @@ mod tests {
             assert_eq!(undo_h.prev_next_slot, undo_f.prev_next_slot);
             assert_eq!(undo_h.appended_keys, undo_f.appended_keys);
             assert_eq!(
-                undo_h.entries.iter().map(|e| e.slot).collect::<Vec<_>>(),
-                undo_f.entries.iter().map(|e| e.slot).collect::<Vec<_>>(),
+                undo_h.retired_slots().collect::<Vec<_>>(),
+                undo_f.retired_slots().collect::<Vec<_>>(),
                 "retired slots of block {b}"
             );
             assert_eq!(heap.snapshot(), file.snapshot(), "snapshot after block {b}");
