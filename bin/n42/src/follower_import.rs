@@ -174,12 +174,13 @@ where
     use alloy_consensus::Transaction as _;
     use rayon::prelude::*;
     use reth_provider::AccountReader as _;
-    use std::collections::HashMap;
 
     let header = block.header();
     let base_fee = u128::from(header.base_fee_per_gas.unwrap_or(0));
     let mut gas_total: u64 = 0;
-    let mut by_sender: HashMap<Address, Vec<usize>> = HashMap::new();
+    // The addresses' own bytes as the hash: SipHash over 163,000 transactions
+    // was ~29 ms of the check, serially, before the vote.
+    let mut by_sender: alloy_primitives::map::AddressHashMap<Vec<usize>> = Default::default();
     for (index, (sender, tx)) in block.transactions_with_sender().enumerate() {
         if let Some(id) = tx.chain_id() {
             if id != chain_id {
@@ -466,6 +467,11 @@ where
             Err(why) => tracing::debug!(target: "n42.follower_import", number, %why, "not parallel; executing serially"),
         }
     }
+    // A block executed on the worker pool read its transfers' accounts
+    // through providers of its own, not through `cached`: the carry below
+    // would copy ~147,000 accounts (26 ms on the import, loop155) that the
+    // next import barely reads.
+    let parallel_executed = output.is_some();
     let output = match output {
         Some(out) => out,
         None => evm_config
@@ -490,7 +496,7 @@ where
     // problem: the next import simply reads the state provider instead.
     let carry_at = std::time::Instant::now();
     let carry_async = carry_async();
-    if !carry_async {
+    if !carry_async && !parallel_executed {
         fill_carry(&mut cached, &output.state, block_hash, carry);
     }
     let carry_ms = carry_at.elapsed().as_millis() as u64;
@@ -563,7 +569,7 @@ where
     };
 
     let execution_output = Arc::new(output);
-    if carry_async {
+    if carry_async && !parallel_executed {
         let state = Arc::clone(&execution_output);
         let carry = Arc::clone(carry);
         rayon::spawn(move || {
@@ -637,12 +643,14 @@ fn carry_async() -> bool {
 }
 
 /// Whether the QMDB root and the hashed post-state run together on the worker
-/// pool (`N42_ROOT_HASHED_PARALLEL=1`) instead of one after the other. They
-/// read the same bundle and neither needs the other; in parallel the pair is
-/// reported as `root_ms` with `hashed_ms` zero. Off until loop102 measures it.
+/// pool (default; `N42_ROOT_HASHED_PARALLEL=0` runs them one after the other).
+/// They read the same bundle and neither needs the other: the pair measured
+/// 94 -> 81 ms and was adopted (docs/FLEET7_STATUS.md), but the default had
+/// stayed off and no launcher set it. In parallel the pair is reported as
+/// `root_ms` with `hashed_ms` zero.
 fn root_hashed_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_PARALLEL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_PARALLEL").map_or(true, |v| v != "0"))
 }
 
 /// `N42_FOLLOWER_PARALLEL`, read once.

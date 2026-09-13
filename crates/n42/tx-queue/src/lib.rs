@@ -342,6 +342,17 @@ impl<T: PoolTransaction> TxQueue<T> {
         parent: B256,
         mined: impl IntoIterator<Item = (Address, u64)>,
     ) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        // The hand-off calls this after build-on-seal already has: the build
+        // then stands on another parent and there is nothing to forget. Look
+        // before folding a block's nonces (a 163,000-entry map), and fold
+        // outside the lock the puller needs.
+        {
+            let inner = self.inner.lock();
+            match inner.last_build.as_ref() {
+                Some((built_on, taken)) if *built_on == parent && !taken.is_empty() => {}
+                _ => return Vec::new(),
+            }
+        }
         let mut highest: AddressHashMap<u64> = AddressHashMap::default();
         for (sender, nonce) in mined {
             let entry = highest.entry(sender).or_insert(nonce);

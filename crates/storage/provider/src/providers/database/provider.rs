@@ -284,9 +284,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
 
         if storage_v2 {
             let batches = std::mem::take(&mut *self.pending_rocksdb_batches.lock());
-            for batch in batches {
-                self.rocksdb_provider.commit_batch(batch)?;
-            }
+            self.rocksdb_provider.commit_batches(batches)?;
         }
 
         self.static_file_provider.commit()?;
@@ -388,9 +386,7 @@ impl<TX, N: NodeTypes> RocksDBProviderFactory for DatabaseProvider<TX, N> {
 
     fn commit_pending_rocksdb_batches(&self) -> ProviderResult<()> {
         let batches = std::mem::take(&mut *self.pending_rocksdb_batches.lock());
-        for batch in batches {
-            self.rocksdb_provider.commit_batch(batch)?;
-        }
+        self.rocksdb_provider.commit_batches(batches)?;
         Ok(())
     }
 }
@@ -661,6 +657,19 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         let rocksdb_enabled =
             rocksdb_ctx.as_ref().is_some_and(|ctx| ctx.storage_settings.storage_v2);
 
+        // N42: each block's plain-state reverts, converted once for the static-file changesets and
+        // the RocksDB history indices, which converted the same reverts four times a block
+        // (~147,000 accounts each at the fleet's tier).
+        let plain_reverts: Vec<revm::database::states::PlainStateReverts> = if first_number.is_some() {
+            use rayon::prelude::*;
+            blocks
+                .par_iter()
+                .map(|block| block.execution_outcome().state.reverts.to_plain_state_reverts())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let mut sf_result = None;
         let mut rocksdb_result = None;
 
@@ -679,7 +688,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                         sf_ctx.expect("static file context exists when blocks are persisted");
                     sf_result = Some(
                         sf_provider
-                            .write_blocks_data(blocks, &tx_nums, sf_ctx, runtime)
+                            .write_blocks_data(blocks, &tx_nums, &plain_reverts, sf_ctx, runtime)
                             .map(|()| start.elapsed()),
                     );
                 });
@@ -694,7 +703,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                         rocksdb_ctx.clone().expect("RocksDB context exists when enabled");
                     rocksdb_result = Some(
                         rocksdb_provider
-                            .write_blocks_data(blocks, &tx_nums, rocksdb_ctx, runtime)
+                            .write_blocks_data(blocks, &tx_nums, &plain_reverts, rocksdb_ctx, runtime)
                             .map(|()| start.elapsed()),
                     );
                 });
@@ -4060,9 +4069,7 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
 
             let start = Instant::now();
             let batches = std::mem::take(&mut *self.pending_rocksdb_batches.lock());
-            for batch in batches {
-                self.rocksdb_provider.commit_batch(batch)?;
-            }
+            self.rocksdb_provider.commit_batches(batches)?;
             timings.rocksdb = start.elapsed();
 
             let start = Instant::now();

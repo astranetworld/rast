@@ -1418,6 +1418,26 @@ impl RocksDBProvider {
         })
     }
 
+    /// N42: commits `batches` in order with one WAL sync: all but the last are
+    /// written unsynced and the last synced, which makes the whole sequence
+    /// durable (a synced write syncs every WAL record before it). Committing
+    /// each synced was one fsync per batch -- three per persisted batch of
+    /// blocks. `N42_ROCKSDB_NOSYNC=1` syncs none.
+    pub fn commit_batches(&self, batches: Vec<WriteBatchWithTransaction<true>>) -> ProviderResult<()> {
+        let count = batches.len();
+        for (index, batch) in batches.into_iter().enumerate() {
+            let mut options = WriteOptions::default();
+            options.set_sync(index + 1 == count && !rocksdb_nosync());
+            self.0.db_rw().write_opt(batch, &options).map_err(|e| {
+                ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Writes all `RocksDB` data for multiple blocks in parallel.
     ///
     /// This handles transaction hash numbers, account history, and storage history based on
@@ -1428,6 +1448,7 @@ impl RocksDBProvider {
         &self,
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
+        plain_reverts: &[revm::database::states::PlainStateReverts],
         ctx: RocksDBWriteCtx,
         runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {
@@ -1458,14 +1479,14 @@ impl RocksDBProvider {
             if write_account_history {
                 s.spawn(|_| {
                     let _guard = span.enter();
-                    r_account_history = Some(self.write_account_history(blocks, &ctx));
+                    r_account_history = Some(self.write_account_history(plain_reverts, &ctx));
                 });
             }
 
             if write_storage_history {
                 s.spawn(|_| {
                     let _guard = span.enter();
-                    r_storage_history = Some(self.write_storage_history(blocks, &ctx));
+                    r_storage_history = Some(self.write_storage_history(plain_reverts, &ctx));
                 });
             }
         });
@@ -1518,55 +1539,107 @@ impl RocksDBProvider {
     ///
     /// Derives history indices from reverts (same source as changesets) to ensure consistency.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
-    fn write_account_history<N: reth_node_types::NodePrimitives>(
+    fn write_account_history(
         &self,
-        blocks: &[ExecutedBlock<N>],
+        plain_reverts: &[revm::database::states::PlainStateReverts],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
-        let mut batch = self.batch();
         let mut account_history: BTreeMap<Address, Vec<u64>> = BTreeMap::new();
 
-        for (block_idx, block) in blocks.iter().enumerate() {
+        for (block_idx, reverts) in plain_reverts.iter().enumerate() {
             let block_number = ctx.first_block_number + block_idx as u64;
-            let reverts = block.execution_outcome().state.reverts.to_plain_state_reverts();
 
             // Iterate through account reverts - these are exactly the accounts that have
             // changesets written, ensuring history indices match changeset entries.
-            for account_block_reverts in reverts.accounts {
+            for account_block_reverts in &reverts.accounts {
                 for (address, _) in account_block_reverts {
-                    account_history.entry(address).or_default().push(block_number);
+                    account_history.entry(*address).or_default().push(block_number);
                 }
             }
         }
 
-        // Write account history using proper shard append logic
-        for (address, indices) in account_history {
-            batch.append_account_history_shard(address, indices)?;
+        // N42: each address's last shard read and extended on the worker pool,
+        // as storage history does; one address at a time this was ~147,000
+        // serial point reads per persisted block at the fleet's tier.
+        let shard_puts = account_history
+            .into_par_iter()
+            .map(|(address, indices)| self.account_history_shards_to_put(address, indices))
+            .collect::<ProviderResult<Vec<_>>>()?;
+
+        let mut batch = self.batch();
+        for shards in shard_puts {
+            for (key, shard) in shards {
+                batch.put::<tables::AccountsHistory>(key, &shard)?;
+            }
         }
         ctx.pending_batches.lock().push(batch.into_inner());
         Ok(())
+    }
+
+    /// Prepares account history shard writes by reading the current last shard and appending
+    /// indices: [`Self::storage_history_shards_to_put`] for accounts.
+    fn account_history_shards_to_put(
+        &self,
+        address: Address,
+        indices: Vec<u64>,
+    ) -> ProviderResult<Vec<(ShardedKey<Address>, BlockNumberList)>> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug_assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "indices must be strictly increasing: {:?}",
+            indices
+        );
+
+        let last_key = ShardedKey::new(address, u64::MAX);
+        let last_shard_opt = self.get::<tables::AccountsHistory>(last_key.clone())?;
+        let mut last_shard = last_shard_opt.unwrap_or_else(BlockNumberList::empty);
+
+        last_shard.append(indices).map_err(ProviderError::other)?;
+
+        if last_shard.len() <= NUM_OF_INDICES_IN_SHARD as u64 {
+            return Ok(vec![(last_key, last_shard)]);
+        }
+
+        let chunks = last_shard.iter().chunks(NUM_OF_INDICES_IN_SHARD);
+        let mut chunks_peekable = chunks.into_iter().peekable();
+        let mut shards = Vec::new();
+
+        while let Some(chunk) = chunks_peekable.next() {
+            let shard = BlockNumberList::new_pre_sorted(chunk);
+            let highest_block_number = if chunks_peekable.peek().is_some() {
+                shard.iter().next_back().expect("`chunks` does not return empty list")
+            } else {
+                u64::MAX
+            };
+
+            shards.push((ShardedKey::new(address, highest_block_number), shard));
+        }
+
+        Ok(shards)
     }
 
     /// Writes storage history indices for the given blocks.
     ///
     /// Derives history indices from reverts (same source as changesets) to ensure consistency.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
-    fn write_storage_history<N: reth_node_types::NodePrimitives>(
+    fn write_storage_history(
         &self,
-        blocks: &[ExecutedBlock<N>],
+        plain_reverts: &[revm::database::states::PlainStateReverts],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
         let mut storage_history: BTreeMap<(Address, B256), Vec<u64>> = BTreeMap::new();
 
-        for (block_idx, block) in blocks.iter().enumerate() {
+        for (block_idx, reverts) in plain_reverts.iter().enumerate() {
             let block_number = ctx.first_block_number + block_idx as u64;
-            let reverts = block.execution_outcome().state.reverts.to_plain_state_reverts();
 
             // Iterate through storage reverts - these are exactly the slots that have
             // changesets written, ensuring history indices match changeset entries.
-            for storage_block_reverts in reverts.storage {
+            for storage_block_reverts in &reverts.storage {
                 for revert in storage_block_reverts {
-                    for (slot, _) in revert.storage_revert {
+                    for (slot, _) in &revert.storage_revert {
                         let plain_key = B256::new(slot.to_be_bytes());
                         storage_history
                             .entry((revert.address, plain_key))

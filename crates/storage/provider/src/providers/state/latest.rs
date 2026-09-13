@@ -102,7 +102,6 @@ impl<Provider: DBProvider + StorageSettingsCache> AccountReader
     /// Get basic account information.
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         if self.0.cached_storage_settings().use_hashed_state() {
-            let hashed_address = alloy_primitives::keccak256(address);
             // N42: a registered QMDB reader answers (`on`) or is checked (`verify`).
             if let Some((reader, mode)) = reth_storage_api::n42_state::reader() {
                 if let Some(version) = self.n42_state_version() {
@@ -112,6 +111,7 @@ impl<Provider: DBProvider + StorageSettingsCache> AccountReader
                             return Ok(answer)
                         }
                         Some(answer) => {
+                            let hashed_address = alloy_primitives::keccak256(address);
                             let database =
                                 self.tx().get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)?;
                             reth_storage_api::n42_state::verify_account(address, version, &answer, &database);
@@ -121,6 +121,7 @@ impl<Provider: DBProvider + StorageSettingsCache> AccountReader
                     }
                 }
             }
+            let hashed_address = alloy_primitives::keccak256(address);
             self.tx()
                 .get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)
                 .map_err(Into::into)

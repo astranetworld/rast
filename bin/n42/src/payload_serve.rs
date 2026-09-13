@@ -563,7 +563,12 @@ async fn build_on_own_block(
         let at = std::time::Instant::now();
         // A parent still finishing behind its seal has no tree yet; the
         // build renames it under the sealed hash when it needs it.
-        if qmdb.root_of(&built_hash).is_some() {
+        // A parent still behind its seal is computing its root under the
+        // forest's lock right now, and has filed nothing yet: asking would
+        // wait out that computation for an answer of `None`.
+        use n42_engine_types::built_executions::{stage_of, Stage};
+        let finishing = matches!(stage_of(built_hash), Some(Stage::Sealed | Stage::StateReady));
+        if !finishing && qmdb.root_of(&built_hash).is_some() {
             qmdb.rename(built_hash, sealed_hash).map_err(|err| format!("qmdb rename: {err}"))?;
         }
         times.rename_ms = at.elapsed().as_millis() as u64;

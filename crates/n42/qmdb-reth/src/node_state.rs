@@ -1334,6 +1334,22 @@ fn read_ckpt(path: &Path) -> Result<Option<ForestCheckpoint>, NodeStateError> {
     bincode::deserialize(&bytes).map(Some).map_err(|source| NodeStateError::Decode { path: path.to_path_buf(), source })
 }
 
+/// Writes `bytes` to `temp`, syncs it, renames it over `path` and syncs the
+/// directory: after a crash the checkpoint is the old file or the new one,
+/// whole. `fs::write` plus `rename` left both the data and the rename to the
+/// page cache.
+fn write_durably(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn write_ckpt(path: &Path, ckpt: &ForestCheckpoint) -> Result<u64, NodeStateError> {
     let io = |source| NodeStateError::Io { path: path.to_path_buf(), source };
     if let Some(dir) = path.parent() {
@@ -1341,8 +1357,7 @@ fn write_ckpt(path: &Path, ckpt: &ForestCheckpoint) -> Result<u64, NodeStateErro
     }
     let bytes = bincode::serialize(ckpt).map_err(|source| NodeStateError::Decode { path: path.to_path_buf(), source })?;
     let temp = path.with_extension("ckpt.tmp");
-    std::fs::write(&temp, &bytes).map_err(io)?;
-    std::fs::rename(&temp, path).map_err(io)?;
+    write_durably(&temp, path, &bytes).map_err(io)?;
     Ok(bytes.len() as u64)
 }
 
@@ -1382,8 +1397,7 @@ fn write_snapshot(path: &Path, snapshot: &ForestSnapshot) -> Result<u64, NodeSta
         source,
     })?;
     let temp = path.with_extension("bin.tmp");
-    std::fs::write(&temp, &bytes).map_err(io)?;
-    std::fs::rename(&temp, path).map_err(io)?;
+    write_durably(&temp, path, &bytes).map_err(io)?;
     Ok(bytes.len() as u64)
 }
 
@@ -1440,6 +1454,11 @@ fn append_delta(path: &Path, from: u64, delta: &ForestDelta) -> Result<u64, Node
     file.set_len(from).map_err(io)?;
     file.seek(SeekFrom::Start(from)).map_err(io)?;
     file.write_all(&record).map_err(io)?;
+    // Durable like the entries it names (`sync_entries_if_file`, fsynced
+    // just before): unsynced, an OS crash could keep the entries and lose the
+    // delta, and the restart would stand behind the database and refuse to
+    // start.
+    file.sync_data().map_err(io)?;
     Ok(from + record.len() as u64)
 }
 

@@ -517,16 +517,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     fn write_account_changesets(
         w: &mut StaticFileProviderRWRefMut<'_, N>,
         blocks: &[ExecutedBlock<N>],
+        plain_reverts: &[revm::database::states::PlainStateReverts],
     ) -> ProviderResult<()> {
-        for block in blocks {
+        for (block, reverts) in blocks.iter().zip(plain_reverts) {
             let block_number = block.recovered_block().number();
-            let reverts = block.execution_outcome().state.reverts.to_plain_state_reverts();
-
             let changeset: Vec<_> = reverts
                 .accounts
-                .into_iter()
+                .iter()
                 .flatten()
-                .map(|(address, info)| AccountBeforeTx { address, info: info.map(Into::into) })
+                .map(|(address, info)| AccountBeforeTx { address: *address, info: info.clone().map(Into::into) })
                 .collect();
             w.append_account_changeset(changeset, block_number)?;
         }
@@ -538,21 +537,20 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     fn write_storage_changesets(
         w: &mut StaticFileProviderRWRefMut<'_, N>,
         blocks: &[ExecutedBlock<N>],
+        plain_reverts: &[revm::database::states::PlainStateReverts],
     ) -> ProviderResult<()> {
-        for block in blocks {
+        for (block, reverts) in blocks.iter().zip(plain_reverts) {
             let block_number = block.recovered_block().number();
-            let reverts = block.execution_outcome().state.reverts.to_plain_state_reverts();
-
             let changeset: Vec<_> = reverts
                 .storage
-                .into_iter()
+                .iter()
                 .flatten()
                 .flat_map(|revert| {
-                    revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
+                    revert.storage_revert.iter().map(move |(key, revert_to_slot)| {
                         StorageBeforeTx {
                             address: revert.address,
                             key: B256::from(key.to_be_bytes()),
-                            value: revert_to_slot.to_previous_value(),
+                            value: (*revert_to_slot).to_previous_value(),
                         }
                     })
                 })
@@ -590,6 +588,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         &self,
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
+        plain_reverts: &[revm::database::states::PlainStateReverts],
         ctx: StaticFileWriteCtx,
         runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {
@@ -655,7 +654,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     r_account_changesets = Some(self.write_segment(
                         StaticFileSegment::AccountChangeSets,
                         first_block_number,
-                        |w| Self::write_account_changesets(w, blocks),
+                        |w| Self::write_account_changesets(w, blocks, plain_reverts),
                     ));
                 });
             }
@@ -666,7 +665,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     r_storage_changesets = Some(self.write_segment(
                         StaticFileSegment::StorageChangeSets,
                         first_block_number,
-                        |w| Self::write_storage_changesets(w, blocks),
+                        |w| Self::write_storage_changesets(w, blocks, plain_reverts),
                     ));
                 });
             }

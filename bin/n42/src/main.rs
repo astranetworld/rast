@@ -473,8 +473,15 @@ fn main() {
                                     // hash is settled, another hash gives back what
                                     // this block does not carry (then pruned below
                                     // where this block mined a higher nonce).
-                                    let carried: std::collections::HashSet<(alloy_primitives::Address, u64)> = pairs.iter().copied().collect();
-                                    let back = queue.settle_own_block(block.number(), block.hash(), |sender, nonce| carried.contains(&(*sender, nonce)));
+                                    // Built only if an own block is held at this
+                                    // height (rarely): a 163,000-entry SipHash set
+                                    // every block on every node was 10-20 ms.
+                                    let carried = std::cell::OnceCell::new();
+                                    let back = queue.settle_own_block(block.number(), block.hash(), |sender, nonce| {
+                                        carried
+                                            .get_or_init(|| pairs.iter().copied().collect::<alloy_primitives::map::HashSet<(alloy_primitives::Address, u64)>>())
+                                            .contains(&(*sender, nonce))
+                                    });
                                     if back > 0 {
                                         warn!(target: "n42.tx_queue", number = block.number(), back, "an own block at this height was not the one committed; its transactions are offered again");
                                     }
