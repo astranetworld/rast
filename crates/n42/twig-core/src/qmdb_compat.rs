@@ -1217,11 +1217,22 @@ impl std::hash::Hasher for KeyPrefixHasher {
     fn write_usize(&mut self, _length_prefix: usize) {}
 }
 
+/// The upper tree over the twig roots, kept between [`QmdbCompatTree::root`]
+/// calls: `nodes[cap + i]` is twig `i`'s root (`NULL_HASH` past the last twig),
+/// `nodes[i] = hash_node(nodes[2i], nodes[2i + 1])`, `cap` the twig count's next
+/// power of two -- exactly the fold `root` used to rebuild from zero on every
+/// call. A root read compares the leaf level with the twigs (a sequential scan
+/// of 32-byte roots) and rehashes only the ancestors of the roots that changed,
+/// so no mutation path has to report what it touched.
+#[derive(Clone, Default)]
+struct UpperTree {
+    cap: usize,
+    nodes: Vec<Hash>,
+}
+
 /// A correctness-first QMDB tree for cross-client bootstrap and vectors.
 ///
-/// It deliberately rebuilds the small upper tree on root reads. gov5's
-/// incremental upper-tree and eviction optimizations can be added after this
-/// representation has complete replay-v2 vectors.
+/// The upper tree is cached and refreshed along changed paths ([`UpperTree`]).
 pub struct QmdbCompatTree {
     entries: Entries,
     index: KeyIndex,
@@ -1230,6 +1241,8 @@ pub struct QmdbCompatTree {
     /// The record being captured, between `start_undo_recording` and
     /// `stop_undo_recording`.
     recording: Option<BlockUndo>,
+    /// The upper tree as of the last root read.
+    upper: std::sync::Mutex<UpperTree>,
 }
 
 impl std::fmt::Debug for QmdbCompatTree {
@@ -1261,6 +1274,7 @@ impl Clone for QmdbCompatTree {
             twigs: self.twigs.clone(),
             next_slot: self.next_slot,
             recording: self.recording.clone(),
+            upper: std::sync::Mutex::new(self.upper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()),
         }
     }
 }
@@ -1273,6 +1287,7 @@ impl QmdbCompatTree {
             twigs: Vec::new(),
             next_slot: 0,
             recording: None,
+            upper: std::sync::Mutex::new(UpperTree::default()),
         }
     }
 
@@ -1339,6 +1354,7 @@ impl QmdbCompatTree {
             twigs: Vec::new(),
             next_slot: kept,
             recording: None,
+            upper: std::sync::Mutex::new(UpperTree::default()),
         };
         if n > 0 {
             tree.ensure_twig((n - 1) / TWIG_SIZE);
@@ -1405,20 +1421,17 @@ impl QmdbCompatTree {
             node >>= 1;
         }
 
-        let cap = self.twigs.len().next_power_of_two();
-        let mut upper = vec![NULL_HASH; cap * 2];
-        for (index, twig) in self.twigs.iter().enumerate() {
-            upper[cap + index] = twig.root;
-        }
-        for index in (1..cap).rev() {
-            upper[index] = hash_node(&upper[index * 2], &upper[index * 2 + 1]);
-        }
+        // Bring the cached upper tree up to date, then read the siblings from it.
+        self.root();
+        let upper = self.upper.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cap = upper.cap;
         let mut upper_path = Vec::with_capacity(cap.trailing_zeros() as usize);
         let mut upper_node = cap + twig_id;
         while upper_node > 1 {
-            upper_path.push(upper[upper_node ^ 1]);
+            upper_path.push(upper.nodes[upper_node ^ 1]);
             upper_node >>= 1;
         }
+        drop(upper);
 
         Some(QmdbProof {
             key: *key,
@@ -1742,6 +1755,65 @@ impl QmdbCompatTree {
     }
 
     pub fn root(&self) -> Hash {
+        if self.twigs.is_empty() {
+            return NULL_HASH;
+        }
+        let cap = self.twigs.len().next_power_of_two();
+        let mut upper = self.upper.lock().unwrap_or_else(|poisoned| {
+            // A panic mid-refresh may have left the levels inconsistent: rebuild.
+            let mut upper = poisoned.into_inner();
+            upper.cap = 0;
+            upper
+        });
+        let root = if upper.cap != cap {
+            // The tree grew or shrank past a power of two: the shape changed.
+            upper.cap = cap;
+            upper.nodes = vec![NULL_HASH; cap * 2];
+            for (index, twig) in self.twigs.iter().enumerate() {
+                upper.nodes[cap + index] = twig.root;
+            }
+            for index in (1..cap).rev() {
+                upper.nodes[index] = hash_node(&upper.nodes[index * 2], &upper.nodes[index * 2 + 1]);
+            }
+            upper.nodes[1]
+        } else {
+            let mut changed: Vec<usize> = Vec::new();
+            for index in 0..cap {
+                let root = self.twigs.get(index).map_or(NULL_HASH, |twig| twig.root);
+                if upper.nodes[cap + index] != root {
+                    upper.nodes[cap + index] = root;
+                    changed.push(cap + index);
+                }
+            }
+            // `changed` ascends, so each level's parents ascend and dedup in place.
+            while changed.first().is_some_and(|node| *node > 1) {
+                let mut parents: Vec<usize> = changed.iter().map(|node| node / 2).collect();
+                parents.dedup();
+                let nodes = &upper.nodes;
+                let hash_parent = |parent: &usize| hash_node(&nodes[parent * 2], &nodes[parent * 2 + 1]);
+                #[cfg(feature = "rayon")]
+                let hashes: Vec<Hash> = if parents.len() >= 1024 {
+                    use rayon::prelude::*;
+                    parents.par_iter().with_min_len(256).map(hash_parent).collect()
+                } else {
+                    parents.iter().map(hash_parent).collect()
+                };
+                #[cfg(not(feature = "rayon"))]
+                let hashes: Vec<Hash> = parents.iter().map(hash_parent).collect();
+                for (parent, hash) in parents.iter().zip(hashes) {
+                    upper.nodes[*parent] = hash;
+                }
+                changed = parents;
+            }
+            upper.nodes[1]
+        };
+        debug_assert_eq!(root, self.root_full(), "the cached upper tree diverged from the full fold");
+        root
+    }
+
+    /// The upper tree folded from zero: what [`Self::root`] computed on every
+    /// call before the cache, kept to check the cache against.
+    pub fn root_full(&self) -> Hash {
         if self.twigs.is_empty() {
             return NULL_HASH;
         }
@@ -2700,5 +2772,46 @@ mod undo_tests {
         assert_eq!(tree.apply_undo(&undo), Err(QmdbUndoError::RecordingActive));
         tree.stop_undo_recording();
         tree.apply_undo(&undo).unwrap();
+    }
+
+    /// The cached upper tree against the full fold, as the tree grows through
+    /// 1, 2, 4 and 8 twig capacities and is reverted back down block by block.
+    #[test]
+    fn the_cached_upper_tree_matches_the_full_fold_across_growth_and_reverts() {
+        let mut tree = QmdbCompatTree::new();
+        let mut roots = vec![tree.root()];
+        let mut undos = Vec::new();
+        let mut next = 0u64;
+        for block in 0..9u64 {
+            // Overwrite a spread of earlier keys, delete one, then append new keys.
+            let mut ops: Vec<QmdbOperation> = (0..next)
+                .step_by(7)
+                .take(300)
+                .map(|n| QmdbOperation { key: key(n), value: Some(vec![0xD0 ^ block as u8, n as u8]) })
+                .collect();
+            if next > 0 && block % 2 == 1 {
+                let deleted = next / 3;
+                ops.retain(|op| op.key != key(deleted));
+                ops.push(QmdbOperation { key: key(deleted), value: None });
+                ops.sort_by(|a, b| a.key.cmp(&b.key));
+            }
+            ops.extend(sets(next..next + 1500, 0xE0 ^ block as u8));
+            next += 1500;
+            let (root, undo) = tree.apply_sorted_ops_recorded(ops).unwrap();
+            assert_eq!(root, tree.root_full(), "block {block}: cached root");
+            assert_eq!(tree.clone().root(), root, "block {block}: a clone carries the cache");
+            let proof = tree.prove(&key(1)).expect("key 1 is live");
+            assert!(proof.verify_for_key(&root, &key(1)), "block {block}: proof from the cached levels");
+            roots.push(root);
+            undos.push(undo);
+        }
+        assert!(tree.twig_count() > 4, "the test must cross a capacity of four twigs");
+        while let Some(undo) = undos.pop() {
+            roots.pop();
+            tree.apply_undo(&undo).unwrap();
+            let root = tree.root();
+            assert_eq!(root, tree.root_full(), "after undo to {} blocks", undos.len());
+            assert_eq!(Some(&root), roots.last(), "the undo restores the recorded root");
+        }
     }
 }
