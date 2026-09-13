@@ -142,11 +142,11 @@ fn apply_compact_nice() {
 
 /// `N42_QMDB_RETAIN_DEPTH`: how many blocks below the head the forest keeps
 /// its records for (the sorted operations to re-apply a block after a move,
-/// and the undo record with the entries it deactivated). The default is the
-/// forest's own (64). At the bench tier a record is ~35 MB, so 64 of them
-/// are ~2 GB a node (loop121's heap profile); HotStuff-2 finality is two
-/// views and the persisted head lags the canonical one by a block or two, so
-/// a much shallower window is safe -- it must only exceed that lag, since
+/// and the undo record with the slots it deactivated). The default is the
+/// forest's own (16, since 2026-09-13; 64 before). At the bench tier a record
+/// is ~30 MB, so 64 of them were ~2 GB a node (loop121's heap profile);
+/// HotStuff-2 finality is two views and the persisted head lags the canonical
+/// one by a block or two, so the window must only exceed that lag, since
 /// persistence walks the records from the persisted head to the block.
 fn retain_depth() -> Option<u64> {
     static DEPTH: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();

@@ -34,8 +34,13 @@ use crate::{BlockChanges, StateError};
 /// How many blocks behind the canonical head a block is kept.
 ///
 /// A committed HotStuff-2 block never reverts, so this only has to cover the
-/// unfinalised tip plus sibling proposals at the same heights.
-pub const DEFAULT_RETAIN_DEPTH: u64 = 64;
+/// unfinalised tip plus sibling proposals at the same heights, and the
+/// persisted head's lag (persistence walks the records from it to the tip):
+/// a block or two. A full block's record is ~30 MB (its sorted operations and
+/// undo), so 64 held ~2 GB a node; loop122 ran 16 on the fleet (each execution
+/// layer 3.7 GB smaller, window-2 major faults halved, the cycle 65-80 ms
+/// shorter) and the bench has used it since.
+pub const DEFAULT_RETAIN_DEPTH: u64 = 16;
 
 /// A block's root and operations, computed but not yet filed under its hash.
 ///

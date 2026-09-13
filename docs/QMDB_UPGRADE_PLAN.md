@@ -8,7 +8,7 @@ We compared LayerZero's official `qmdb` (f14a2a09c) with our QMDB (gov5 format, 
 
 | | ours | LayerZero (no io_uring) |
 | --- | --- | --- |
-| block p50, 2M keys / 50M keys | 75 / 121 ms (p99 ~216) | 85 / 99 ms (p99 110) |
+| block p50, 2M keys / 50M keys | 75 / 121 ms (p99 ~216; harness not node-like, see comparison section 6.9) | 85 / 99 ms (p99 110) |
 | memory, 2M / 50M keys | 4.1 / 10.7 GB | 1.1 / 2.5 GB |
 | disk, same history | 2.0 / 2.6 GB | 7.0 / 15.1 GB |
 | 1M creates a block | 318 ms | 608 ms |
@@ -108,7 +108,8 @@ hashed tables cannot be dropped until that dependency is found.
 | 4a | deferred: after 3a/3b the real state restarts in 0.74-0.94 s at 1.6 GB, which was 4a's latency motive; its other motive, dropping dead byte ranges (4b), has nothing to reclaim on this workload (section 6.2). Revisit when a larger state makes restart matter | -- |
 | 5a | done: the forest applies a block from the slice its record keeps (values copied once, into the store), no clone of the block's operations. L prefill p50 236 -> 179 ms, L blocks p50/p99 98.9/112.5 -> 87.7/103.0 ms, S p50 62.8 -> 52.4 ms; roots unchanged | `/data/blockchain/qmdb-compare/stage5a` |
 | 5b | done: move bookkeeping in a `Vec` sorted only when a delta is measured (cleared unsorted on the block-delta path); a block's delta slots sorted instead of set-built; file-mode undo records name retired slots as `u64`s (8 B instead of 64). Roots unchanged. The harness never persisted, so its forest kept every block's dirty slots in a growing `BTreeSet` -- an artifact the node (which clears them every block) never paid; harness numbers from here on are taken node-like (`QMDBCMP_PERSIST=1`) | `/data/blockchain/qmdb-compare/stage5b`, `persist-ab` |
-| 5c | next: retention depth (64 -> 16) measured on node-like runs | -- |
+| 5c | done: default retention depth 64 -> 16, as the fleet has run since loop122; harness RSS at depth 16 / 64: 6.31 / 12.27 GB, latency unchanged. Node-like A/B of 5b+5c against 5a: L blocks 58 -> 40 ms p50, 103 -> 90 ms p99 | comparison section 6.9 |
+| 6 | next: QMDB serves latest-state reads (design notes below) | -- |
 
 ## Recommended approach
 
@@ -219,7 +220,8 @@ gov5's portable v2 hollow twigs are supported; enabled per node only after stage
 2.7 GB of WAL. No pruning of any history (full-archive decision).
 
 **Targets at 50M live keys** after stage 5: RSS ~1.5-2 GB (now 10.7), block p50 ≤ 100 ms and p99 < 130 ms (now 121 /
-~216); after stage 6 a warm state read ≤ 1.5 us (MDBX measured 1.96); disk no larger than today.
+~216). Reached after stage 5, node-like: 40 / 90 ms; RSS 4.6 GB, not yet the target (the forest's records, the
+per-slot offsets and the index remain); after stage 6 a warm state read ≤ 1.5 us (MDBX measured 1.96); disk no larger than today.
 
 **Fork-gated later, with gov5, not in this plan:** LayerZero's paged ActiveBits hashing, live-entry compaction, a
 sharded root, NextKey entries for exclusion proofs; if a change-set grouping is ever needed, one change set per block.

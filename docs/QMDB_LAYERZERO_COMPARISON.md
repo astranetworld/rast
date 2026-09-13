@@ -135,6 +135,8 @@ sync 11.8 ms. The p99 figures for ours sum the phases' p99s and overstate the jo
 phase records no mean, so ours' means use its p50.)
 
 What L adds to S:
+- (Section 6.9: this harness never persisted, so our numbers here include bookkeeping the node clears every
+  block; node-like, after stages 1-5, ours is 40 / 90 ms at 50M keys.)
 - **At 50M keys LayerZero is faster on the block path**: 99 ms against ours 121 at p50, and a flat
   tail (110 against ~216). Ours grows with the key count (75 → 121 ms from 2M to 50M; the index and
   the upper-tree rebuild); LayerZero's barely moves (85 → 99).
@@ -187,7 +189,7 @@ key (1,738,215 of 1,738,215). With a fixed operation order the root is the same 
 | | ours | LayerZero (no io_uring) |
 | --- | --- | --- |
 | block p50, 2M keys | 75 ms | 85 ms |
-| block p50 / p99, 50M keys | 121 / ~216 ms | 99 / 110 ms |
+| block p50 / p99, 50M keys | 121 / ~216 ms (node-like after stages 1-5: 40 / 90, section 6.9) | 99 / 110 ms |
 | 1M creates a block | 318 ms | 608 ms |
 | memory, 2M / 50M keys | 4.1 / 10.7 GB | 1.1 / 2.5 GB |
 | disk, same history | 2.0 / 2.6 GB | 7.0 / 15.1 GB |
@@ -394,3 +396,34 @@ and every fingerprint match confirmed against the key the entry store holds at t
 - The confirm read costs the block path ~3 ms at L (a random read of the old record per updated key) and nothing
   measurable on point reads, which read that record for the value anyway.
 - The restart rose 744 -> 939 ms: 1.74M inserts that each confirm against the entry file. Still under a second.
+
+### 6.9 The harness was not node-like: its block numbers carried bookkeeping the node clears
+
+`bench-ours` computed, filed and made canonical every block but never persisted one. The forest records the slots
+every move touches (`dirty_slots`) until a delta is taken, and the node takes one on every canonical head
+(`on_canonical`: `take_block_deltas`, then `forget_changes`). The harness never did, so its `BTreeSet` of dirty slots
+grew by ~147,000 slots a block for the whole run, and every block paid inserts into a set of millions. Every harness
+block number up to stage 5a -- sections 3.1-3.2, the verdict's 121 ms at 50M keys, 6.6-6.8 -- includes that cost;
+the comparisons between stages stay valid (all ran the same harness), the absolute numbers for our store were
+pessimistic. Stage 5b turned the set into a `Vec`, which is why its harness numbers fell so far (L p50 87.7 -> 39.3).
+
+`QMDBCMP_PERSIST=1` now takes each block's delta and clears the bookkeeping as the node does. Stage 5a (a worktree
+at `3c6ef2798`) against stage 5b+5c, both node-like, alternating 5a / 5b / 5a / 5b, roots identical in every run
+(`/data/blockchain/qmdb-compare/persist-ab`):
+
+    run                           stage 5a                       stage 5b+5c
+    S blocks p50 / p99 ms         48.0 / 101.6, 46.9 / 105.4     35.2 / 94.6, 38.1 / 122.3
+    L prefill p50 / p99 ms        168.9 / 507.6, 168.2 / 514.2   168.8 / 493.8, 172.0 / 499.3
+    L blocks p50 / p99 ms         58.5 / 104.5, 57.6 / 102.4     39.4 / 88.4, 39.9 / 91.9
+    L blocks peak RSS             4.69, 4.66 GB                  4.62, 4.60 GB
+
+- Node-like, stage 5b+5c takes a third off the 50M-key block (58 -> 40 ms p50, 103 -> 90 ms p99) and a quarter off
+  the 2M-key block: the per-block set built from the undo's slots and the 64-byte undo entries were real costs.
+- Against LayerZero's 99 / 110 ms at 50M keys (section 3.2, no io_uring), our block path is now 40 / 90 ms, at 4.6 GB
+  of RSS against its 2.5 GB and 2.6 GB of disk against its 15 GB.
+- The S p99 of the second 5b+5c run (122 ms) is a single 50-block run's tail; the L tails, over 100 blocks, agree.
+
+Retention depth, the same L shape without persistence (peak RSS is reached while the prefill's 1M-operation records
+are still retained, so it overstates a full block's record): depth 2 4.68 GB, 16 6.31 GB, 64 12.27 GB, block latency
+unchanged. A full fleet block's record is ~30 MB; the forest's default moves from 64 to 16, which the fleet has run
+since loop122.
