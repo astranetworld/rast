@@ -102,7 +102,8 @@ hashed tables cannot be dropped until that dependency is found.
 | 1a | done: lookups 3-4x faster, warm reads +8%, block path -3%, roots unchanged | same doc, section 6.6 |
 | 7 | code in (`max_total_wal_size` 256 MiB, `N42_ROCKSDB_MAX_WAL_MB`); fleet leg with WAL size still to record | -- |
 | 2 | done: upper tree cached, refreshed along changed paths; `prove` reads it; roots unchanged, block p50 unchanged at 50M keys (the full fold was a few ms), no full rebuild per proof | `/data/blockchain/qmdb-compare/stage2` |
-| 3a | next: scans removed, SIMD leaf and level batches, coarse parallel units | -- |
+| 3a | done: retire and rehash proportional to the block, SIMD leaf and twig-level batches, coarse parallel units, restart hashes each bit set once and twigs in parallel. Real-state rebuild 4,541 -> 1,402 ms; S p50/p99 68.0/129.8 -> 60.2/106.5 ms; L 102.9/125.3 -> 95.5/107.6 ms; roots unchanged | `/data/blockchain/qmdb-compare/stage3a` |
+| 3b | next: evict every full twig below the retention window, rehydrate for proofs and truncations | -- |
 
 ## Recommended approach
 

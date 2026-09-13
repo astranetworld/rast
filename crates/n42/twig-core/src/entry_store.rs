@@ -472,41 +472,16 @@ impl Entries {
         }
     }
 
-    /// Clears the active flag of every slot `held` names. In the heap, each
-    /// entry checks a bitmap of the slots on the worker pool rather than
-    /// 133,000 random writes in sequence; in the file the flags *are* a
-    /// bitmap and the clears are the random writes, 64 slots to a word.
+    /// Clears the active flag of every slot `held` names: one write a slot,
+    /// in the heap as in the file, so the cost is the block's and not the
+    /// state's (the heap used to scan a bitmap over every slot).
     pub(crate) fn retire(&mut self, held: &[Option<u64>]) {
         match self {
             Self::Heap(entries) => {
-                let mut bits = vec![0u64; entries.len().div_ceil(64)];
-                let mut any = false;
                 for slot in held.iter().flatten() {
-                    let slot = *slot as usize;
-                    debug_assert!(entries[slot].active, "the index named an inactive slot");
-                    bits[slot / 64] |= 1 << (slot % 64);
-                    any = true;
-                }
-                if !any {
-                    return;
-                }
-                let clear = |(chunk, word): (&mut [Entry], &u64)| {
-                    if *word != 0 {
-                        for (i, entry) in chunk.iter_mut().enumerate() {
-                            if (*word >> i) & 1 == 1 {
-                                entry.active = false;
-                            }
-                        }
-                    }
-                };
-                #[cfg(feature = "rayon")]
-                {
-                    use rayon::prelude::*;
-                    entries.par_chunks_mut(64).zip(bits.par_iter()).for_each(clear);
-                }
-                #[cfg(not(feature = "rayon"))]
-                {
-                    entries.chunks_mut(64).zip(bits.iter()).for_each(clear);
+                    let entry = &mut entries[*slot as usize];
+                    debug_assert!(entry.active, "the index named an inactive slot");
+                    entry.active = false;
                 }
             }
             Self::File(file) => {

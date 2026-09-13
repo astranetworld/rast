@@ -833,8 +833,14 @@ impl Twig {
 
     fn recompute(&mut self) {
         let nodes = self.nodes_mut();
-        for start in (1..TWIG_SIZE).rev() {
-            nodes[start] = hash_node(&nodes[start * 2], &nodes[start * 2 + 1]);
+        // Level by level from the leaves up, each level's pairs batched across
+        // the SIMD lanes (`simd::hash_parents`: one level at a time, so no
+        // parent is read while written).
+        let parents = twig_node_indices();
+        let mut width = TWIG_SIZE / 2;
+        while width >= 1 {
+            crate::simd::hash_parents(&mut nodes[..], &parents[width..2 * width]);
+            width /= 2;
         }
         self.leaf_root = nodes[1];
         self.bits_root = hash_bits(&self.bits);
@@ -857,6 +863,13 @@ impl Twig {
     }
 }
 
+/// `0..TWIG_SIZE`: the heap indices of a twig's internal nodes, sliced per
+/// level for `simd::hash_parents`.
+fn twig_node_indices() -> &'static [usize] {
+    static INDICES: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    INDICES.get_or_init(|| (0..TWIG_SIZE).collect())
+}
+
 /// A twig whose bit set changed; its leaves did not.
 const DIRTY_BITS: u8 = 1;
 /// A twig that took new leaves (and possibly bit changes).
@@ -872,17 +885,38 @@ fn mark_dirty(dirty: &mut Vec<u8>, twig_id: usize, level: u8) {
 /// The leaf hash of every operation that writes a value, on the worker pool
 /// when the `rayon` feature is on.
 fn leaf_hashes(operations: &[QmdbOperation]) -> Vec<Option<Hash>> {
-    let leaf = |operation: &QmdbOperation| operation.value.as_ref().map(|value| hash_leaf(&operation.key, value));
+    // A chunk at a time, its leaves batched across the SIMD lanes.
+    let chunk = |operations: &[QmdbOperation]| -> Vec<Option<Hash>> {
+        let jobs: Vec<(&Hash, &[u8])> = operations
+            .iter()
+            .filter_map(|operation| operation.value.as_deref().map(|value| (&operation.key, value)))
+            .collect();
+        let mut hashes = vec![NULL_HASH; jobs.len()];
+        crate::simd::hash_leaves(&jobs, &mut hashes);
+        let mut hashes = hashes.into_iter();
+        operations.iter().map(|operation| operation.value.as_ref().and_then(|_| hashes.next())).collect()
+    };
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        operations.par_iter().map(leaf).collect()
+        let pieces: Vec<Vec<Option<Hash>>> = operations.par_chunks(LEAF_CHUNK).map(chunk).collect();
+        let mut out = Vec::with_capacity(operations.len());
+        for piece in pieces {
+            out.extend(piece);
+        }
+        out
     }
     #[cfg(not(feature = "rayon"))]
     {
-        operations.iter().map(leaf).collect()
+        operations.chunks(LEAF_CHUNK).flat_map(chunk).collect()
     }
 }
+
+/// Operations per unit of parallel work on the block path: small enough to
+/// spread a block over the pool, large enough that a unit is not dominated by
+/// its scheduling (half the CPU of a 50M-key profile was rayon's, with a task
+/// per operation or per twig; `docs/QMDB_LAYERZERO_COMPARISON.md` section 6.5).
+const LEAF_CHUNK: usize = 1024;
 
 /// The slot each operation's key currently occupies, if any.
 fn held_slots(index: &KeyIndex, operations: &[QmdbOperation]) -> Vec<Option<u64>> {
@@ -890,7 +924,7 @@ fn held_slots(index: &KeyIndex, operations: &[QmdbOperation]) -> Vec<Option<u64>
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        operations.par_iter().map(held).collect()
+        operations.par_iter().with_min_len(LEAF_CHUNK).map(held).collect()
     }
     #[cfg(not(feature = "rayon"))]
     {
@@ -898,57 +932,22 @@ fn held_slots(index: &KeyIndex, operations: &[QmdbOperation]) -> Vec<Option<u64>
     }
 }
 
-/// Retires every slot `held` names: the entries' active flags and the twigs'
-/// bits, each entry and each twig checking a bitmap of the slots on the
-/// worker pool; the twigs touched are marked for a bit-set rehash.
+/// Clears every slot `held` names in its twig's bit set and marks the twig
+/// for a bit-set rehash. Serial and proportional to the block: a cleared bit
+/// is one write, where the bitmap over every slot and the parallel pass over
+/// every twig this replaced grew with the state.
 fn retire_twigs(slots: usize, twigs: &mut [Twig], dirty: &mut Vec<u8>, held: &[Option<u64>]) {
     let cursor = slots as u64;
-    const WORDS_PER_TWIG: usize = TWIG_SIZE / 64;
-    // The entries' flags are cleared by `Entries::retire`; here the twigs'
-    // bit sets, each twig checking a bitmap of the slots on the worker pool.
-    let mut bits = vec![0u64; slots.div_ceil(64)];
-    let mut any = false;
-    for slot in held.iter().flatten() {
-        let slot = *slot as usize;
-        bits[slot / 64] |= 1 << (slot % 64);
-        any = true;
-    }
-    if !any {
-        return;
-    }
     if dirty.len() < twigs.len() {
         dirty.resize(twigs.len(), 0);
     }
-    let clear_twig = |(twig_id, (twig, mark)): (usize, (&mut Twig, &mut u8))| {
-        let from = (twig_id * WORDS_PER_TWIG).min(bits.len());
-        let to = ((twig_id + 1) * WORDS_PER_TWIG).min(bits.len());
-        let mut touched = false;
-        for (wi, word) in bits[from..to].iter().enumerate() {
-            if *word == 0 {
-                continue;
-            }
-            touched = true;
-            for b in 0..64 {
-                if (*word >> b) & 1 == 1 {
-                    let local = wi * 64 + b;
-                    twig.bits[local / 8] &= !(1 << (local % 8));
-                }
-            }
-        }
-        if touched {
-            *mark = (*mark).max(DIRTY_BITS);
-            twig.last_retired_at = cursor;
-        }
-    };
-    let n = twigs.len();
-    #[cfg(feature = "rayon")]
-    {
-        use rayon::prelude::*;
-        twigs.par_iter_mut().zip(dirty[..n].par_iter_mut()).enumerate().for_each(clear_twig);
-    }
-    #[cfg(not(feature = "rayon"))]
-    {
-        twigs.iter_mut().zip(dirty[..n].iter_mut()).enumerate().for_each(clear_twig);
+    for slot in held.iter().flatten() {
+        let slot = *slot as usize;
+        let (twig_id, local) = (slot / TWIG_SIZE, slot % TWIG_SIZE);
+        let twig = &mut twigs[twig_id];
+        twig.bits[local / 8] &= !(1 << (local % 8));
+        twig.last_retired_at = cursor;
+        dirty[twig_id] = dirty[twig_id].max(DIRTY_BITS);
     }
 }
 
@@ -1002,20 +1001,45 @@ pub struct ApplyPhases {
 }
 
 /// Rehashes every twig marked in `dirty`, each independently of the others.
+///
+/// Only the marked twigs reach the pool, split by their work: a recompute is
+/// ~2,000 compressions and goes a twig to a task; a bit-set rehash is one and
+/// goes in batches.
 fn rehash_dirty(twigs: &mut [Twig], dirty: &[u8]) {
-    let work = |(twig_id, twig): (usize, &mut Twig)| match dirty.get(twig_id).copied().unwrap_or(0) {
-        DIRTY_LEAVES => twig.recompute(),
-        DIRTY_BITS => twig.rehash_bits(),
-        _ => {}
-    };
+    let mut leaves: Vec<&mut Twig> = Vec::new();
+    let mut bits: Vec<&mut Twig> = Vec::new();
+    for (twig, mark) in twigs.iter_mut().zip(dirty) {
+        match *mark {
+            DIRTY_LEAVES => leaves.push(twig),
+            DIRTY_BITS => bits.push(twig),
+            _ => {}
+        }
+    }
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        twigs.par_iter_mut().enumerate().for_each(work);
+        rayon::join(
+            || leaves.par_iter_mut().for_each(|twig| twig.recompute()),
+            || bits.par_iter_mut().with_min_len(512).for_each(|twig| twig.rehash_bits()),
+        );
     }
     #[cfg(not(feature = "rayon"))]
     {
-        twigs.iter_mut().enumerate().for_each(work);
+        leaves.iter_mut().for_each(|twig| twig.recompute());
+        bits.iter_mut().for_each(|twig| twig.rehash_bits());
+    }
+}
+
+/// Recomputes every twig, a twig to a task on the worker pool.
+fn recompute_all(twigs: &mut [Twig]) {
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        twigs.par_iter_mut().for_each(Twig::recompute);
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        twigs.iter_mut().for_each(Twig::recompute);
     }
 }
 
@@ -1335,18 +1359,28 @@ impl QmdbCompatTree {
             .map_err(|e| QmdbSnapshotError::EntryFile(e.to_string()))?;
         let entries = Entries::File(file);
         let n = kept as usize;
-        // The leaf hashes, from the records.
-        let leaf = |slot: usize| hash_leaf(&entries.key(slot), entries.value(slot));
+        // The leaf hashes, from the records, a chunk at a time across the SIMD lanes.
+        let chunk = |index: usize| -> Vec<Hash> {
+            let (from, to) = (index * LEAF_CHUNK, ((index + 1) * LEAF_CHUNK).min(n));
+            let keys: Vec<Hash> = (from..to).map(|slot| entries.key(slot)).collect();
+            let jobs: Vec<(&Hash, &[u8])> = keys.iter().zip(from..to).map(|(key, slot)| (key, entries.value(slot))).collect();
+            let mut hashes = vec![NULL_HASH; to - from];
+            crate::simd::hash_leaves(&jobs, &mut hashes);
+            hashes
+        };
         let leaves: Vec<Hash> = {
             #[cfg(feature = "rayon")]
-            {
+            let pieces: Vec<Vec<Hash>> = {
                 use rayon::prelude::*;
-                (0..n).into_par_iter().map(leaf).collect()
-            }
+                (0..n.div_ceil(LEAF_CHUNK)).into_par_iter().map(chunk).collect()
+            };
             #[cfg(not(feature = "rayon"))]
-            {
-                (0..n).map(leaf).collect()
+            let pieces: Vec<Vec<Hash>> = (0..n.div_ceil(LEAF_CHUNK)).map(chunk).collect();
+            let mut leaves = Vec::with_capacity(n);
+            for piece in pieces {
+                leaves.extend(piece);
             }
+            leaves
         };
         let mut tree = Self {
             entries,
@@ -1364,15 +1398,14 @@ impl QmdbCompatTree {
             let local = slot % TWIG_SIZE;
             tree.twigs[twig_id].set_leaf_unchecked(local, leaf);
             if tree.entries.is_active(slot) {
-                tree.twigs[twig_id].set_active(local, true);
+                // The bit only: `recompute` below hashes each bit set once.
+                tree.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
                 if tree.index.insert(tree.entries.key(slot), slot as u64).is_some() {
                     return Err(QmdbSnapshotError::DuplicateActiveKey(tree.entries.key(slot)));
                 }
             }
         }
-        for twig in &mut tree.twigs {
-            twig.recompute();
-        }
+        recompute_all(&mut tree.twigs);
         Ok((tree, kept))
     }
 
@@ -1565,7 +1598,10 @@ impl QmdbCompatTree {
             }
         }
 
+        // Twigs that lost leaves recompute; twigs that only regained live
+        // slots rehash their bit set.
         let mut touched_twigs = std::collections::BTreeSet::new();
+        let mut revived_twigs = std::collections::BTreeSet::new();
 
         // 1. Truncate the block's appends: drop their index mappings, clear
         //    their bits, null their leaves.
@@ -1607,11 +1643,14 @@ impl QmdbCompatTree {
             let twig_id = (slot as usize) / TWIG_SIZE;
             let local = (slot as usize) % TWIG_SIZE;
             self.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
-            touched_twigs.insert(twig_id);
+            revived_twigs.insert(twig_id);
         }
 
-        for twig_id in touched_twigs {
-            self.twigs[twig_id].recompute();
+        for twig_id in &touched_twigs {
+            self.twigs[*twig_id].recompute();
+        }
+        for twig_id in revived_twigs.difference(&touched_twigs) {
+            self.twigs[*twig_id].rehash_bits();
         }
         Ok(())
     }
@@ -1883,7 +1922,7 @@ impl QmdbCompatTree {
                 if tree.index.insert(entry.key, slot as u64).is_some() {
                     return Err(QmdbSnapshotError::DuplicateActiveKey(entry.key));
                 }
-                tree.twigs[twig_id].set_active(local, true);
+                tree.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
             }
             // A fresh tree keeps its entries in the heap, where a push
             // cannot fail; `set_entry_file` moves them afterwards.
@@ -1892,9 +1931,7 @@ impl QmdbCompatTree {
                 tree.entries.set_active(slot, false);
             }
         }
-        for twig in &mut tree.twigs {
-            twig.recompute();
-        }
+        recompute_all(&mut tree.twigs);
         Ok(tree)
     }
 
