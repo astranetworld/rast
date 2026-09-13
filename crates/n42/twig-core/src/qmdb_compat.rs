@@ -1515,6 +1515,25 @@ impl QmdbCompatTree {
         self.apply_sorted_ops_recorded_phased(operations).map(|(root, undo, _)| (root, undo))
     }
 
+    /// [`Self::apply_sorted_ops_recorded`] on operations the caller keeps (a
+    /// block record re-applies them after a revert): values are copied into
+    /// the entry store, so the operations need not be cloned first. Unsorted
+    /// operations are sorted in a copy.
+    pub fn apply_sorted_slice_recorded(
+        &mut self,
+        operations: &[QmdbOperation],
+    ) -> Result<(Hash, BlockUndo), QmdbOperationError> {
+        self.start_undo_recording();
+        match self.apply_sorted_slice_phased(operations) {
+            Ok((root, _)) => Ok((root, self.recording.take().unwrap_or_default())),
+            Err(error) => {
+                // A refused batch mutates nothing, so there is nothing to undo.
+                self.recording = None;
+                Err(error)
+            }
+        }
+    }
+
     /// [`Self::apply_sorted_ops_recorded`], reporting where the time went.
     pub fn apply_sorted_ops_recorded_phased(
         &mut self,
@@ -1669,7 +1688,6 @@ impl QmdbCompatTree {
         &mut self,
         operations: impl IntoIterator<Item = QmdbOperation>,
     ) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
-        let mut phases = ApplyPhases::default();
         let at = std::time::Instant::now();
         let mut operations = operations.into_iter().collect::<Vec<_>>();
         // Callers that sort (`sorted_operations_from_execution`) pay the
@@ -1677,6 +1695,26 @@ impl QmdbCompatTree {
         if !operations.is_sorted_by_key(|operation| operation.key) {
             operations.sort_unstable_by_key(|operation| operation.key);
         }
+        let sort_us = at.elapsed().as_micros() as u64;
+        let (root, mut phases) = self.apply_sorted_slice_phased(&operations)?;
+        phases.sort_us += sort_us;
+        Ok((root, phases))
+    }
+
+    /// [`Self::apply_sorted_ops_phased`] on borrowed operations: the values
+    /// are copied into the entry store. Unsorted operations are sorted in a
+    /// copy first.
+    pub fn apply_sorted_slice_phased(
+        &mut self,
+        operations: &[QmdbOperation],
+    ) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
+        if !operations.is_sorted_by_key(|operation| operation.key) {
+            let mut sorted = operations.to_vec();
+            sorted.sort_unstable_by_key(|operation| operation.key);
+            return self.apply_sorted_slice_phased(&sorted);
+        }
+        let mut phases = ApplyPhases::default();
+        let at = std::time::Instant::now();
         for pair in operations.windows(2) {
             if pair[0].key == pair[1].key {
                 return Err(QmdbOperationError::DuplicateKey(pair[0].key));
@@ -1698,12 +1736,12 @@ impl QmdbCompatTree {
         // and root. The tree these produce is the tree `set`/`delete` produce,
         // and a test says so operation for operation.
         let at = std::time::Instant::now();
-        let leaves = leaf_hashes(&operations);
+        let leaves = leaf_hashes(operations);
         // The slot each key holds now, looked up on the worker pool: the
         // block's keys are distinct, so no lookup depends on an earlier write
         // of the same block, and the lookups are the random reads of a
         // multi-million-entry index that the serial loop was waiting on.
-        let held = held_slots(&self.index, &self.entries, &operations);
+        let held = held_slots(&self.index, &self.entries, operations);
         phases.leaves_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         // The undo record's entries -- what every retired slot held -- built
@@ -1735,8 +1773,8 @@ impl QmdbCompatTree {
         // The appends' index entries, inserted per shard afterwards; the
         // block's keys are distinct, so no operation reads one.
         let mut appended: Vec<(Hash, u64)> = Vec::with_capacity(operations.len());
-        for ((operation, leaf), old_slot) in operations.into_iter().zip(leaves).zip(held) {
-            match (operation.value, leaf) {
+        for ((operation, leaf), old_slot) in operations.iter().zip(leaves).zip(held) {
+            match (operation.value.as_deref(), leaf) {
                 (Some(value), Some(leaf)) => {
                     let slot = self.append_deferred(operation.key, value, leaf, &mut dirty)?;
                     appended.push((operation.key, slot));
@@ -1762,7 +1800,7 @@ impl QmdbCompatTree {
     /// `set` for the block apply: the slot the key held already retired and
     /// recorded, the twig's hashing left to [`rehash_dirty`], the index
     /// insert left to the caller. Returns the slot appended.
-    fn append_deferred(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, dirty: &mut Vec<u8>) -> Result<u64, QmdbOperationError> {
+    fn append_deferred(&mut self, key: Hash, value: &[u8], leaf: Hash, dirty: &mut Vec<u8>) -> Result<u64, QmdbOperationError> {
         if let Some(record) = self.recording.as_mut() {
             record.appended_keys.push(key);
         }
@@ -1775,7 +1813,7 @@ impl QmdbCompatTree {
         twig.nodes_mut()[TWIG_SIZE + local] = leaf;
         twig.bits[local / 8] |= 1 << (local % 8);
         mark_dirty(dirty, twig_id, DIRTY_LEAVES);
-        self.entries.push(key, value).map_err(|e| QmdbOperationError::Store(e.to_string()))?;
+        self.entries.push_slice(&key, value).map_err(|e| QmdbOperationError::Store(e.to_string()))?;
         Ok(slot)
     }
 

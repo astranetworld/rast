@@ -524,8 +524,10 @@ impl QmdbForest {
     /// the tree reverts it first.
     pub fn compute(&mut self, parent: B256, changes: &BlockChanges) -> Result<PreparedBlock, StateError> {
         self.move_to(parent)?;
-        let ops = changes.operations();
-        let (root, undo) = self.tree.apply_sorted_ops_recorded(ops.clone())?;
+        let mut ops = changes.operations();
+        ops.sort_unstable_by_key(|operation| operation.key);
+        // Applied from the slice the record keeps: no clone of the block.
+        let (root, undo) = self.tree.apply_sorted_slice_recorded(&ops)?;
         self.note_move(&undo);
         let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
@@ -543,9 +545,14 @@ impl QmdbForest {
     /// straight from the execution's bundle -- the change set and its
     /// operations were 75 ms of a 190 ms root phase on a 147,000-account
     /// block). The operations need not be sorted; the tree sorts them.
-    pub fn compute_operations(&mut self, parent: B256, ops: Vec<QmdbOperation>) -> Result<PreparedBlock, StateError> {
+    pub fn compute_operations(&mut self, parent: B256, mut ops: Vec<QmdbOperation>) -> Result<PreparedBlock, StateError> {
         self.move_to(parent)?;
-        let (root, undo) = self.tree.apply_sorted_ops_recorded(ops.clone())?;
+        if !ops.is_sorted_by_key(|operation| operation.key) {
+            ops.sort_unstable_by_key(|operation| operation.key);
+        }
+        // Applied from the slice the record keeps: no clone of the block
+        // (168,000 operations and as many value allocations a full block).
+        let (root, undo) = self.tree.apply_sorted_slice_recorded(&ops)?;
         self.note_move(&undo);
         let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
@@ -914,8 +921,8 @@ impl QmdbForest {
                 .records
                 .get(hash)
                 .ok_or(StateError::UnknownBlock(*hash))?;
-            let (ops, expected) = (record.ops.clone(), record.root);
-            let (root, undo) = self.tree.apply_sorted_ops_recorded(ops)?;
+            let expected = record.root;
+            let (root, undo) = self.tree.apply_sorted_slice_recorded(&record.ops)?;
             self.note_move(&undo);
             let root = B256::from(root);
             if root != expected {

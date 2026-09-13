@@ -444,6 +444,18 @@ impl Entries {
         }
     }
 
+    /// Appends a live entry as the next slot from borrowed bytes: the file
+    /// copies them into its tail, the heap into a new value.
+    pub(crate) fn push_slice(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Heap(entries) => {
+                entries.push(Entry { key: *key, value: value.to_vec(), active: true });
+                Ok(())
+            }
+            Self::File(file) => file.push(key, value),
+        }
+    }
+
     /// Appends a live entry as the next slot.
     pub(crate) fn push(&mut self, key: Hash, value: Vec<u8>) -> io::Result<()> {
         match self {

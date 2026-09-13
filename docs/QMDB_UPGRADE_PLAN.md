@@ -106,7 +106,8 @@ hashed tables cannot be dropped until that dependency is found.
 | 3b | done: every full twig below the retention window drops its 128 KiB of leaf nodes, live or not; proofs and truncations rehash one from the entries (checked against its leaf root); restart keeps nodes only for the last twig. Real-state rebuild 1,402 -> 744 ms and RSS 5.38 -> 1.67 GB; L RSS 11.22 -> 7.09 GB; latency unchanged; roots unchanged | `/data/blockchain/qmdb-compare/stage3b` |
 | 1b | done: 256 shards of `u64` buckets (24-bit seeded fingerprint, whose top bits are the home, and slot + 1), linear probing, load <= 3/4, growth without key reads, every match confirmed against the entry store. L RSS 7.09 -> 4.73 GB (prefill 6.30 -> 4.11), S 1.16 -> 1.01 GB; L block p50/p99 95.9/106.8 -> 98.9/112.5 ms (the confirm read); roots unchanged | `/data/blockchain/qmdb-compare/stage1b` |
 | 4a | deferred: after 3a/3b the real state restarts in 0.74-0.94 s at 1.6 GB, which was 4a's latency motive; its other motive, dropping dead byte ranges (4b), has nothing to reclaim on this workload (section 6.2). Revisit when a larger state makes restart matter | -- |
-| 5 | next: no clone of a block's operations (5a), then retention bounded by finality | -- |
+| 5a | done: the forest applies a block from the slice its record keeps (values copied once, into the store), no clone of the block's operations. L prefill p50 236 -> 179 ms, L blocks p50/p99 98.9/112.5 -> 87.7/103.0 ms, S p50 62.8 -> 52.4 ms; roots unchanged | `/data/blockchain/qmdb-compare/stage5a` |
+| 5b | next: move bookkeeping without ordered sets; file-mode undo records as slot lists; then retention depth | -- |
 
 ## Recommended approach
 
@@ -175,6 +176,30 @@ uncommitted depth.
   (`database/provider.rs:774-790`) and the hashed post-state passes (`follower_import.rs`,
   `engine-types/src/payload.rs`, `direct_build.rs`) behind an N42 storage flag. Archive history keeps coming from
   changesets and history indices.
+
+**Stage 6 design notes (2026-09-13, after stages 1a-3b and 1b).** What the code read since the plan was
+written adds:
+- *Where the node's QMDB lives.* `QmdbNodeState` (`qmdb-reth/src/node_state.rs`) is an `Arc<Inner>` whose forest
+  sits behind one `Mutex`; the tree inside may stand at a pending build or at a sibling fork, and persistence
+  (`on_canonical`) runs a block or two behind the tip. Readers cannot take that lock per read.
+- *What version a read must see.* reth reads through `MemoryOverlayStateProvider`, which answers every key changed
+  by the unpersisted ancestors of the executing block, then falls back to the base at MDBX's persisted block N. A
+  base that answers at any version V on the executing block's own ancestry, N <= V <= parent, is therefore correct:
+  a key changed in (N, V] is in the overlay. A base at the tree's tip is not, when the tip is a sibling fork or a
+  pending build. So the view is pinned to the canonical chain, not to the tree.
+- *The journal.* `apply_sorted_slice_phased` already computes, for every operation, the slot the key held before
+  the block (`held_slots`). Kept per block as a sorted `(key, Option<slot>)` list, it answers "the key's slot as
+  of the parent" without reading anything; a view at V consults the journals of the blocks after V on the tree's
+  path (at most the persistence lag, a handful) and the index otherwise. Journals are dropped with the records.
+- *Concurrency.* The index shards (`TagIndex`, stage 1b) become `RwLock`s written in the block's index phase only;
+  `FileEntries::offsets` becomes append-only pages so a reader never sees a reallocation; sealed mmap chunks are
+  already immutable, the tail buffer needs a short lock or a published copy; truncation (`apply_undo` below the
+  sealed length) waits for readers of older generations. A generation counter bumped by any revert lets a view
+  detect that its version left the tree's path and fall back to MDBX.
+- *The hook.* The vendored `LatestStateProviderRef` has no path to the node's state. The least invasive plug is a
+  process-wide reader registered by `bin/n42` at startup (an additive trait and `OnceLock` in the vendored
+  `storage-api`, default absent), consulted by `basic_account` / `storage` under `N42_QMDB_READS`; MDBX stays the
+  answer whenever the reader declines (not initialised, version unavailable, `off`).
 
 **Stage 4b -- QMDB dead-space reclamation, opt-in (default off). Stage 0 result: 0 of 14,472 full twigs are fully dead on the real state, so punching dead twigs reclaims nothing here; QMDB history on disk only shrinks with live-entry compaction (root-changing, fork-gated). Kept only as an option for workloads with cold history.** `u32` offsets relative to the twig base;
 `fallocate(PUNCH_HOLE|KEEP_SIZE)` over fully dead twigs below finality with a persisted punched set; `snapshot()`,
