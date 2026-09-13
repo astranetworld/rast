@@ -84,3 +84,17 @@ runs.
 | --- | --- | --- |
 | a follower's check of block N+1 reads its senders from block N's execution output, published by N's import as soon as N's QMDB root is filed, instead of waiting for N to land in the engine; untouched senders are read at N's parent, which is in the engine; N+1's execution still waits for N's insert | `N42_CHECK_ON_PARENT_OUTPUT=1` (`bin/n42/src/follower_import.rs`) | N's engine insert and hand-off bookkeeping (~60-80 ms) off every vote's path |
 
+## 6. Found, not changed yet: each needs a larger change or a fleet leg
+
+| finding | cost | why not now |
+| --- | --- | --- |
+| the leader's graft inserts ~147,000 accounts into one `BundleState` map serially | ~70 ms on the seal path | a sharded bundle kept through the roots and the overlay, merged only behind the seal: a representation change across builder, overlay and roots |
+| the leader's receipts loop commits 150,000 transfer results one at a time (receipt build, a Cancun check and an empty state commit each) | 45 ms on the seal path | the executor's receipts and gas counters are private to alloy-evm's `EthBlockExecutor`; a bulk append needs an executor of our own, and the receipts root is consensus data |
+| the body is deep-copied four times per block (build-on-own, hand-off, `remember_sealed`, the engine's conversion of a block it already holds) | ~40 ms and allocator churn | `Arc<SealedBlock>` in every store; the engine's conversion is reth's |
+| every transaction is encoded twice (tx root, wire frame) | ~15-25 ms (estimate) | the assembler's encodings would have to travel with the payload |
+| the hand-off waits for the hashed post-state, and followers build it before the engine insert | 28-40 ms | reth's `LazyHashedPostState` would have to be handed over pending |
+| reth fills its execution cache over ~147,000 accounts on the engine thread for blocks nothing re-executes | ~20 ms (estimate) | needs a wrapper around `BasicEngineValidator`, and the engine's own fallback execution uses the cache |
+| `HashedAccounts`/`HashedStorages` duplicate QMDB's live state | ~150,000 MDBX upserts and a keccak per touched key per block | stage 6c: after `N42_QMDB_READS` holds on the fleet in `verify`, then `on` |
+| the QMDB delta per block repeats what the entry file and its active bits hold; the checkpoint grows a bit per slot ever written | encode + keccak over ~1.3 MB a block; periodic full rewrites | a log format change with a migration |
+| ~14 static-file fsyncs per save (two per segment) | device-dependent | reth's static-file writer; one sync per commit needs a change there |
+

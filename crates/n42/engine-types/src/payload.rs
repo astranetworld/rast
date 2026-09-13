@@ -1058,17 +1058,22 @@ where
             db.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
             let merge_ms = finish_at.elapsed().as_millis() as u64;
             // The post-state is final: the next block can be built on it.
-            // Receipts and hashed state come with `complete`.
+            // The bundle is taken and its reverts appended once, here, and the
+            // one execution output is shared by `state_ready`, the roots below
+            // and `complete`: the provisional used to clone the whole bundle
+            // (~147,000 accounts) and every receipt only to drop the receipts,
+            // inside the 26 ms before the next build could start (loop138).
+            // The hashed state comes with `complete`.
+            let mut bundle = db.take_bundle();
+            crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
+            let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
+                state: bundle,
+                result: execution_result,
+            });
+            let execution_result = &execution_output.result;
             let provisional = crate::built_executions::BuiltExecution {
                 block: recovered.clone(),
-                execution_output: Arc::new(reth_execution_types::BlockExecutionOutput {
-                    state: db.bundle_state.clone(),
-                    result: reth_execution_types::BlockExecutionResult {
-                        receipts: Vec::new(),
-                        gas_used: execution_result.gas_used,
-                        ..execution_result.clone()
-                    },
-                }),
+                execution_output: Arc::clone(&execution_output),
                 hashed_state: Arc::new(Default::default()),
                 trie_updates: Arc::new(TrieUpdates::default()),
             };
@@ -1095,7 +1100,7 @@ where
             }
             let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
             let roots_at = std::time::Instant::now();
-            let bundle_ref = &db.bundle_state;
+            let bundle_ref = &execution_output.state;
             // The state provider is `Send` but not `Sync`: the hashed
             // post-state stays on this thread while the root and the
             // receipts run beside it.
@@ -1126,12 +1131,6 @@ where
                     gas_used: execution_result.gas_used,
                 },
             );
-            let mut bundle = db.take_bundle();
-            crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
-            let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
-                state: bundle,
-                result: execution_result,
-            });
             crate::built_executions::complete(
                 block_hash,
                 crate::built_executions::BuiltExecution {
