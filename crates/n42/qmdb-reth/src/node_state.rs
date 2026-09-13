@@ -158,9 +158,10 @@ fn retain_depth() -> Option<u64> {
     })
 }
 
-/// `N42_QMDB_TRIM_TWIGS=0` keeps every twig's leaf nodes; by default a twig
-/// whose slots are all dead for longer than the retention window keeps only
-/// its root (`docs/QMDB_ENTRY_LOG.md`, step 5).
+/// `N42_QMDB_TRIM_TWIGS=0` keeps every twig's leaf nodes; by default a full
+/// twig below the retention window keeps only its root and bits, and a proof
+/// or a revert into it rehashes its entries (`docs/QMDB_UPGRADE_PLAN.md`,
+/// stage 3).
 fn trim_twigs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_TRIM_TWIGS").map_or(true, |v| v != "0"))

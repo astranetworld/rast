@@ -760,9 +760,10 @@ fn read_bytes<'a>(
 
 #[derive(Clone)]
 struct Twig {
-    /// The leaf merkle tree: `None` once the twig is trimmed (every slot
-    /// dead for longer than the retention window, `trim_dead_twigs`), when
-    /// only `leaf_root` is kept -- 32 B instead of 128 KB.
+    /// The leaf merkle tree: `None` once the twig is evicted (full and below
+    /// the retention window, `evict_twig_nodes`; or every slot dead,
+    /// `trim_dead_twigs`), when only `leaf_root` is kept -- 32 B instead of
+    /// 128 KiB. The entries rehash it (`twig_leaf_nodes`).
     nodes: Option<Box<[Hash; 2 * TWIG_SIZE]>>,
     /// `nodes[1]`, kept when the nodes are not.
     leaf_root: Hash,
@@ -796,11 +797,12 @@ impl Twig {
         }
     }
 
-    /// The leaf nodes; a trimmed twig is never written or proved from (the
-    /// trimming rule keeps every twig an undo or a proof can reach), so
-    /// reaching one here is a broken invariant, not a recoverable state.
+    /// The leaf nodes; an evicted twig is never written (appends go to the
+    /// partial last twig, and a truncation hydrates the twig it cuts into
+    /// first), so reaching one here is a broken invariant, not a recoverable
+    /// state.
     fn nodes_mut(&mut self) -> &mut [Hash; 2 * TWIG_SIZE] {
-        self.nodes.as_mut().expect("a trimmed QMDB twig was written or proved from")
+        self.nodes.as_mut().expect("an evicted QMDB twig was written without being hydrated")
     }
 
     fn set_leaf(&mut self, local: usize, leaf: Hash) {
@@ -1028,6 +1030,23 @@ fn rehash_dirty(twigs: &mut [Twig], dirty: &[u8]) {
         leaves.iter_mut().for_each(|twig| twig.recompute());
         bits.iter_mut().for_each(|twig| twig.rehash_bits());
     }
+}
+
+/// A twig's leaf tree hashed from its entries: the first `filled` slots'
+/// leaves (the rest null), every level above them. What an evicted twig held.
+fn twig_leaf_nodes(entries: &Entries, twig_id: usize, filled: usize) -> Box<[Hash; 2 * TWIG_SIZE]> {
+    let mut nodes = Box::new([NULL_HASH; 2 * TWIG_SIZE]);
+    let base = twig_id * TWIG_SIZE;
+    let keys: Vec<Hash> = (base..base + filled).map(|slot| entries.key(slot)).collect();
+    let jobs: Vec<(&Hash, &[u8])> = keys.iter().zip(base..).map(|(key, slot)| (key, entries.value(slot))).collect();
+    crate::simd::hash_leaves(&jobs, &mut nodes[TWIG_SIZE..TWIG_SIZE + filled]);
+    let parents = twig_node_indices();
+    let mut width = TWIG_SIZE / 2;
+    while width >= 1 {
+        crate::simd::hash_parents(&mut nodes[..], &parents[width..2 * width]);
+        width /= 2;
+    }
+    nodes
 }
 
 /// Recomputes every twig, a twig to a task on the worker pool.
@@ -1267,6 +1286,9 @@ pub struct QmdbCompatTree {
     recording: Option<BlockUndo>,
     /// The upper tree as of the last root read.
     upper: std::sync::Mutex<UpperTree>,
+    /// Every twig below this id holds no leaf nodes: where the next
+    /// `evict_twig_nodes` starts.
+    evicted_below: usize,
 }
 
 impl std::fmt::Debug for QmdbCompatTree {
@@ -1299,6 +1321,7 @@ impl Clone for QmdbCompatTree {
             next_slot: self.next_slot,
             recording: self.recording.clone(),
             upper: std::sync::Mutex::new(self.upper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()),
+            evicted_below: self.evicted_below,
         }
     }
 }
@@ -1312,6 +1335,7 @@ impl QmdbCompatTree {
             next_slot: 0,
             recording: None,
             upper: std::sync::Mutex::new(UpperTree::default()),
+            evicted_below: 0,
         }
     }
 
@@ -1359,53 +1383,54 @@ impl QmdbCompatTree {
             .map_err(|e| QmdbSnapshotError::EntryFile(e.to_string()))?;
         let entries = Entries::File(file);
         let n = kept as usize;
-        // The leaf hashes, from the records, a chunk at a time across the SIMD lanes.
-        let chunk = |index: usize| -> Vec<Hash> {
-            let (from, to) = (index * LEAF_CHUNK, ((index + 1) * LEAF_CHUNK).min(n));
-            let keys: Vec<Hash> = (from..to).map(|slot| entries.key(slot)).collect();
-            let jobs: Vec<(&Hash, &[u8])> = keys.iter().zip(from..to).map(|(key, slot)| (key, entries.value(slot))).collect();
-            let mut hashes = vec![NULL_HASH; to - from];
-            crate::simd::hash_leaves(&jobs, &mut hashes);
-            hashes
-        };
-        let leaves: Vec<Hash> = {
-            #[cfg(feature = "rayon")]
-            let pieces: Vec<Vec<Hash>> = {
-                use rayon::prelude::*;
-                (0..n.div_ceil(LEAF_CHUNK)).into_par_iter().map(chunk).collect()
-            };
-            #[cfg(not(feature = "rayon"))]
-            let pieces: Vec<Vec<Hash>> = (0..n.div_ceil(LEAF_CHUNK)).map(chunk).collect();
-            let mut leaves = Vec::with_capacity(n);
-            for piece in pieces {
-                leaves.extend(piece);
+        let full = n / TWIG_SIZE;
+        // Each twig from its own records on its own task: the leaves batched
+        // across the SIMD lanes, the bits from the active flags, one hash of
+        // the bit set. Full twigs keep only their roots (a proof or a
+        // truncation rehashes one, `hydrate`); the partial last twig keeps its
+        // nodes for the appends.
+        let build = |twig_id: usize| -> Twig {
+            let base = twig_id * TWIG_SIZE;
+            let filled = (n - base).min(TWIG_SIZE);
+            let nodes = twig_leaf_nodes(&entries, twig_id, filled);
+            let mut bits = [0u8; BITS_BYTES];
+            for local in 0..filled {
+                if entries.is_active(base + local) {
+                    bits[local / 8] |= 1 << (local % 8);
+                }
             }
-            leaves
+            let leaf_root = nodes[1];
+            let bits_root = hash_bits(&bits);
+            Twig {
+                nodes: (twig_id >= full).then_some(nodes),
+                leaf_root,
+                bits,
+                bits_root,
+                root: hash_node(&leaf_root, &bits_root),
+                last_retired_at: 0,
+            }
         };
+        #[cfg(feature = "rayon")]
+        let twigs: Vec<Twig> = {
+            use rayon::prelude::*;
+            (0..n.div_ceil(TWIG_SIZE)).into_par_iter().map(build).collect()
+        };
+        #[cfg(not(feature = "rayon"))]
+        let twigs: Vec<Twig> = (0..n.div_ceil(TWIG_SIZE)).map(build).collect();
         let mut tree = Self {
             entries,
             index: KeyIndex::default(),
-            twigs: Vec::new(),
+            twigs,
             next_slot: kept,
             recording: None,
             upper: std::sync::Mutex::new(UpperTree::default()),
+            evicted_below: full,
         };
-        if n > 0 {
-            tree.ensure_twig((n - 1) / TWIG_SIZE);
-        }
-        for (slot, leaf) in leaves.into_iter().enumerate() {
-            let twig_id = slot / TWIG_SIZE;
-            let local = slot % TWIG_SIZE;
-            tree.twigs[twig_id].set_leaf_unchecked(local, leaf);
-            if tree.entries.is_active(slot) {
-                // The bit only: `recompute` below hashes each bit set once.
-                tree.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
-                if tree.index.insert(tree.entries.key(slot), slot as u64).is_some() {
-                    return Err(QmdbSnapshotError::DuplicateActiveKey(tree.entries.key(slot)));
-                }
+        for slot in 0..n {
+            if tree.entries.is_active(slot) && tree.index.insert(tree.entries.key(slot), slot as u64).is_some() {
+                return Err(QmdbSnapshotError::DuplicateActiveKey(tree.entries.key(slot)));
             }
         }
-        recompute_all(&mut tree.twigs);
         Ok((tree, kept))
     }
 
@@ -1446,7 +1471,20 @@ impl QmdbCompatTree {
         let local = slot as usize % TWIG_SIZE;
         let twig = &self.twigs[twig_id];
 
-        let nodes = twig.nodes.as_ref().expect("an active slot's twig is never trimmed");
+        // An evicted twig's nodes are rehashed from its entries for the proof
+        // and dropped again.
+        let scratch;
+        let nodes: &[Hash; 2 * TWIG_SIZE] = match twig.nodes.as_ref() {
+            Some(nodes) => nodes,
+            None => {
+                scratch = twig_leaf_nodes(&self.entries, twig_id, TWIG_SIZE);
+                if scratch[1] != twig.leaf_root {
+                    debug_assert!(false, "twig {twig_id}'s entries do not hash to its leaf root");
+                    return None;
+                }
+                &scratch
+            }
+        };
         let mut twig_path = [NULL_HASH; TWIG_HEIGHT];
         let mut node = TWIG_SIZE + local;
         for sibling in &mut twig_path {
@@ -1603,8 +1641,20 @@ impl QmdbCompatTree {
         let mut touched_twigs = std::collections::BTreeSet::new();
         let mut revived_twigs = std::collections::BTreeSet::new();
 
-        // 1. Truncate the block's appends: drop their index mappings, clear
-        //    their bits, null their leaves.
+        // The twigs that survive the truncation. The boundary twig, if `prev`
+        // cuts through it, has its leaves nulled: bring back its nodes first
+        // if they were evicted, so a refusal still leaves the tree unchanged.
+        let twigs_remaining = if prev == 0 {
+            0
+        } else {
+            ((prev - 1) as usize) / TWIG_SIZE + 1
+        };
+        if prev < self.next_slot && !(prev as usize).is_multiple_of(TWIG_SIZE) {
+            self.hydrate(prev as usize / TWIG_SIZE).map_err(QmdbUndoError::Store)?;
+        }
+
+        // 1. Truncate the block's appends: drop their index mappings, and in
+        //    the boundary twig clear their bits and null their leaves.
         for slot in prev..self.next_slot {
             if self.entries.is_active(slot as usize) {
                 let key = self.entries.key(slot as usize);
@@ -1613,6 +1663,9 @@ impl QmdbCompatTree {
                 }
             }
             let twig_id = (slot as usize) / TWIG_SIZE;
+            if twig_id >= twigs_remaining {
+                continue;
+            }
             let local = (slot as usize) % TWIG_SIZE;
             let twig = &mut self.twigs[twig_id];
             twig.set_leaf_unchecked(local, NULL_HASH);
@@ -1622,15 +1675,9 @@ impl QmdbCompatTree {
         self.entries.truncate(prev as usize).map_err(|e| QmdbUndoError::Store(e.to_string()))?;
         self.next_slot = prev;
 
-        // 2. Drop twigs the truncation emptied entirely. The boundary twig,
-        //    if `prev` cuts through it, stays and is recomputed below.
-        let twigs_remaining = if prev == 0 {
-            0
-        } else {
-            ((prev - 1) as usize) / TWIG_SIZE + 1
-        };
+        // 2. Drop twigs the truncation emptied entirely.
         self.twigs.truncate(twigs_remaining);
-        touched_twigs.retain(|id| *id < twigs_remaining);
+        self.evicted_below = self.evicted_below.min(twigs_remaining);
 
         // 3. Revive the slots the block deactivated. Only those below the
         //    cursor: a slot the block both appended and killed is gone with
@@ -1983,6 +2030,43 @@ impl QmdbCompatTree {
         let local = (slot as usize) % TWIG_SIZE;
         self.twigs[twig_id].set_active(local, false);
         self.twigs[twig_id].last_retired_at = self.next_slot;
+    }
+
+    /// Drops the leaf nodes of every full twig whose slots all lie below
+    /// `before` -- the oldest cursor any undo still held can rewind to --
+    /// whether its slots are live or not. The world root needs only a twig's
+    /// root and bits; reviving a slot rehashes only the bits; a proof, or a
+    /// truncation cutting into the twig, rehashes its 2,048 entries from the
+    /// entry store (`prove`, `apply_undo`). 128 KiB a twig, where
+    /// `trim_dead_twigs` could drop only twigs without a live slot, of which
+    /// a transfer chain's state has none. Starts where the last call stopped;
+    /// returns how many twigs this call evicted.
+    pub fn evict_twig_nodes(&mut self, before: u64) -> usize {
+        let full = ((self.next_slot.min(before) as usize) / TWIG_SIZE).min(self.twigs.len());
+        let mut evicted = 0;
+        for twig in &mut self.twigs[self.evicted_below.min(full)..full] {
+            if twig.nodes.take().is_some() {
+                evicted += 1;
+            }
+        }
+        self.evicted_below = self.evicted_below.max(full);
+        evicted
+    }
+
+    /// Restores an evicted twig's leaf nodes from its entries, refusing --
+    /// and leaving the twig as it was -- if they do not hash to its leaf root.
+    fn hydrate(&mut self, twig_id: usize) -> Result<(), String> {
+        if self.twigs[twig_id].nodes.is_some() {
+            return Ok(());
+        }
+        let filled = (self.entries.len() - twig_id * TWIG_SIZE).min(TWIG_SIZE);
+        let nodes = twig_leaf_nodes(&self.entries, twig_id, filled);
+        if nodes[1] != self.twigs[twig_id].leaf_root {
+            return Err(format!("QMDB twig {twig_id}'s entries do not hash to its leaf root"));
+        }
+        self.twigs[twig_id].nodes = Some(nodes);
+        self.evicted_below = self.evicted_below.min(twig_id);
+        Ok(())
     }
 
     /// Drops the leaf nodes of every twig that no undo still held can touch
@@ -2850,5 +2934,47 @@ mod undo_tests {
             assert_eq!(root, tree.root_full(), "after undo to {} blocks", undos.len());
             assert_eq!(Some(&root), roots.last(), "the undo restores the recorded root");
         }
+    }
+
+    /// Evicted twigs: the root, a proof, a revival and a truncation cutting
+    /// into an evicted twig all agree with a tree that never evicted.
+    #[test]
+    fn evicted_twig_nodes_rehydrate_for_proofs_revivals_and_truncations() {
+        let mut tree = QmdbCompatTree::new();
+        let mut never = QmdbCompatTree::new();
+        let a = sets(0..7000, 0xA0);
+        let root_a = tree.apply_sorted_ops(a.clone()).unwrap();
+        assert_eq!(never.apply_sorted_ops(a).unwrap(), root_a);
+        // Overwrite the first 3,000 keys (their slots die in evicted twigs)
+        // and append 2,000 more.
+        let mut b = sets(0..3000, 0xB0);
+        b.extend(sets(7000..9000, 0xB1));
+        let (root_b, undo_b) = tree.apply_sorted_ops_recorded(b.clone()).unwrap();
+        let (never_b, never_undo_b) = never.apply_sorted_ops_recorded(b).unwrap();
+        assert_eq!(root_b, never_b);
+        // 12,000 slots: five full twigs, evicted even below the block's cursor.
+        assert_eq!(tree.evict_twig_nodes(tree.next_slot()), 5);
+        assert_eq!(tree.evict_twig_nodes(tree.next_slot()), 0, "the scan resumes where it stopped");
+        assert_eq!(tree.trimmed_twigs(), 5);
+        assert_eq!(tree.root(), root_b);
+        for n in [5000, 8000] {
+            let proof = tree.prove(&key(n)).expect("live");
+            assert_eq!(Some(&proof), never.prove(&key(n)).as_ref());
+            assert!(proof.verify_for_key(&root_b, &key(n)));
+        }
+        // The undo truncates to slot 7,000 -- inside evicted twig 3 -- and
+        // revives slots in evicted twigs 0-2.
+        tree.apply_undo(&undo_b).unwrap();
+        never.apply_undo(&never_undo_b).unwrap();
+        assert_eq!(tree.root(), root_a);
+        assert_eq!(tree.root_full(), root_a);
+        assert_eq!(tree.prove(&key(10)), never.prove(&key(10)));
+        // And on: a block, another eviction, the roots still agree.
+        let mut c = sets(100..200, 0xC0);
+        c.extend(sets(9000..13000, 0xC1));
+        assert_eq!(tree.apply_sorted_ops(c.clone()).unwrap(), never.apply_sorted_ops(c).unwrap());
+        tree.evict_twig_nodes(tree.next_slot());
+        assert_eq!(tree.root(), never.root());
+        assert_eq!(tree.prove(&key(150)), never.prove(&key(150)));
     }
 }

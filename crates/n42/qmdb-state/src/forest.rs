@@ -727,9 +727,9 @@ impl QmdbForest {
         self.records
             .retain(|hash, record| record.number >= cutoff || *hash == block_hash);
         if self.trim_twigs {
-            // Twigs no retained undo (nor the pending block's) can touch keep
-            // only their root: the oldest cursor any of them could rewind to
-            // is the bound.
+            // Full twigs no retained undo (nor the pending block's) can cut
+            // into keep only their root and bits: the oldest cursor any of
+            // them could rewind to is the bound.
             let oldest = self
                 .records
                 .values()
@@ -737,13 +737,13 @@ impl QmdbForest {
                 .chain(self.pending.as_ref().map(|(_, undo)| undo.prev_next_slot))
                 .min()
                 .unwrap_or_else(|| self.tree.next_slot());
-            self.tree.trim_dead_twigs(oldest);
+            self.tree.evict_twig_nodes(oldest);
         }
         Ok(())
     }
 
-    /// Whether long-dead twigs are trimmed to their root on every head move
-    /// (on by default).
+    /// Whether full twigs below the retention window drop their leaf nodes on
+    /// every head move (on by default).
     pub const fn with_twig_trimming(mut self, on: bool) -> Self {
         self.trim_twigs = on;
         self
@@ -1387,12 +1387,11 @@ mod tests {
         assert!(proof.verify_for_key(&forest.root().0, &gov5_account_key(&Address::with_last_byte(1).0 .0)));
         assert!(forest.prove_account(Address::with_last_byte(2)).is_none(), "account 2 is only in the sibling");
     }
-    /// The forest trims only what no retained undo can reach: a block that
-    /// kills an old twig inside the window leaves it; once the window has
-    /// moved past, the twig is trimmed, and a revert inside the window still
-    /// works on a forest with trimmed twigs.
+    /// The forest evicts only full twigs no retained undo can cut into, live
+    /// or dead, and a revert inside the window still works on a forest with
+    /// evicted twigs.
     #[test]
-    fn dead_twigs_are_trimmed_only_past_the_retention_window() {
+    fn twig_nodes_are_evicted_only_past_the_retention_window() {
         use n42_twig_core::TWIG_SIZE;
         let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_retain_depth(2);
         // Block 1 appends three twigs of accounts; block 2 rewrites them all
@@ -1411,20 +1410,21 @@ mod tests {
         forest.set_canonical(h(1)).unwrap();
         forest.apply(h(1), h(2), 2, &many(2)).unwrap();
         forest.set_canonical(h(2)).unwrap();
-        assert_eq!(forest.trimmed_twigs().0, 0, "block 2's undo can still revive block 1's slots");
+        assert_eq!(forest.trimmed_twigs().0, 0, "block 1's undo can still cut into block 1's twigs");
         let root2 = forest.root();
         forest.apply(h(2), h(3), 3, &changes(3)).unwrap();
         forest.set_canonical(h(3)).unwrap();
         forest.apply(h(3), h(4), 4, &changes(4)).unwrap();
         forest.set_canonical(h(4)).unwrap();
         // Records for blocks 2-4 are retained (depth 2 below 4); block 2's undo
-        // rewinds to block 1's cursor, so block 1's twigs stay.
-        assert_eq!(forest.trimmed_twigs().0, 0);
+        // rewinds to block 1's cursor, so block 1's three full twigs go (a
+        // revival rehashes only bits) and block 2's stay.
+        assert_eq!(forest.trimmed_twigs().0, 3);
         forest.apply(h(4), h(5), 5, &changes(5)).unwrap();
         forest.set_canonical(h(5)).unwrap();
         // Now blocks 3-5 are retained; their oldest cursor is after block 2's
-        // appends, so block 1's three twigs are trimmed.
-        assert_eq!(forest.trimmed_twigs().0, 3);
+        // appends, so block 2's three twigs go too.
+        assert_eq!(forest.trimmed_twigs().0, 6);
         // A sibling of block 5 on block 4 (a revert inside the window) still
         // computes, and the roots agree with an untrimmed forest.
         let mut untrimmed = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_twig_trimming(false);
