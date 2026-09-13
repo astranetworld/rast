@@ -224,3 +224,124 @@ reth's hashed tables dropped, as `docs/QMDB_PAPER_REVIEW.md` recommends -- behin
 new devnet first; (d) measure io_uring with the lock limit raised, and compaction over a long run.
 Items 1-3 and the gov5 specification are the gate: the implementation should not start before
 there is a decision on the grouping and compaction rules, because every root depends on them.
+
+## 6. Stage 0 measurements for the upgrade plan (`docs/QMDB_UPGRADE_PLAN.md`)
+
+### 6.1 Where a node's disk goes (node0 after loop155 A2, `n42 db stats --detailed-sizes`)
+
+    component                                   size       entries
+    static files (7.1 GiB data + 969 MiB index) 8.1 GiB
+    RocksDB WAL                                 2.5 GiB    (larger than every RocksDB table together)
+    RocksDB TransactionHashNumbers              1.5 GiB    32,616,000
+    RocksDB AccountsHistory                     148 MiB    3,585,116
+    QMDB entries.log + ckpt + log               1.1 GiB
+    MDBX HashedAccounts                         120 MiB    1,729,162   (+119 MiB freelist)
+    MDBX HashedStorages                         112 KiB    863
+
+The WAL is pure overhead: no column family setting bounds it (plan stage 7).
+
+### 6.2 QMDB dead space: nothing to punch without moving live entries
+
+    slots        full twigs   fully dead   twigs by live slots: 0 / 1 / 2-16 / 17-256 / 257-1024 / >1024
+    29,639,064   14,472       0 (0.0%)     0 / 0 / 426 / 13,466 / 276 / 304
+
+Every full twig still holds live entries: the 2M recipients are spread over the whole history, so an
+account's latest entry sits in an old twig as often as a new one. Reclaiming QMDB's history on disk
+therefore needs live-entry compaction, which changes the root (fork-gated, with gov5): plan stage 4b as
+designed (punch fully dead twigs) reclaims 0 bytes on this workload. The same table sizes plan stage 3: the
+node arrays of these twigs are 1.90 GB resident today, ~0 after eviction.
+
+### 6.3 The key index's hasher (plan stage 1a)
+
+256 shards by `key[0]`, the shipped `KeyPrefixHasher` against a hasher mixing `key[8..16]` (per key, one thread):
+
+    keys                          insert ns   lookup ns
+    1,738,215 real, shipped       85          92.2
+    1,738,215 real, mixed         39          21.7
+    50,000,000 synthetic, shipped 150         140.1
+    50,000,000 synthetic, mixed   63          36.9
+
+The shipped hasher receives the `[u8;32]` length prefix as a write, so every key in a shard shares its low
+hash byte and probing starts at 1/256 of the buckets: lookups are 4x slower than they need to be, at both scales.
+
+### 6.4 Point reads: MDBX against our QMDB against LayerZero (the same accounts)
+
+1,000,000 random reads of the fleet flood's recipients (slot big-endian ‖ 0x42 ‖ zeros, 2M of them) on the
+loop155 A2 node0 state; each read includes its key hash and value decode. MDBX: `HashedAccounts` through a reth
+read transaction per thread (`crates/n42/qmdb-reth/examples/read_bench.rs`), advised out of the page cache before
+its cold pass. Ours: `QmdbCompatTree::get` after `from_entry_file` (shipped index hasher, before stage 1a).
+LayerZero: `read_entry` on the replayed store, reopened from its files.
+
+    store                 threads   p50       p99        p99.9      reads/s      found
+    MDBX, cold            1         1,020 ns  84,660 ns  147,590 ns 302,633      861,878
+    MDBX, warm            1         970 ns    1,490 ns   3,120 ns   971,107      861,878
+    MDBX, warm            16        1,670 ns  2,390 ns   5,770 ns   8,873,230    861,878
+    ours (QMDB), warm     1         600 ns    1,080 ns   3,200 ns   1,536,672    865,941
+    ours (QMDB), warm     16        650 ns    1,250 ns   1,960 ns   21,739,450   865,941
+    LayerZero, warm       1         910 ns    1,460 ns   2,400 ns   1,076,988    865,941
+    LayerZero, warm       16        3,420 ns  6,020 ns   8,360 ns   4,420,419    865,941
+
+- Our store already reads 1.6x faster than MDBX on one thread and 2.6x on sixteen, where MDBX's latency rises
+  with contention and LayerZero's rises 3.8x (its index units and caches are locked).
+- Opening is the cost on our side: 6.1 s to rebuild from the entry file (it hashes every record, stage 4a),
+  against 2.3 s for LayerZero. A cold MDBX read is a page fault: p99 85 us.
+- Agreement on the same accounts: 820,422 identical, 175,515 different, 4,063 only in QMDB, 0 only in MDBX. MDBX
+  was persisted to block 288 and QMDB's checkpoint to 295: the differences are the accounts of those seven
+  blocks, as persistence lag predicts; nothing contradicts.
+
+### 6.5 Where our block path spends its time at 50M keys (`perf record -F 999`, blocks phase only)
+
+150 fleet-shaped blocks over 50M keys: compute p50 108.7 ms, p99 192.8 ms. Flat profile, all threads:
+
+    share   symbol
+    18.8%   crossbeam_epoch Global::try_advance
+    18.6%   crossbeam_epoch with_handle (pin)
+    6.8%    crossbeam_deque Stealer::steal
+    4.3%    rayon WorkerThread::wait_until_cold
+    3.9%    Chain<Range, Range> iteration (per-twig scans)
+    3.5%    rayon join over QmdbOperation slices
+    2.7%    rayon Sleep::wake_specific_thread
+    2.7%    held_slots closure (index lookups)
+    2.2%    blake3 AVX-512 compress (+ ~3% blake3 Hasher bookkeeping)
+    1.8%    Mutex lock_contended
+    1.7%    hashbrown insert (key index)
+    1.6%    retire_twigs closure
+    0.7%    BTreeMap insert (note_move)
+
+About half of the sampled CPU is rayon's scheduling: epoch pinning, stealing, waking and cold waits. Part of it
+is idle workers spinning, which a CPU profile counts, but the shape is the one plan stage 3 names: parallel
+iterations over every twig (`retire_twigs`, `rehash_dirty`) and per-operation tasks too small to pay for their
+scheduling. Coarser work units and iterating only dirty twigs come before the index hasher in value at this
+scale; the hasher (section 6.3) is the cheapest change.
+
+### 6.6 Stage 1a landed: the index hasher (after the fix)
+
+`KeyPrefixHasher` now ignores the `[u8;32]` length-prefix write and mixes `key[8..16]` with a per-process seed
+(`RandomState`-derived, so a grinder cannot aim keys at one probe sequence). Roots are untouched: the index only
+maps keys to slots. Rerun of the same measurements (`/data/blockchain/qmdb-compare/stage1a`):
+
+    index microbench (per key, one thread)   insert ns   lookup ns   before (section 6.3)
+    1,738,215 real keys, shipped hasher      37          24.8        85 / 92.2
+    1,738,215 real keys, reference mixer     32          22.5        39 / 21.7
+    50,000,000 synthetic, shipped hasher     61          44.6        150 / 140.1
+    50,000,000 synthetic, reference mixer    56          39.2        63 / 36.9
+
+    point reads (section 6.4 setup)          p50       p99        p99.9      reads/s
+    ours (QMDB), warm, 1 thread              550 ns    880 ns     1,230 ns   1,790,541   (was 600 / 1,080 / 3,200; 1,536,672)
+    ours (QMDB), warm, 16 threads            610 ns    1,190 ns   1,690 ns   22,799,956  (was 650 / 1,250 / 1,960; 21,739,450)
+    MDBX, warm, 1 thread (same run)          980 ns    1,460 ns   2,980 ns   965,844
+    MDBX, warm, 16 threads (same run)        1,890 ns  2,560 ns   5,720 ns   8,027,481
+
+    workload L, 100 blocks over 50M keys     compute p50   compute p99   sync p50   peak RSS
+    before (section 3.2)                     106.3 ms      n/a           11.8 ms    10.65 GB
+    after                                    102.7 ms      110.1 ms      2.4 ms     10.16 GB
+
+- The shipped hasher now sits within 10-15% of the reference mixer at both scales (lookups 3.7x and 3.1x faster than
+  before). The remaining gap is the seed's extra multiply.
+- Warm point reads gain 8% at p50 and lose most of the p99.9 tail; QMDB is now 1.8x MDBX on one thread and 2.8x on
+  sixteen.
+- The block path barely moves (compute p50 -3%): at 50M keys it is dominated by the scans and scheduling of
+  section 6.5, not by index probes. The sync phase's drop is page-cache state between runs, not this change.
+- Every gate held: `cargo test -p n42-twig-core -p n42-qmdb-state -p n42-qmdb-reth` (including the gov5 cross-client
+  vectors), the real state rebuilt to `0xfd21f549…29b6ce6`, harness S 50-block root `0xbf3fc24c…8b3e76`, L prefill
+  root `0x9e0588a3…`.

@@ -1171,26 +1171,50 @@ impl KeyIndex {
     }
 }
 
-/// Hashes a [`Hash`] key by its leading eight bytes. Only ever fed 32-byte
-/// keys through `write`; anything else falls back to folding the bytes in.
-#[derive(Default)]
+/// Hashes a [`Hash`] key by its bytes 8..16, mixed with a per-process seed.
+///
+/// The index shards by `key[0]`, so the hash must not depend on `key[0]`:
+/// the previous hasher took `key[0..8]` -- and, fed through `Hash for [u8; 32]`,
+/// the slice's length prefix as well -- so every key in a shard shared the
+/// hash's low byte, and the table started probing at one bucket in 256
+/// (lookups 92 -> 22 ns on the real 1.74M-key state, 140 -> 37 ns at 50M
+/// keys, `docs/QMDB_LAYERZERO_COMPARISON.md` section 6.3). Keys are hashes an
+/// attacker can grind, hence the seed. Only ever fed 32-byte keys; shorter
+/// writes (the length prefix) are ignored.
 pub struct KeyPrefixHasher(u64);
+
+/// A random seed per process, taken from std's randomly keyed hasher.
+fn key_hash_seed() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0x6e34_325f_7177_6d62);
+        hasher.finish() | 1
+    })
+}
+
+impl Default for KeyPrefixHasher {
+    #[inline]
+    fn default() -> Self {
+        Self(key_hash_seed())
+    }
+}
 
 impl std::hash::Hasher for KeyPrefixHasher {
     #[inline]
     fn finish(&self) -> u64 {
-        self.0
+        let x = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^ (x >> 29)
     }
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        if bytes.len() >= 8 {
-            self.0 ^= u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
-        } else {
-            for b in bytes {
-                self.0 = self.0.rotate_left(8) ^ u64::from(*b);
-            }
+        if bytes.len() >= 16 {
+            self.0 ^= u64::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]]);
         }
     }
+    #[inline]
+    fn write_usize(&mut self, _length_prefix: usize) {}
 }
 
 /// A correctness-first QMDB tree for cross-client bootstrap and vectors.

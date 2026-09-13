@@ -174,6 +174,27 @@ fn write_buffer_manager_size() -> usize {
         .map_or(DEFAULT_WRITE_BUFFER_MANAGER_SIZE, |mb| mb << 20)
 }
 
+/// Default cap on the total size of `RocksDB`'s write-ahead log (256 MiB).
+///
+/// Unset, `RocksDB` derives the cap as four times the column families' combined
+/// memtable capacity -- several GiB at 128 MiB memtables -- and a WAL file is
+/// deleted only after every column family whose writes it holds has flushed. A
+/// rarely written column family (storage history on a transfer chain) then
+/// pins every WAL: a bench node held 2.5 GiB of WAL beside 1.6 GiB of tables
+/// (`docs/QMDB_LAYERZERO_COMPARISON.md` section 6.1). Past this cap `RocksDB`
+/// flushes the column families holding the oldest WAL, so the log stays bounded.
+/// A flush of a nearly empty memtable is cheap. `N42_ROCKSDB_MAX_WAL_MB` overrides.
+const DEFAULT_MAX_TOTAL_WAL_SIZE: u64 = 256 * 1024 * 1024;
+
+/// The WAL cap in force: `N42_ROCKSDB_MAX_WAL_MB`, else the default.
+fn max_total_wal_size() -> u64 {
+    std::env::var("N42_ROCKSDB_MAX_WAL_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|mb| *mb > 0)
+        .map_or(DEFAULT_MAX_TOTAL_WAL_SIZE, |mb| mb << 20)
+}
+
 /// Default buffer capacity for compression in batches.
 /// 4 KiB matches common block/page sizes and comfortably holds typical history values,
 /// reducing the first few reallocations without over-allocating.
@@ -279,6 +300,8 @@ impl RocksDBBuilder {
         // Both set to 0 means "delete ASAP, no archival".
         options.set_wal_ttl_seconds(0);
         options.set_wal_size_limit_mb(0);
+        // Bound the live WAL: see `DEFAULT_MAX_TOTAL_WAL_SIZE`.
+        options.set_max_total_wal_size(max_total_wal_size());
 
         // Statistics can view from RocksDB log file
         if enable_statistics {
