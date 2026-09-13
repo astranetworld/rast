@@ -6,7 +6,7 @@
 //! and nulls inactive leaves, so it must not be used to import replay-v2 QMDB
 //! state. This small, isolated core is the compatibility baseline.
 
-use std::{collections::HashMap, io::Read};
+use std::io::Read;
 
 use crate::entry_store::Entries;
 use crate::{Hash, NULL_HASH, TWIG_HEIGHT, TWIG_SIZE, hash_leaf, hash_node, null_level};
@@ -921,8 +921,8 @@ fn leaf_hashes(operations: &[QmdbOperation]) -> Vec<Option<Hash>> {
 const LEAF_CHUNK: usize = 1024;
 
 /// The slot each operation's key currently occupies, if any.
-fn held_slots(index: &KeyIndex, operations: &[QmdbOperation]) -> Vec<Option<u64>> {
-    let held = |operation: &QmdbOperation| index.get(&operation.key).copied();
+fn held_slots(index: &KeyIndex, entries: &Entries, operations: &[QmdbOperation]) -> Vec<Option<u64>> {
+    let held = |operation: &QmdbOperation| index.get(&operation.key, |slot| entries.key(slot as usize));
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
@@ -1137,86 +1137,15 @@ pub enum QmdbUndoError {
 }
 
 
-/// The key -> slot index. Keys are already 32-byte hashes (keccak of an
-/// address or an address and a slot), so the map hashes them by their first
-/// eight bytes instead of running SipHash over 32: a full block is ~150,000
-/// inserts and as many lookups, twice (builder and follower).
-type ShardMap = HashMap<Hash, u64, std::hash::BuildHasherDefault<KeyPrefixHasher>>;
+/// The key -> slot index: fingerprints confirmed against the entry store
+/// (`crate::index`).
+type KeyIndex = crate::index::TagIndex;
 
-/// The index in 256 shards by the key's first byte, so that a block's
-/// appends -- sorted by key, hence contiguous per shard -- can be inserted
-/// on the worker pool (round 43: the serial index inserts were the largest
-/// part of a 147,000-operation block's 45 ms of structural writes on a
-/// 3,000,000-entry tree).
-#[derive(Clone)]
-struct KeyIndex {
-    shards: Vec<ShardMap>,
-}
-
-impl Default for KeyIndex {
-    fn default() -> Self {
-        Self { shards: (0..256).map(|_| ShardMap::default()).collect() }
-    }
-}
-
-impl KeyIndex {
-    #[inline]
-    fn get(&self, key: &Hash) -> Option<&u64> {
-        self.shards[key[0] as usize].get(key)
-    }
-    #[inline]
-    fn insert(&mut self, key: Hash, slot: u64) -> Option<u64> {
-        self.shards[key[0] as usize].insert(key, slot)
-    }
-    #[inline]
-    fn remove(&mut self, key: &Hash) -> Option<u64> {
-        self.shards[key[0] as usize].remove(key)
-    }
-    fn len(&self) -> usize {
-        self.shards.iter().map(HashMap::len).sum()
-    }
-    fn is_empty(&self) -> bool {
-        self.shards.iter().all(HashMap::is_empty)
-    }
-    fn reserve(&mut self, additional: usize) {
-        let per = additional / 256 + 1;
-        for shard in &mut self.shards {
-            shard.reserve(per);
-        }
-    }
-    /// Inserts `(key, slot)` pairs sorted by key, one shard at a time on the
-    /// worker pool (every shard's pairs are one contiguous run).
-    fn insert_sorted(&mut self, pairs: &[(Hash, u64)]) {
-        let mut starts = [0usize; 257];
-        let mut at = 0usize;
-        for shard in 0..256usize {
-            starts[shard] = at;
-            while at < pairs.len() && pairs[at].0[0] as usize == shard {
-                at += 1;
-            }
-        }
-        starts[256] = pairs.len();
-        debug_assert_eq!(at, pairs.len(), "pairs sorted by key");
-        let work = |(shard, map): (usize, &mut ShardMap)| {
-            for (key, slot) in &pairs[starts[shard]..starts[shard + 1]] {
-                map.insert(*key, *slot);
-            }
-        };
-        #[cfg(feature = "rayon")]
-        {
-            use rayon::prelude::*;
-            self.shards.par_iter_mut().enumerate().for_each(work);
-        }
-        #[cfg(not(feature = "rayon"))]
-        {
-            self.shards.iter_mut().enumerate().for_each(work);
-        }
-    }
-}
-
-/// Hashes a [`Hash`] key by its bytes 8..16, mixed with a per-process seed.
+/// Hashes a [`Hash`] key by its bytes 8..16, mixed with a per-process seed:
+/// a `HashMap<Hash, _>` hasher for 32-byte keys. The tree's index no longer
+/// uses it (`crate::index`); it stays for callers keying maps by QMDB keys.
 ///
-/// The index shards by `key[0]`, so the hash must not depend on `key[0]`:
+/// A map sharded by `key[0]` needs a hash that does not depend on `key[0]`:
 /// the previous hasher took `key[0..8]` -- and, fed through `Hash for [u8; 32]`,
 /// the slice's length prefix as well -- so every key in a shard shared the
 /// hash's low byte, and the table started probing at one bucket in 256
@@ -1427,7 +1356,9 @@ impl QmdbCompatTree {
             evicted_below: full,
         };
         for slot in 0..n {
-            if tree.entries.is_active(slot) && tree.index.insert(tree.entries.key(slot), slot as u64).is_some() {
+            if tree.entries.is_active(slot)
+                && tree.index.insert(tree.entries.key(slot), slot as u64, |s| tree.entries.key(s as usize)).is_some()
+            {
                 return Err(QmdbSnapshotError::DuplicateActiveKey(tree.entries.key(slot)));
             }
         }
@@ -1458,15 +1389,21 @@ impl QmdbCompatTree {
         self.index.is_empty()
     }
 
+    /// Bytes the key index's tables hold (the index is the tree's largest
+    /// structure per live key).
+    pub fn index_bytes(&self) -> usize {
+        self.index.memory_bytes()
+    }
+
     pub fn get(&self, key: &Hash) -> Option<&[u8]> {
         self.index
-            .get(key)
-            .map(|slot| self.entries.value(*slot as usize))
+            .get(key, |slot| self.entries.key(slot as usize))
+            .map(|slot| self.entries.value(slot as usize))
     }
 
     /// Generate a gov5-compatible membership proof for an active key.
     pub fn prove(&self, key: &Hash) -> Option<QmdbProof> {
-        let slot = *self.index.get(key)?;
+        let slot = self.index.get(key, |slot| self.entries.key(slot as usize))?;
         let twig_id = slot as usize / TWIG_SIZE;
         let local = slot as usize % TWIG_SIZE;
         let twig = &self.twigs[twig_id];
@@ -1516,7 +1453,7 @@ impl QmdbCompatTree {
 
     /// Append a new frozen leaf, deactivating an earlier live slot for `key`.
     pub fn set(&mut self, key: Hash, value: Vec<u8>) {
-        if let Some(old_slot) = self.index.get(&key).copied() {
+        if let Some(old_slot) = self.index.get(&key, |slot| self.entries.key(slot as usize)) {
             self.record_deactivation(old_slot);
             self.deactivate(old_slot);
         }
@@ -1534,12 +1471,12 @@ impl QmdbCompatTree {
         // the block path (`apply_sorted_ops`) reports it, this one-at-a-time
         // path is the genesis, the tests and the vectors.
         self.entries.push(key, value).expect("the QMDB entry file could not be written");
-        self.index.insert(key, slot);
+        self.index.insert(key, slot, |slot| self.entries.key(slot as usize));
     }
 
     /// Deactivate a key without erasing its frozen leaf.
     pub fn delete(&mut self, key: &Hash) -> bool {
-        let Some(slot) = self.index.remove(key) else {
+        let Some(slot) = self.index.remove(key, |slot| self.entries.key(slot as usize)) else {
             return false;
         };
         self.record_deactivation(slot);
@@ -1658,8 +1595,9 @@ impl QmdbCompatTree {
         for slot in prev..self.next_slot {
             if self.entries.is_active(slot as usize) {
                 let key = self.entries.key(slot as usize);
-                if self.index.get(&key) == Some(&slot) {
-                    self.index.remove(&key);
+                let key_at = |slot: u64| self.entries.key(slot as usize);
+                if self.index.get(&key, key_at) == Some(slot) {
+                    self.index.remove(&key, |slot| self.entries.key(slot as usize));
                 }
             }
             let twig_id = (slot as usize) / TWIG_SIZE;
@@ -1686,7 +1624,7 @@ impl QmdbCompatTree {
             let slot = entry.slot;
             let key = if undo.slots_only { self.entries.key(slot as usize) } else { entry.key };
             self.entries.set_active(slot as usize, true);
-            self.index.insert(key, slot);
+            self.index.insert(key, slot, |slot| self.entries.key(slot as usize));
             let twig_id = (slot as usize) / TWIG_SIZE;
             let local = (slot as usize) % TWIG_SIZE;
             self.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
@@ -1765,7 +1703,7 @@ impl QmdbCompatTree {
         // block's keys are distinct, so no lookup depends on an earlier write
         // of the same block, and the lookups are the random reads of a
         // multi-million-entry index that the serial loop was waiting on.
-        let held = held_slots(&self.index, &operations);
+        let held = held_slots(&self.index, &self.entries, &operations);
         phases.leaves_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         // The undo record's entries -- what every retired slot held -- built
@@ -1805,14 +1743,15 @@ impl QmdbCompatTree {
                 }
                 _ => {
                     if old_slot.is_some() {
-                        self.index.remove(&operation.key);
+                        self.index.remove(&operation.key, |slot| self.entries.key(slot as usize));
                     }
                 }
             }
         }
         phases.writes_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
-        self.index.insert_sorted(&appended);
+        let entries = &self.entries;
+        self.index.insert_sorted(&appended, |slot| entries.key(slot as usize));
         phases.index_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         rehash_dirty(&mut self.twigs, &dirty);
@@ -1965,16 +1904,16 @@ impl QmdbCompatTree {
             let local = slot % TWIG_SIZE;
             tree.ensure_twig(twig_id);
             tree.twigs[twig_id].set_leaf_unchecked(local, hash_leaf(&entry.key, &entry.value));
+            // A fresh tree keeps its entries in the heap, where a push
+            // cannot fail; `set_entry_file` moves them afterwards. The entry
+            // goes in first: the index confirms keys against the store.
+            tree.entries.push(entry.key, entry.value.clone()).expect("a heap push cannot fail");
             if entry.active {
-                if tree.index.insert(entry.key, slot as u64).is_some() {
+                if tree.index.insert(entry.key, slot as u64, |s| tree.entries.key(s as usize)).is_some() {
                     return Err(QmdbSnapshotError::DuplicateActiveKey(entry.key));
                 }
                 tree.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
-            }
-            // A fresh tree keeps its entries in the heap, where a push
-            // cannot fail; `set_entry_file` moves them afterwards.
-            tree.entries.push(entry.key, entry.value.clone()).expect("a heap push cannot fail");
-            if !entry.active {
+            } else {
                 tree.entries.set_active(slot, false);
             }
         }

@@ -345,3 +345,52 @@ maps keys to slots. Rerun of the same measurements (`/data/blockchain/qmdb-compa
 - Every gate held: `cargo test -p n42-twig-core -p n42-qmdb-state -p n42-qmdb-reth` (including the gov5 cross-client
   vectors), the real state rebuilt to `0xfd21f549…29b6ce6`, harness S 50-block root `0xbf3fc24c…8b3e76`, L prefill
   root `0x9e0588a3…`.
+
+### 6.7 Stages 2, 3a and 3b landed (the same harness, one run each)
+
+Every row is `compute_ms` of `bench-ours` (S: 50 blocks over 2M recipients; L: 50M prefilled keys, then 100 blocks)
+and the real node state rebuilt from its entry file (`qmdb-compare ours`). Roots were identical in every run.
+
+    run                                 after 1a        after 2         after 3a        after 3b
+    real state: rebuild ms / peak RSS   4,699 / 4.39    4,541 / 4.38    1,402 / 5.38    744 / 1.67 GB
+    S blocks: p50 / p99 ms              67.3 / 126.5    68.0 / 129.8    60.2 / 106.5    62.0 / 121.7
+    S blocks: peak RSS                  1.49 GB         1.50            1.53            1.16
+    L prefill: p50 / p99 ms             235.5 / 979.7   229.4 / 899.6   220.5 / 858.9   229.3 / 896.9
+    L prefill: peak RSS                 9.02 GB         9.20            9.28            6.30
+    L blocks: p50 / p99 ms              102.7 / 110.1   102.9 / 125.3   95.5 / 107.6    95.9 / 106.8
+    L blocks: peak RSS                  10.16 GB        11.07           11.22           7.09
+
+- Stage 2 (cached upper tree) is invisible in block latency: at ~33,000 twigs the full fold was a few ms. It
+  removes a full rebuild from every proof.
+- Stage 3a (block-proportional retire and rehash, SIMD leaf and level batches, coarse units) takes 7% off the L
+  block and 11% off S at p50, and the restart from 4.5 s to 1.4 s (one bit-set hash per twig instead of one per
+  live slot, twigs recomputed in parallel). Its restart RSS rose because every twig was built at once.
+- Stage 3b (evicting full twigs' leaf nodes) is the memory step: the restart holds 1.67 GB instead of 5.38 and
+  finishes in 0.74 s, L drops 4.1 GB at the same latency. What remains at 50M keys is mostly the key index
+  (~60 B a key in `HashMap`s, stage 1b) and the per-slot offsets (8 B a slot).
+- p99 at S moves between runs by +-15 ms with no code change (the 1a and 2 columns differ only by the upper-tree
+  cache); single runs do not resolve differences of that size.
+
+### 6.8 Stage 1b landed: the compact fingerprint index
+
+The `HashMap<[u8; 32], u64>` shards became `twig-core/src/index.rs`: per shard an open-addressing table of `u64`
+buckets holding a 24-bit seeded fingerprint of `key[8..16]` and `slot + 1`, the fingerprint's top bits naming the
+home bucket (so a table grows without reading a key), linear probing with backward-shift deletion, load at most 3/4,
+and every fingerprint match confirmed against the key the entry store holds at that slot.
+
+    run                                 after 3b        after 1b
+    real state: rebuild ms / peak RSS   744 / 1.67 GB   939 / 1.61 GB
+    S blocks: p50 / p99 ms / RSS        62.0 / 121.7 / 1.16 GB    62.8 / 123.1 / 1.01 GB
+    L prefill: p50 / p99 ms / RSS       229.3 / 896.9 / 6.30 GB   236.2 / 597.9 / 4.11 GB
+    L blocks: p50 / p99 ms / RSS        95.9 / 106.8 / 7.09 GB    98.9 / 112.5 / 4.73 GB
+
+    point reads (section 6.4 setup)     p50       p99        p99.9      reads/s
+    ours, warm, 1 thread                540 ns    850 ns     1,110 ns   1,837,342   (after 1a: 550 / 880 / 1,230)
+    ours, warm, 16 threads              560 ns    1,000 ns   1,340 ns   25,294,641  (after 1a: 610 / 1,190 / 1,690)
+    MDBX, warm, 16 threads (same run)   2,190 ns  3,980 ns   5,950 ns   6,536,394
+
+- At 50M keys the index went from ~60 to ~13 bytes a key: 2.4 GB of the L run's RSS. From the start of stage 1a the
+  L blocks phase is down from 10.2 to 4.7 GB.
+- The confirm read costs the block path ~3 ms at L (a random read of the old record per updated key) and nothing
+  measurable on point reads, which read that record for the value anyway.
+- The restart rose 744 -> 939 ms: 1.74M inserts that each confirm against the entry file. Still under a second.

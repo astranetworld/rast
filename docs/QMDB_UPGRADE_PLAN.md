@@ -104,7 +104,9 @@ hashed tables cannot be dropped until that dependency is found.
 | 2 | done: upper tree cached, refreshed along changed paths; `prove` reads it; roots unchanged, block p50 unchanged at 50M keys (the full fold was a few ms), no full rebuild per proof | `/data/blockchain/qmdb-compare/stage2` |
 | 3a | done: retire and rehash proportional to the block, SIMD leaf and twig-level batches, coarse parallel units, restart hashes each bit set once and twigs in parallel. Real-state rebuild 4,541 -> 1,402 ms; S p50/p99 68.0/129.8 -> 60.2/106.5 ms; L 102.9/125.3 -> 95.5/107.6 ms; roots unchanged | `/data/blockchain/qmdb-compare/stage3a` |
 | 3b | done: every full twig below the retention window drops its 128 KiB of leaf nodes, live or not; proofs and truncations rehash one from the entries (checked against its leaf root); restart keeps nodes only for the last twig. Real-state rebuild 1,402 -> 744 ms and RSS 5.38 -> 1.67 GB; L RSS 11.22 -> 7.09 GB; latency unchanged; roots unchanged | `/data/blockchain/qmdb-compare/stage3b` |
-| 1b | next: compact fingerprint index (`twig-core/src/index.rs`) | -- |
+| 1b | done: 256 shards of `u64` buckets (24-bit seeded fingerprint, whose top bits are the home, and slot + 1), linear probing, load <= 3/4, growth without key reads, every match confirmed against the entry store. L RSS 7.09 -> 4.73 GB (prefill 6.30 -> 4.11), S 1.16 -> 1.01 GB; L block p50/p99 95.9/106.8 -> 98.9/112.5 ms (the confirm read); roots unchanged | `/data/blockchain/qmdb-compare/stage1b` |
+| 4a | deferred: after 3a/3b the real state restarts in 0.74-0.94 s at 1.6 GB, which was 4a's latency motive; its other motive, dropping dead byte ranges (4b), has nothing to reclaim on this workload (section 6.2). Revisit when a larger state makes restart matter | -- |
+| 5 | next: no clone of a block's operations (5a), then retention bounded by finality | -- |
 
 ## Recommended approach
 

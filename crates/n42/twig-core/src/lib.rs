@@ -12,6 +12,7 @@
 
 pub mod entry_store;
 mod flat;
+mod index;
 pub mod qmdb_compat;
 mod simd;
 
