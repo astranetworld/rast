@@ -11,6 +11,7 @@
 //! no eviction tiers, no compaction yet — those are P2+).
 
 pub mod entry_store;
+pub mod entry_view;
 mod flat;
 mod index;
 pub mod qmdb_compat;
@@ -18,6 +19,7 @@ mod simd;
 
 use flat::FlatIndex;
 pub use simd::{hash_singleblock_batch, kernel_name as simd_kernel_name};
+pub use index::{SharedOffsetIndex, MAX_INDEX_VALUE};
 
 /// 32-byte hash / key.
 pub type Hash = [u8; 32];

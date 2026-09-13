@@ -220,6 +220,11 @@ impl FileEntries {
         self.offsets.len()
     }
 
+    /// Where `slot`'s record starts in the file.
+    pub(crate) fn offset(&self, slot: usize) -> Option<u64> {
+        self.offsets.get(slot).copied()
+    }
+
     pub(crate) fn key(&self, slot: usize) -> Hash {
         let mut key = [0u8; KEY_LEN];
         key.copy_from_slice(&self.record(slot)[..KEY_LEN]);
@@ -474,6 +479,15 @@ impl Entries {
                 Ok(())
             }
             Self::File(file) => file.truncate(len),
+        }
+    }
+
+    /// Where `slot`'s record starts in the entry file; `None` in the heap or
+    /// past the last slot.
+    pub(crate) fn file_offset(&self, slot: usize) -> Option<u64> {
+        match self {
+            Self::Heap(_) => None,
+            Self::File(file) => file.offset(slot),
         }
     }
 

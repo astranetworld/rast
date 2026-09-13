@@ -37,20 +37,50 @@ type DbProof<'a, TX, A> = Proof<
     reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
     reth_trie_db::DatabaseHashedCursorFactory<&'a TX>,
 >;
+/// N42: the block the hashed tables stand at in `tx` -- the `Finish` checkpoint's partial
+/// state/trie frontier, or `Finish` itself -- which is the version a registered
+/// [`reth_storage_api::n42_state::N42StateReader`] must answer at.
+pub(crate) fn n42_hashed_state_version<TX: DbTx>(tx: &TX) -> Option<u64> {
+    let finish = reth_stages_types::StageId::Finish;
+    let checkpoint = match finish.get_pre_encoded() {
+        Some(encoded) => tx.get_by_encoded_key::<tables::StageCheckpoints>(encoded),
+        None => tx.get::<tables::StageCheckpoints>(finish.to_string()),
+    }
+    .ok()??;
+    Some(
+        checkpoint
+            .finish_stage_checkpoint()
+            .and_then(|finish| finish.partial_state_trie())
+            .unwrap_or(checkpoint.block_number),
+    )
+}
+
 /// State provider over latest state that takes tx reference.
 ///
 /// Wraps a [`DBProvider`] to get access to database.
 #[derive(Debug)]
-pub struct LatestStateProviderRef<'b, Provider>(&'b Provider);
+pub struct LatestStateProviderRef<'b, Provider>(
+    &'b Provider,
+    /// N42: the hashed-state version, read once for an owned [`LatestStateProvider`].
+    Option<&'b std::sync::OnceLock<Option<u64>>>,
+);
 
 impl<'b, Provider: DBProvider> LatestStateProviderRef<'b, Provider> {
     /// Create new state provider
     pub const fn new(provider: &'b Provider) -> Self {
-        Self(provider)
+        Self(provider, None)
     }
 
     fn tx(&self) -> &Provider::Tx {
         self.0.tx_ref()
+    }
+
+    /// N42: the hashed-state version of this provider's transaction.
+    fn n42_state_version(&self) -> Option<u64> {
+        match self.1 {
+            Some(cell) => *cell.get_or_init(|| n42_hashed_state_version(self.tx())),
+            None => n42_hashed_state_version(self.tx()),
+        }
     }
 
     fn hashed_storage_lookup(
@@ -73,6 +103,24 @@ impl<Provider: DBProvider + StorageSettingsCache> AccountReader
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         if self.0.cached_storage_settings().use_hashed_state() {
             let hashed_address = alloy_primitives::keccak256(address);
+            // N42: a registered QMDB reader answers (`on`) or is checked (`verify`).
+            if let Some((reader, mode)) = reth_storage_api::n42_state::reader() {
+                if let Some(version) = self.n42_state_version() {
+                    match reader.account(address, version) {
+                        Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {
+                            reth_storage_api::n42_state::record_answer();
+                            return Ok(answer)
+                        }
+                        Some(answer) => {
+                            let database =
+                                self.tx().get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)?;
+                            reth_storage_api::n42_state::verify_account(address, version, &answer, &database);
+                            return Ok(database)
+                        }
+                        None => reth_storage_api::n42_state::record_decline(),
+                    }
+                }
+            }
             self.tx()
                 .get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)
                 .map_err(Into::into)
@@ -303,6 +351,32 @@ impl<Provider: DBProvider + BlockHashReader + StorageSettingsCache> StateProvide
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
         if self.0.cached_storage_settings().use_hashed_state() {
+            // N42: a registered QMDB reader answers (`on`) or is checked (`verify`).
+            if let Some((reader, mode)) = reth_storage_api::n42_state::reader() {
+                if let Some(version) = self.n42_state_version() {
+                    match reader.storage(&account, &storage_key, version) {
+                        Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {
+                            reth_storage_api::n42_state::record_answer();
+                            return Ok(answer)
+                        }
+                        Some(answer) => {
+                            let database = self.hashed_storage_lookup(
+                                alloy_primitives::keccak256(account),
+                                alloy_primitives::keccak256(storage_key),
+                            )?;
+                            reth_storage_api::n42_state::verify_storage(
+                                &account,
+                                &storage_key,
+                                version,
+                                answer,
+                                database,
+                            );
+                            return Ok(database)
+                        }
+                        None => reth_storage_api::n42_state::record_decline(),
+                    }
+                }
+            }
             self.hashed_storage_lookup(
                 alloy_primitives::keccak256(account),
                 alloy_primitives::keccak256(storage_key),
@@ -330,18 +404,22 @@ impl<Provider: DBProvider + BlockHashReader> BytecodeReader
 
 /// State provider for the latest state.
 #[derive(Debug)]
-pub struct LatestStateProvider<Provider>(Provider);
+pub struct LatestStateProvider<Provider>(
+    Provider,
+    /// N42: the hashed-state version of the transaction, read at most once.
+    std::sync::OnceLock<Option<u64>>,
+);
 
 impl<Provider: DBProvider> LatestStateProvider<Provider> {
     /// Create new state provider
     pub const fn new(db: Provider) -> Self {
-        Self(db)
+        Self(db, std::sync::OnceLock::new())
     }
 
     /// Returns a new provider that takes the `TX` as reference
     #[inline(always)]
     const fn as_ref(&self) -> LatestStateProviderRef<'_, Provider> {
-        LatestStateProviderRef::new(&self.0)
+        LatestStateProviderRef(&self.0, Some(&self.1))
     }
 }
 

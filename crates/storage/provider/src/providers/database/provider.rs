@@ -854,6 +854,16 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             Ok::<_, ProviderError>(())
         })?;
 
+        // N42: the state/trie blocks' hashed state is written (committed with this transaction); a
+        // registered QMDB reader moves with it.
+        if save_mode.with_state() && !state_trie_blocks.is_empty() {
+            if let Some(reader) = reth_storage_api::n42_state::registered() {
+                let persisted: Vec<_> =
+                    state_trie_blocks.iter().map(|block| block.recovered_block().num_hash()).collect();
+                reader.on_state_persisted(&persisted);
+            }
+        }
+
         // Collect results from spawned tasks
         if !blocks.is_empty() {
             timings.sf = sf_result.ok_or(StaticFileWriterError::ThreadPanic("static file"))??;
@@ -947,6 +957,10 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
     /// This includes calculating the resulted state root and comparing it with the parent block
     /// state root.
     pub fn unwind_trie_state_from(&self, from: BlockNumber) -> ProviderResult<()> {
+        // N42: a registered QMDB reader stops answering above the unwind.
+        if let Some(reader) = reth_storage_api::n42_state::registered() {
+            reader.on_state_unwound(from.saturating_sub(1));
+        }
         let changed_accounts = self.account_changesets_range(from..)?;
 
         // Unwind account hashes.
@@ -2895,6 +2909,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
         if range.is_empty() {
             return Ok(());
+        }
+        // N42: a registered QMDB reader stops answering above the unwind.
+        if let Some(reader) = reth_storage_api::n42_state::registered() {
+            reader.on_state_unwound(block);
         }
 
         // get transaction receipts

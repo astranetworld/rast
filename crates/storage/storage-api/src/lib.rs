@@ -67,6 +67,10 @@ pub use database_provider::*;
 
 pub mod noop;
 
+/// N42: the latest-state reader registry (a QMDB read view on a QMDB chain).
+#[cfg(feature = "std")]
+pub mod n42_state;
+
 #[cfg(feature = "db-api")]
 mod history;
 #[cfg(feature = "db-api")]

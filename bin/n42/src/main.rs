@@ -187,6 +187,11 @@ fn main() {
                     .ok_or_else(|| eyre::eyre!("no hash for head block {}", info.best_number))?;
                 qmdb.initialize((info.best_number, head_hash))?;
                 info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
+                // `N42_QMDB_READS=verify|on`: the read view answers or checks the
+                // providers' latest-state reads (docs/QMDB_UPGRADE_PLAN.md, stage 6).
+                if n42_qmdb_reth::register_state_reader(qmdb) {
+                    info!(target: "reth::cli", "QMDB read view registered as the state reader");
+                }
                 // The head's execution result, for the first header after a
                 // restart under deferred execution: before the fork the
                 // header carries it; past the fork the forest holds the root

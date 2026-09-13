@@ -109,7 +109,9 @@ hashed tables cannot be dropped until that dependency is found.
 | 5a | done: the forest applies a block from the slice its record keeps (values copied once, into the store), no clone of the block's operations. L prefill p50 236 -> 179 ms, L blocks p50/p99 98.9/112.5 -> 87.7/103.0 ms, S p50 62.8 -> 52.4 ms; roots unchanged | `/data/blockchain/qmdb-compare/stage5a` |
 | 5b | done: move bookkeeping in a `Vec` sorted only when a delta is measured (cleared unsorted on the block-delta path); a block's delta slots sorted instead of set-built; file-mode undo records name retired slots as `u64`s (8 B instead of 64). Roots unchanged. The harness never persisted, so its forest kept every block's dirty slots in a growing `BTreeSet` -- an artifact the node (which clears them every block) never paid; harness numbers from here on are taken node-like (`QMDBCMP_PERSIST=1`) | `/data/blockchain/qmdb-compare/stage5b`, `persist-ab` |
 | 5c | done: default retention depth 64 -> 16, as the fleet has run since loop122; harness RSS at depth 16 / 64: 6.31 / 12.27 GB, latency unchanged. Node-like A/B of 5b+5c against 5a: L blocks 58 -> 40 ms p50, 103 -> 90 ms p99 | comparison section 6.9 |
-| 6 | next: QMDB serves latest-state reads (design notes below) | -- |
+| 6a | done: QMDB read view (`qmdb-reth/src/read_view.rs`): a key -> entry-file offset index (`twig-core` `SharedOffsetIndex`, one lock per shard) at its head, records read through its own mapping of the entry file (`entry_view.rs`), 64 blocks of "offset before this block" journals so any reader at an older version is answered exactly, a truncation guard that invalidates the view before the tree cuts records it reads. Built at initialisation (file mode), moved by persistence. Random-chain oracle test at the last three persisted versions, forks above and reverts below its head | `qmdb-reth` tests |
+| 6b | done: `reth_storage_api::n42_state` registry (`N42_QMDB_READS=off|verify|on`); the vendored latest and historical providers ask it for accounts and storage at the hashed tables' version; `save_blocks` moves it, unwinds invalidate it; `bin/n42` registers the view. End to end on an in-process QMDB dev chain persisting every block: 60 reads checked, 0 mismatches, 0 declines | `n42-testing` `test_qmdb_chain__read_view_verifies_against_the_hashed_tables` (ignored; run alone) |
+| 6c | next: a fleet leg in `verify`, then `on`; hashed tables off only after `on` holds | -- |
 
 ## Recommended approach
 
@@ -209,6 +211,23 @@ written adds:
   process-wide reader registered by `bin/n42` at startup (an additive trait and `OnceLock` in the vendored
   `storage-api`, default absent), consulted by `basic_account` / `storage` under `N42_QMDB_READS`; MDBX stays the
   answer whenever the reader declines (not initialised, version unavailable, `off`).
+
+**Stage 6a/6b as built (2026-09-13).** What implementation added to the design notes above:
+- *The exact version is the hashed tables' frontier, not `Finish`.* With storage v2 `save_blocks` writes hashed
+  state only for the state/trie blocks, up to the `Finish` checkpoint's `partial_state_trie` (when set), and the
+  overlay anchors there. A provider's reads are answered at that block, read once per owned `LatestStateProvider`;
+  the view moves with `state_trie_blocks`, before the transaction commits, which exact-version reads make safe (a
+  reader at an older version undoes the newer blocks through the journals).
+- *Declining is always safe while the hashed tables are written*: the database answers. `on` mode is correct only
+  for what the view answers; 6c (no hashed tables) needs the view never to decline, including after a restart
+  (the view is built at the database's head) and after an unwind (currently it is invalidated for good).
+- *Verify found a pre-existing divergence on the APoS dev path, not in the view.* With a local consensus signer the
+  payload builder credits fees to the signer (`payload.rs`, coinbase), the sealed header carries beneficiary
+  `0x0`, and the engine's execution credits `0x0` (`EvmEnv::for_eth_block`). The forest keeps the builder's
+  execution because `validate_block[_operations]` returns an already-filed block's root without recomputing, so
+  the database and the chain's QMDB root disagree about the fee recipient's balance; every later block reads that
+  account as absent. A HotStuff chain configures no local signer and credits the leader's fee recipient on both
+  sides, so the fleet is not affected; the end-to-end test uses tip-free transfers to keep this out of its scope.
 
 **Stage 4b -- QMDB dead-space reclamation, opt-in (default off). Stage 0 result: 0 of 14,472 full twigs are fully dead on the real state, so punching dead twigs reclaims nothing here; QMDB history on disk only shrinks with live-entry compaction (root-changing, fork-gated). Kept only as an option for workloads with cold history.** `u32` offsets relative to the twig base;
 `fallocate(PUNCH_HOLE|KEEP_SIZE)` over fully dead twigs below finality with a persisted punched set; `snapshot()`,

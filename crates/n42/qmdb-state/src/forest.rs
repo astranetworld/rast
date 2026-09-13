@@ -442,6 +442,44 @@ impl QmdbForest {
         self
     }
 
+    /// What a filed block changed, as the entry file holds it: for each of its
+    /// operations in key order, the byte offset of the record it appended, or
+    /// `None` for a deletion. `None` when the block is not applied on the
+    /// tree's current path (its appended slots may hold another block's
+    /// records), when its operations were not kept (a restored head), or when
+    /// the entries are not in a file. The caller flushes the entries before
+    /// reading the records (`flush_entries_for_sync`).
+    pub fn block_changes(&self, block_hash: &B256) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        self.tree.entry_file()?;
+        let record = self.records.get(block_hash)?;
+        let undo = record.undo.as_ref()?;
+        let mut slot = undo.prev_next_slot;
+        let mut changes = Vec::with_capacity(record.ops.len());
+        for operation in &record.ops {
+            if operation.value.is_some() {
+                changes.push((operation.key, Some(self.tree.entry_offset(slot)?)));
+                slot += 1;
+            } else {
+                changes.push((operation.key, None));
+            }
+        }
+        (slot == self.tree.next_slot() || self.records.values().any(|other| {
+            other.undo.as_ref().is_some_and(|later| later.prev_next_slot == slot)
+        }) || self.pending.as_ref().is_some_and(|(_, pending)| pending.prev_next_slot == slot))
+        .then_some(changes)
+    }
+
+    /// Every live entry's key and record offset at the tree's current block;
+    /// `None` without an entry file.
+    pub fn live_entry_offsets(&self) -> Option<Vec<([u8; 32], u64)>> {
+        self.tree.live_entry_offsets()
+    }
+
+    /// Installs (or removes) the guard told before the entry file is cut.
+    pub fn set_truncation_guard(&mut self, guard: Option<std::sync::Arc<dyn n42_twig_core::qmdb_compat::TruncationGuard>>) {
+        self.tree.set_truncation_guard(guard);
+    }
+
     /// The canonical head, as `(number, hash)`.
     pub const fn head(&self) -> (u64, B256) {
         self.head
@@ -1458,5 +1496,45 @@ mod tests {
         }
         let sibling = forest.apply(h(4), h(9), 5, &changes(9)).unwrap();
         assert_eq!(sibling, untrimmed.apply(h(4), h(9), 5, &changes(9)).unwrap());
+    }
+
+    /// A filed block's changes name the records it appended in the entry
+    /// file, and nothing is named for a block that is not on the tree's path.
+    #[test]
+    fn block_changes_name_the_records_a_block_appended() {
+        let dir = std::env::temp_dir().join(format!("n42-forest-changes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entries.log");
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_entry_file(&path).unwrap();
+        forest.apply(GENESIS, h(1), 1, &changes(1)).unwrap();
+        let mut two = changes(2);
+        two.delete_account(Address::with_last_byte(1));
+        forest.apply(h(1), h(2), 2, &two).unwrap();
+        // A sibling of block 2 computed and filed moves the tree off block 2.
+        forest.apply(h(1), h(9), 2, &changes(9)).unwrap();
+        forest.flush_entries_for_sync().unwrap();
+        let view = n42_twig_core::entry_view::EntryFileView::open(&path).unwrap();
+        let listed = forest.block_changes(&h(9)).expect("block 9 is on the tree's path");
+        let ops = { let mut ops = changes(9).operations(); ops.sort_unstable_by_key(|op| op.key); ops };
+        assert_eq!(listed.len(), ops.len());
+        for ((key, offset), op) in listed.iter().zip(&ops) {
+            assert_eq!(*key, op.key);
+            match (offset, &op.value) {
+                (Some(offset), Some(value)) => {
+                    let (k, v) = view.record(*offset);
+                    assert_eq!((k, v), (op.key, value.as_slice()));
+                }
+                (None, None) => {}
+                other => panic!("mismatched change {other:?}"),
+            }
+        }
+        assert!(forest.block_changes(&h(2)).is_none(), "block 2 was reverted by the move to its sibling");
+        assert!(forest.block_changes(&h(1)).is_some());
+        let live = forest.live_entry_offsets().unwrap();
+        assert!(!live.is_empty());
+        for (key, offset) in live {
+            assert_eq!(view.key(offset), key);
+        }
     }
 }

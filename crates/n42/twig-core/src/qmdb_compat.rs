@@ -1221,6 +1221,16 @@ struct UpperTree {
     nodes: Vec<Hash>,
 }
 
+/// Told before a tree cuts its entry file, so a reader that addresses the file
+/// by byte offset outside the tree's lock (`crate::entry_view::EntryFileView`)
+/// can stop reading the bytes that are about to go: reading a mapped page past
+/// the file's end is a `SIGBUS`, not an error.
+pub trait TruncationGuard: Send + Sync {
+    /// The file is about to be cut to `new_len` bytes. Returns once no reader
+    /// can still reach a record at or past `new_len`.
+    fn before_truncate(&self, new_len: u64);
+}
+
 /// A correctness-first QMDB tree for cross-client bootstrap and vectors.
 ///
 /// The upper tree is cached and refreshed along changed paths ([`UpperTree`]).
@@ -1237,6 +1247,8 @@ pub struct QmdbCompatTree {
     /// Every twig below this id holds no leaf nodes: where the next
     /// `evict_twig_nodes` starts.
     evicted_below: usize,
+    /// Told before `apply_undo` cuts the entry file.
+    truncation_guard: Option<std::sync::Arc<dyn TruncationGuard>>,
 }
 
 impl std::fmt::Debug for QmdbCompatTree {
@@ -1270,6 +1282,7 @@ impl Clone for QmdbCompatTree {
             recording: self.recording.clone(),
             upper: std::sync::Mutex::new(self.upper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()),
             evicted_below: self.evicted_below,
+            truncation_guard: self.truncation_guard.clone(),
         }
     }
 }
@@ -1284,6 +1297,7 @@ impl QmdbCompatTree {
             recording: None,
             upper: std::sync::Mutex::new(UpperTree::default()),
             evicted_below: 0,
+            truncation_guard: None,
         }
     }
 
@@ -1303,6 +1317,32 @@ impl QmdbCompatTree {
         file.sync()?;
         self.entries = Entries::File(file);
         Ok(())
+    }
+
+    /// Byte offset of `slot`'s record in the entry file (`[key 32][len u32 LE]
+    /// [value]`); `None` in the heap or past the last slot. A record's bytes
+    /// never change once appended; only a truncation (`apply_undo`) removes
+    /// them, after telling the [`TruncationGuard`].
+    pub fn entry_offset(&self, slot: u64) -> Option<u64> {
+        self.entries.file_offset(usize::try_from(slot).ok()?)
+    }
+
+    /// Every live entry's key and record offset, in slot order; `None` in the
+    /// heap. What a read view over the entry file is built from.
+    pub fn live_entry_offsets(&self) -> Option<Vec<(Hash, u64)>> {
+        self.entries.file_path()?;
+        let mut out = Vec::with_capacity(self.index.len());
+        for slot in 0..self.entries.len() {
+            if self.entries.is_active(slot) {
+                out.push((self.entries.key(slot), self.entries.file_offset(slot)?));
+            }
+        }
+        Some(out)
+    }
+
+    /// Installs (or removes) the guard told before the entry file is cut.
+    pub fn set_truncation_guard(&mut self, guard: Option<std::sync::Arc<dyn TruncationGuard>>) {
+        self.truncation_guard = guard;
     }
 
     /// Where the entries live on disk, if they do.
@@ -1373,6 +1413,7 @@ impl QmdbCompatTree {
             recording: None,
             upper: std::sync::Mutex::new(UpperTree::default()),
             evicted_below: full,
+            truncation_guard: None,
         };
         for slot in 0..n {
             if tree.entries.is_active(slot)
@@ -1648,6 +1689,11 @@ impl QmdbCompatTree {
             twig.set_leaf_unchecked(local, NULL_HASH);
             twig.bits[local / 8] &= !(1 << (local % 8));
             touched_twigs.insert(twig_id);
+        }
+        if let (true, Some(guard), Some(new_len)) =
+            (prev < self.next_slot, &self.truncation_guard, self.entries.file_offset(prev as usize))
+        {
+            guard.before_truncate(new_len);
         }
         self.entries.truncate(prev as usize).map_err(|e| QmdbUndoError::Store(e.to_string()))?;
         self.next_slot = prev;
@@ -2920,7 +2966,7 @@ mod undo_tests {
                 let deleted = next / 3;
                 ops.retain(|op| op.key != key(deleted));
                 ops.push(QmdbOperation { key: key(deleted), value: None });
-                ops.sort_by(|a, b| a.key.cmp(&b.key));
+                ops.sort_by_key(|op| op.key);
             }
             ops.extend(sets(next..next + 1500, 0xE0 ^ block as u8));
             next += 1500;

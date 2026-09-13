@@ -1351,6 +1351,158 @@ async fn test_recent_signatures_should_not_reset_on_checkpoint_blocks_imported()
 }
 
 
+/// End to end, `N42_QMDB_READS=verify`: the QMDB read view is built at
+/// initialisation, registered as the providers' state reader, moved by
+/// persistence, and every latest-state read the engine and the payload builder
+/// make through the hashed tables is compared with it -- none may disagree.
+///
+/// Ignored by default: the reader registry is process-wide, so a parallel test
+/// persisting its own chain would move this view. Run it alone:
+/// `cargo test -p n42-testing --lib test_qmdb_chain__read_view_verifies -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "the state reader registry is process-wide; run alone"]
+async fn test_qmdb_chain__read_view_verifies_against_the_hashed_tables() -> eyre::Result<()> {
+    use n42_qmdb_reth::{n42_state, register_state_reader, with_declared_state_scheme, QmdbNodeState};
+
+    // SAFETY: set before any thread reads it; the test runs alone (see above).
+    unsafe { std::env::set_var("N42_QMDB_READS", "verify") };
+    reth_tracing::init_test_tracing();
+    let runtime = Runtime::test();
+    let mut accounts = TesterAccountPool::new();
+    let base = CliqueTest { signers: vec!["A".to_string()], ..Default::default() };
+    let mut chainspec = base.gen_chainspec(&mut accounts);
+    let sender = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42))?;
+    chainspec.genesis.alloc.insert(
+        sender.address(),
+        alloy_genesis::GenesisAccount { balance: U256::from(10u128.pow(18)), ..Default::default() },
+    );
+    chainspec.genesis.config.extra_fields.insert_value("stateScheme".to_string(), "qmdb")?;
+    let chainspec = Arc::new(with_declared_state_scheme(chainspec)?);
+
+    let dir = std::env::temp_dir().join(format!("n42-qmdb-reads-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let qmdb = QmdbNodeState::new_with_entry_file(chainspec.clone(), &dir, true);
+    qmdb.set_read_view_wanted(true);
+
+    // Persist every block at once, so the view is moved by the database's
+    // persistence rather than left at genesis.
+    let mut node_config = NodeConfig::new(chainspec.clone())
+        .with_network(NetworkArgs {
+            discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
+            ..NetworkArgs::default()
+        })
+        .with_unused_ports()
+        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
+        .with_dev(DevArgs {
+            dev: false,
+            consensus_signer_private_key: Some(B256::random().to_string()),
+            ..Default::default()
+        });
+    node_config.engine.persistence_threshold = 0;
+    let capturing_consensus = CapturingConsensusBuilder::default();
+    let types = N42Node::with_qmdb(Some(qmdb.clone()));
+    let NodeHandle { node, .. } = NodeBuilder::new(node_config)
+        .testing_node(runtime.clone())
+        .with_types::<N42Node>()
+        .with_components(
+            types
+                .components_builder()
+                .consensus(capturing_consensus.clone())
+                .payload(
+                    n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
+                        .with_qmdb(Some(qmdb.clone())),
+                ),
+        )
+        .with_add_ons(types.add_ons())
+        .launch()
+        .await?;
+
+    let genesis_hash = node.provider.block_hash(0)?.expect("genesis is stored");
+    qmdb.initialize((0, genesis_hash))?;
+    assert!(qmdb.read_view().is_some(), "the read view is built in file mode");
+    assert!(register_state_reader(&qmdb), "verify mode registers the view");
+
+    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    for (nonce, number) in (1..=8u64).enumerate() {
+        let tx = alloy_consensus::TxEip1559 {
+            chain_id: chainspec.chain().id(),
+            nonce: nonce as u64,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10_000_000_000,
+            // No tip: on this APoS dev path the builder credits fees to the
+            // local signer while the engine's execution credits the header's
+            // beneficiary, and the forest keeps the builder's execution. A
+            // tip would test that divergence, not the read view.
+            max_priority_fee_per_gas: 0,
+            to: alloy_primitives::TxKind::Call(Address::with_last_byte(0x70 + number as u8)),
+            value: U256::from(1_000u64 * number),
+            ..Default::default()
+        };
+        let signature = alloy_signer::SignerSync::sign_hash_sync(
+            &sender,
+            &alloy_consensus::SignableTransaction::signature_hash(&tx),
+        )?;
+        let signed = n42_tx_types::N42TxEnvelope::from(reth_ethereum_primitives::TransactionSigned::new_unhashed(
+            tx.into(),
+            signature,
+        ));
+        let encoded_len = alloy_eips::eip2718::Encodable2718::encode_2718_len(&signed);
+        let recovered = reth_primitives_traits::Recovered::new_unchecked(signed, sender.address());
+        let pooled = n42_engine_types::N42PooledTransaction::new(recovered, encoded_len);
+        reth_transaction_pool::TransactionPool::add_transaction(
+            &node.pool,
+            reth_transaction_pool::TransactionOrigin::Local,
+            pooled,
+        )
+        .await?;
+        new_block(&node, key.clone(), None, &capturing_consensus).await?;
+        let header = node.provider.latest_header()?.expect("a head");
+        assert_eq!(header.number, number, "block {number} was not accepted");
+        qmdb.on_canonical(header.hash())?;
+        // Diagnostics: who was paid, and what each store holds for it.
+        let head_state = reth_provider::StateProviderFactory::latest(&node.provider)?;
+        let persisted = reth_provider::BlockNumReader::best_block_number(&node.provider)?;
+        println!(
+            "block {number}: beneficiary={} gas_used={} persisted={persisted} head_state={:?} view_at_head={:?} view={:?}",
+            header.beneficiary,
+            header.gas_used,
+            reth_provider::AccountReader::basic_account(&head_state, &header.beneficiary)?,
+            qmdb.read_view().and_then(|v| { let h = v.head().0; v.account(&header.beneficiary, h) }),
+            qmdb.read_view().map(|v| v.head()),
+        );
+    }
+
+    // Wait for the database to persist the chain (the view moves with it).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while reth_provider::BlockNumReader::best_block_number(&node.provider)? < 6 {
+        assert!(std::time::Instant::now() < deadline, "the database did not persist the blocks");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Reads at the latest persisted version, as a provider after the run would make them.
+    let latest = reth_provider::StateProviderFactory::latest(&node.provider)?;
+    let recipient = Address::with_last_byte(0x71);
+    let _ = reth_provider::AccountReader::basic_account(&latest, &recipient)?;
+    let _ = reth_provider::AccountReader::basic_account(&latest, &sender.address())?;
+
+    let (checks, mismatches, declines, answers) = n42_state::stats();
+    let view = qmdb.read_view().expect("built");
+    println!(
+        "qmdb reads: checks={checks} mismatches={mismatches} declines={declines} answers={answers} view_head={:?} view_valid={}",
+        view.head(),
+        view.is_valid()
+    );
+    for detail in n42_state::recent_mismatches() {
+        println!("qmdb read mismatch: {detail}");
+    }
+    assert_eq!(mismatches, 0, "the QMDB read view disagreed with the hashed tables");
+    assert!(checks > 0, "no read was checked against the view");
+    assert!(view.is_valid(), "the view was invalidated");
+    assert!(view.head().0 >= 6, "persistence did not move the view");
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// On a QMDB chain every header this node produces carries the forest root, its
 /// own engine validates each block against the same forest, and a restart picks
 /// the forest up where the chain is.

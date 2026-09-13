@@ -8218,6 +8218,7 @@ name = "n42-qmdb-reth"
 version = "2.1.5"
 dependencies = [
  "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
  "alloy-genesis",
  "alloy-primitives 1.7.1",
  "alloy-rpc-types-engine 2.4.1",
@@ -8242,6 +8243,7 @@ dependencies = [
  "reth-node-builder",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-storage-api",
  "reth-storage-overlay",
  "reth-trie",
  "revm-database 42.0.0",
@@ -12890,6 +12892,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

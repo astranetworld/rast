@@ -247,15 +247,42 @@ where
                 .map(Some),
             HistoryInfo::InPlainState | HistoryInfo::MaybeInPlainState => {
                 if self.provider.cached_storage_settings().use_hashed_state() {
-                    let hashed_address = alloy_primitives::keccak256(address);
-                    let hashed_slot = alloy_primitives::keccak256(lookup_key);
-                    Ok(self
-                        .tx()
-                        .cursor_dup_read::<tables::HashedStorages>()?
-                        .seek_by_key_subkey(hashed_address, hashed_slot)?
-                        .filter(|entry| entry.key == hashed_slot)
-                        .map(|entry| entry.value)
-                        .or(Some(StorageValue::ZERO)))
+                    let database = || -> ProviderResult<Option<StorageValue>> {
+                        let hashed_address = alloy_primitives::keccak256(address);
+                        let hashed_slot = alloy_primitives::keccak256(lookup_key);
+                        Ok(self
+                            .tx()
+                            .cursor_dup_read::<tables::HashedStorages>()?
+                            .seek_by_key_subkey(hashed_address, hashed_slot)?
+                            .filter(|entry| entry.key == hashed_slot)
+                            .map(|entry| entry.value)
+                            .or(Some(StorageValue::ZERO)))
+                    };
+                    // N42: the latest value comes from a registered QMDB reader
+                    // (`on`) or is checked against it (`verify`).
+                    if let Some((reader, mode)) = reth_storage_api::n42_state::reader() {
+                        if let Some(version) = super::latest::n42_hashed_state_version(self.tx()) {
+                            match reader.storage(&address, &lookup_key, version) {
+                                Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {
+                                    reth_storage_api::n42_state::record_answer();
+                                    return Ok(Some(answer.unwrap_or(StorageValue::ZERO)))
+                                }
+                                Some(answer) => {
+                                    let database = database()?;
+                                    reth_storage_api::n42_state::verify_storage(
+                                        &address,
+                                        &lookup_key,
+                                        version,
+                                        answer,
+                                        database,
+                                    );
+                                    return Ok(database)
+                                }
+                                None => reth_storage_api::n42_state::record_decline(),
+                            }
+                        }
+                    }
+                    database()
                 } else {
                     Ok(self
                         .tx()
@@ -365,6 +392,25 @@ where
             HistoryInfo::InPlainState | HistoryInfo::MaybeInPlainState => {
                 if self.provider.cached_storage_settings().use_hashed_state() {
                     let hashed_address = alloy_primitives::keccak256(address);
+                    // N42: the latest account comes from a registered QMDB reader
+                    // (`on`) or is checked against it (`verify`).
+                    if let Some((reader, mode)) = reth_storage_api::n42_state::reader() {
+                        if let Some(version) = super::latest::n42_hashed_state_version(self.tx()) {
+                            match reader.account(address, version) {
+                                Some(answer) if mode == reth_storage_api::n42_state::ReadsMode::On => {
+                                    reth_storage_api::n42_state::record_answer();
+                                    return Ok(answer)
+                                }
+                                Some(answer) => {
+                                    let database =
+                                        self.tx().get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)?;
+                                    reth_storage_api::n42_state::verify_account(address, version, &answer, &database);
+                                    return Ok(database)
+                                }
+                                None => reth_storage_api::n42_state::record_decline(),
+                            }
+                        }
+                    }
                     Ok(self.tx().get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)?)
                 } else {
                     Ok(self.tx().get_by_encoded_key::<tables::PlainAccountState>(address)?)

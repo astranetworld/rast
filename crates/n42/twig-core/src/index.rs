@@ -26,8 +26,10 @@ const SHARDS: usize = 256;
 const FP_BITS: u32 = 24;
 const SLOT_BITS: u32 = 40;
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
-/// The largest slot a bucket can name.
+/// The largest slot (or, in a [`SharedOffsetIndex`], byte offset) a bucket can name.
 pub(crate) const MAX_SLOT: u64 = SLOT_MASK - 1;
+/// [`MAX_SLOT`], public: the largest value a [`SharedOffsetIndex`] holds.
+pub const MAX_INDEX_VALUE: u64 = MAX_SLOT;
 const MIN_BITS: u32 = 4;
 const MAX_BITS: u32 = FP_BITS;
 
@@ -255,6 +257,115 @@ impl TagIndex {
     }
 }
 
+/// The fingerprint index with every shard behind its own lock: many readers
+/// and one writer at a time, each holding one shard for one lookup or for one
+/// shard's run of a sorted batch. Values are any `u64` up to
+/// [`MAX_INDEX_VALUE`] -- a QMDB read view keeps entry-file byte offsets --
+/// confirmed through `key_at` like [`TagIndex`]'s slots.
+pub struct SharedOffsetIndex {
+    shards: Vec<std::sync::RwLock<Shard>>,
+}
+
+impl std::fmt::Debug for SharedOffsetIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedOffsetIndex").field("len", &self.len()).finish()
+    }
+}
+
+impl Default for SharedOffsetIndex {
+    fn default() -> Self {
+        Self { shards: (0..SHARDS).map(|_| std::sync::RwLock::new(Shard::default())).collect() }
+    }
+}
+
+impl SharedOffsetIndex {
+    fn read(&self, key: &Hash) -> std::sync::RwLockReadGuard<'_, Shard> {
+        self.shards[key[0] as usize].read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write(&self, shard: usize) -> std::sync::RwLockWriteGuard<'_, Shard> {
+        self.shards[shard].write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The value held for `key`.
+    pub fn get(&self, key: &Hash, key_at: impl Fn(u64) -> Hash) -> Option<u64> {
+        self.read(key).get(key, &key_at).map(|(_, value)| value)
+    }
+
+    /// Maps `key` to `value`, returning the value it replaced.
+    pub fn insert(&self, key: Hash, value: u64, key_at: impl Fn(u64) -> Hash) -> Option<u64> {
+        self.write(key[0] as usize).insert(&key, value, &key_at)
+    }
+
+    /// Removes `key`, returning its value.
+    pub fn remove(&self, key: &Hash, key_at: impl Fn(u64) -> Hash) -> Option<u64> {
+        self.write(key[0] as usize).remove(key, &key_at)
+    }
+
+    /// How many keys are held.
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.read().unwrap_or_else(std::sync::PoisonError::into_inner).len).sum()
+    }
+
+    /// Whether no key is held.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes the tables hold.
+    pub fn memory_bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.read().unwrap_or_else(std::sync::PoisonError::into_inner).buckets.capacity() * 8)
+            .sum::<usize>()
+            + self.shards.capacity() * std::mem::size_of::<std::sync::RwLock<Shard>>()
+    }
+
+    /// Applies `changes` sorted by key -- `Some(value)` maps, `None` removes --
+    /// one shard's run under one write lock, shards in parallel with the
+    /// `rayon` feature. Returns what each key held before, in `changes`' order.
+    pub fn apply_sorted(&self, changes: &[(Hash, Option<u64>)], key_at: impl Fn(u64) -> Hash + Sync) -> Vec<Option<u64>> {
+        debug_assert!(changes.windows(2).all(|pair| pair[0].0 < pair[1].0), "changes sorted by key, keys distinct");
+        let mut starts = [0usize; SHARDS + 1];
+        let mut at = 0usize;
+        for (shard, start) in starts.iter_mut().enumerate().take(SHARDS) {
+            *start = at;
+            while at < changes.len() && changes[at].0[0] as usize == shard {
+                at += 1;
+            }
+        }
+        starts[SHARDS] = changes.len();
+        let work = |shard: usize| -> Vec<Option<u64>> {
+            let run = &changes[starts[shard]..starts[shard + 1]];
+            if run.is_empty() {
+                return Vec::new();
+            }
+            let mut guard = self.write(shard);
+            let inserts = run.iter().filter(|(_, value)| value.is_some()).count();
+            let len = guard.len;
+            guard.ensure_capacity(len + inserts);
+            run.iter()
+                .map(|(key, value)| match value {
+                    Some(value) => guard.insert(key, *value, &key_at),
+                    None => guard.remove(key, &key_at),
+                })
+                .collect()
+        };
+        #[cfg(feature = "rayon")]
+        let pieces: Vec<Vec<Option<u64>>> = {
+            use rayon::prelude::*;
+            (0..SHARDS).into_par_iter().map(work).collect()
+        };
+        #[cfg(not(feature = "rayon"))]
+        let pieces: Vec<Vec<Option<u64>>> = (0..SHARDS).map(work).collect();
+        let mut out = Vec::with_capacity(changes.len());
+        for piece in pieces {
+            out.extend(piece);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +465,77 @@ mod tests {
             assert_eq!(single.get(key, key_at), Some(*slot));
         }
         assert!(sorted.memory_bytes() < 50_000 * 22, "{} bytes", sorted.memory_bytes());
+    }
+
+    #[test]
+    fn the_shared_index_applies_sorted_batches_like_single_operations() {
+        let mut stream = Stream(7);
+        let mut store: Vec<Hash> = Vec::new();
+        let shared = SharedOffsetIndex::default();
+        let mut oracle: HashMap<Hash, u64> = HashMap::new();
+        for _ in 0..40 {
+            let mut batch: HashMap<Hash, Option<u64>> = HashMap::new();
+            for _ in 0..2_000 {
+                let key = key_of(stream.next() % 30_000, None);
+                let value = if stream.next().is_multiple_of(5) {
+                    None
+                } else {
+                    store.push(key);
+                    Some(store.len() as u64 - 1)
+                };
+                batch.insert(key, value);
+            }
+            let mut changes: Vec<(Hash, Option<u64>)> = batch.into_iter().collect();
+            changes.sort_unstable_by_key(|(key, _)| *key);
+            let key_at = |value: u64| store[value as usize];
+            let previous = shared.apply_sorted(&changes, key_at);
+            for ((key, value), previous) in changes.iter().zip(previous) {
+                let expected = match value {
+                    Some(value) => oracle.insert(*key, *value),
+                    None => oracle.remove(key),
+                };
+                assert_eq!(previous, expected);
+            }
+            assert_eq!(shared.len(), oracle.len());
+        }
+        let key_at = |value: u64| store[value as usize];
+        for (key, value) in &oracle {
+            assert_eq!(shared.get(key, key_at), Some(*value));
+        }
+    }
+
+    #[test]
+    fn readers_of_untouched_keys_see_them_while_a_writer_applies_batches() {
+        let stable: Vec<Hash> = (0..5_000u64).map(|n| key_of(n, None)).collect();
+        let churn: Vec<Hash> = (1_000_000..1_050_000u64).map(|n| key_of(n, None)).collect();
+        let store: Vec<Hash> = stable.iter().chain(churn.iter()).copied().collect();
+        let shared = SharedOffsetIndex::default();
+        let key_at = |value: u64| store[value as usize];
+        let mut initial: Vec<(Hash, Option<u64>)> = stable.iter().enumerate().map(|(i, key)| (*key, Some(i as u64))).collect();
+        initial.sort_unstable_by_key(|(key, _)| *key);
+        shared.apply_sorted(&initial, key_at);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for round in 0..20usize {
+                    let mut changes: Vec<(Hash, Option<u64>)> = churn
+                        .iter()
+                        .enumerate()
+                        .map(|(i, key)| (*key, round.is_multiple_of(2).then_some((stable.len() + i) as u64)))
+                        .collect();
+                    changes.sort_unstable_by_key(|(key, _)| *key);
+                    shared.apply_sorted(&changes, key_at);
+                }
+            });
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        for (i, key) in stable.iter().enumerate() {
+                            assert_eq!(shared.get(key, key_at), Some(i as u64));
+                        }
+                    }
+                });
+            }
+            writer.join().unwrap();
+        });
     }
 }

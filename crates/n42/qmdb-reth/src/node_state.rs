@@ -180,6 +180,12 @@ fn with_configured_retention(forest: QmdbForest) -> QmdbForest {
 /// instead of the heap (`docs/QMDB_ENTRY_LOG.md`, step 1). Off until a round
 /// reads it. The file is recreated from the checkpoint and the log at every
 /// start, so it is state the node can lose.
+/// `N42_QMDB_READS`: whether the node builds the QMDB read view (`verify`,
+/// `on`); unset or `off` builds nothing.
+fn read_view_env() -> bool {
+    std::env::var("N42_QMDB_READS").is_ok_and(|v| !v.is_empty() && v != "off")
+}
+
 fn entry_file_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_ENTRY_FILE").is_ok_and(|v| v == "1"))
@@ -277,6 +283,12 @@ struct Inner {
     /// The entries live in `entries.log` and the checkpoint is `forest.ckpt`
     /// (`N42_QMDB_ENTRY_FILE=1`, or the constructor's choice).
     entry_file: bool,
+    /// The view answering state reads for the database's persisted block,
+    /// built at initialisation in file mode when wanted.
+    read_view: std::sync::OnceLock<Arc<crate::read_view::QmdbReadView>>,
+    /// Whether `initialize` builds the read view (`N42_QMDB_READS` set to
+    /// anything but `off`, or `set_read_view_wanted`).
+    read_view_wanted: std::sync::atomic::AtomicBool,
 }
 
 /// The delta log's position, as the node last left it.
@@ -346,7 +358,92 @@ impl QmdbNodeState {
                 persist: Mutex::new(PersistCursor::default()),
                 compaction: Mutex::new(None),
                 entry_file,
+                read_view: std::sync::OnceLock::new(),
+                read_view_wanted: std::sync::atomic::AtomicBool::new(read_view_env()),
             }),
+        }
+    }
+
+    /// Builds the read view at `head` from the forest standing there, and
+    /// has the tree tell it before cutting the entry file. A failure leaves
+    /// the node without the view (reads go to the database) and says so.
+    fn build_read_view(&self, forest: &mut QmdbForest, head: (u64, B256)) {
+        let started = std::time::Instant::now();
+        let built = forest
+            .flush_entries_for_sync()
+            .map_err(|e| e.to_string())
+            .and_then(|_| forest.live_entry_offsets().ok_or_else(|| "no entry file".to_owned()))
+            .and_then(|live| {
+                crate::read_view::QmdbReadView::build(&self.entry_file_path(), head, live).map_err(|e| e.to_string())
+            });
+        match built {
+            Ok(view) => {
+                forest.set_truncation_guard(Some(view.clone()));
+                info!(
+                    target: "n42.qmdb",
+                    block = head.0, keys = view.len(), build_ms = started.elapsed().as_millis() as u64,
+                    "built the QMDB read view",
+                );
+                let _ = self.inner.read_view.set(view);
+            }
+            Err(error) => warn!(target: "n42.qmdb", %error, "the QMDB read view was not built; state reads go to the database"),
+        }
+    }
+
+    /// Whether `initialize` builds the read view (overrides `N42_QMDB_READS`).
+    pub fn set_read_view_wanted(&self, on: bool) {
+        self.inner.read_view_wanted.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The read view, if one was built, borrowed.
+    pub fn read_view_ref(&self) -> Option<&crate::read_view::QmdbReadView> {
+        self.inner.read_view.get().map(AsRef::as_ref)
+    }
+
+    /// The read view, if one was built.
+    pub fn read_view(&self) -> Option<Arc<crate::read_view::QmdbReadView>> {
+        self.inner.read_view.get().cloned()
+    }
+
+    /// The database persisted `blocks` (ascending by number): the read view
+    /// moves with them, and is invalidated if it cannot follow exactly.
+    pub fn on_persisted(&self, blocks: &[(u64, B256)]) {
+        use crate::read_view::Position;
+        let Some(view) = self.inner.read_view.get() else { return };
+        for &(number, hash) in blocks {
+            match view.position(number, hash) {
+                Position::Held => {}
+                Position::Invalid => return,
+                Position::Mismatch => {
+                    view.invalidate("a persisted block is not the block the view holds");
+                    return;
+                }
+                Position::Gap => {
+                    view.invalidate("the database persisted past the view's next block");
+                    return;
+                }
+                Position::Next => {
+                    let changes = self.with_forest(|forest| {
+                        forest.flush_entries_for_sync()?;
+                        let changes = forest.block_changes(&hash);
+                        if let Some(changes) = &changes {
+                            view.raise_floor(changes);
+                        }
+                        Ok(changes)
+                    });
+                    match changes {
+                        Ok(Some(changes)) => view.advance(number, hash, &changes),
+                        Ok(None) => {
+                            view.invalidate("a persisted block's changes are not on the tree's path");
+                            return;
+                        }
+                        Err(_) => {
+                            view.invalidate("the forest could not list a persisted block's changes");
+                            return;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -422,8 +519,11 @@ impl QmdbNodeState {
         }
         let (head_number, head_hash) = head;
         if self.inner.entry_file {
-            let forest = self.initialize_file_mode(head, &mut cursor)?;
-            *guard = Some(with_configured_retention(forest));
+            let mut forest = with_configured_retention(self.initialize_file_mode(head, &mut cursor)?);
+            if self.inner.read_view_wanted.load(std::sync::atomic::Ordering::Relaxed) {
+                self.build_read_view(&mut forest, head);
+            }
+            *guard = Some(forest);
             return Ok(());
         }
         let path = self.snapshot_path();
@@ -1837,5 +1937,117 @@ mod tests {
             state.on_canonical(bad),
             Err(NodeStateError::State(StateError::UnknownBlock(_)))
         ));
+    }
+
+    /// The read view answers at the persisted block exactly: every account and
+    /// slot of a random chain, read at the last three persisted blocks, is that
+    /// block's state; a reader ahead of it is declined; a sibling at the tip
+    /// leaves it valid; a revert below its head invalidates it.
+    #[test]
+    fn the_read_view_answers_at_the_persisted_block_and_declines_otherwise() {
+        use alloy_primitives::{keccak256, Address, KECCAK256_EMPTY, U256};
+        use n42_qmdb_state::AccountState;
+        use reth_primitives_traits::Account;
+        use std::collections::BTreeMap;
+
+        type World = (BTreeMap<Address, AccountState>, BTreeMap<(Address, B256), U256>);
+        let chain = qmdb_chain();
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), scratch("read-view"), true);
+        state.set_read_view_wanted(true);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let view = state.read_view().expect("the view is built at initialisation");
+
+        let addresses: Vec<Address> = (1..=40u8).map(Address::with_last_byte).collect();
+        let slots: Vec<B256> = (0..6u8).map(B256::with_last_byte).collect();
+        let mut world: World = Default::default();
+        world.0.insert(Address::with_last_byte(1), AccountState { nonce: 0, balance: U256::from(100), code_hash: KECCAK256_EMPTY });
+        let mut worlds = vec![world.clone()];
+        let mut hashes = vec![chain.genesis_hash()];
+        let mut seed = 0x1234_5678_u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        let check = |worlds: &[World], at: usize| {
+            let world = &worlds[at];
+            for address in &addresses {
+                let expected = world.0.get(address).map(|s| Account {
+                    nonce: s.nonce,
+                    balance: s.balance,
+                    bytecode_hash: (s.code_hash != KECCAK256_EMPTY).then_some(s.code_hash),
+                });
+                assert_eq!(view.account(address, at as u64), Some(expected), "account {address} at {at}");
+                for slot in &slots {
+                    let expected = world.1.get(&(*address, *slot)).copied();
+                    assert_eq!(view.storage(address, slot, at as u64), Some(expected), "slot {slot} of {address} at {at}");
+                }
+            }
+        };
+        let mut random_block = |world: &mut World| {
+            let mut changes = BlockChanges::new();
+            for _ in 0..12 {
+                let address = addresses[(next() % 40) as usize];
+                match next() % 6 {
+                    0 => {
+                        changes.delete_account(address);
+                        world.0.remove(&address);
+                    }
+                    1..=3 => {
+                        let account = AccountState {
+                            nonce: next() % 5,
+                            balance: U256::from(next() % 1000 + 1),
+                            code_hash: if next() % 4 == 0 { B256::repeat_byte(7) } else { KECCAK256_EMPTY },
+                        };
+                        changes.set_account(address, account);
+                        world.0.insert(address, account);
+                    }
+                    _ => {
+                        let slot = slots[(next() % 6) as usize];
+                        let value = U256::from(next() % 3);
+                        changes.set_storage(address, slot, value);
+                        if value.is_zero() {
+                            world.1.remove(&(address, slot));
+                        } else {
+                            world.1.insert((address, slot), value);
+                        }
+                    }
+                }
+            }
+            changes
+        };
+
+        for n in 1..=30usize {
+            let changes = random_block(&mut world);
+            let parent = hashes[n - 1];
+            let hash = keccak256((n as u64).to_be_bytes());
+            let root = state.compute(parent, &changes).unwrap().root;
+            state.validate_block(parent, hash, n as u64, &changes, root).unwrap();
+            state.on_canonical(hash).unwrap();
+            hashes.push(hash);
+            worlds.push(world.clone());
+            if n >= 3 {
+                let persisted = n - 3;
+                state.on_persisted(&[(persisted as u64, hashes[persisted])]);
+                assert_eq!(view.head(), (persisted as u64, hashes[persisted]));
+                for at in persisted.saturating_sub(2)..=persisted {
+                    check(&worlds, at);
+                }
+                assert_eq!(view.account(&addresses[0], persisted as u64 + 1), None, "a reader ahead of the view is declined");
+            }
+        }
+
+        // A sibling of the tip (not persisted) moves the tree off block 30.
+        let mut sibling_world = worlds[29].clone();
+        let sibling = random_block(&mut sibling_world);
+        let sibling_hash = B256::repeat_byte(0xEE);
+        let root = state.compute(hashes[29], &sibling).unwrap().root;
+        state.validate_block(hashes[29], sibling_hash, 30, &sibling, root).unwrap();
+        assert!(view.is_valid(), "the tree cut only records above the view");
+        check(&worlds, 27);
+
+        // A computation on block 26 reverts persisted block 27 on the tree.
+        state.compute(hashes[26], &BlockChanges::new()).unwrap();
+        assert!(!view.is_valid(), "records the view reads were cut");
+        assert_eq!(view.account(&addresses[0], 27), None);
     }
 }
