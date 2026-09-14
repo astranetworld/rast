@@ -243,7 +243,39 @@ where
     if v1.transactions.len() != built.block.body().transactions.len() {
         return None;
     }
+    let payload_withdrawals = data.payload.as_v2().map(|v2| v2.withdrawals.as_slice());
+    if !build_executes_as_sealed(built.block.header(), built.block.body().withdrawals.as_ref().map(|w| w.as_slice()), &sealed_header, payload_withdrawals) {
+        debug!(target: "n42.payload_serve", number, "a build on the same parent is not this block; importing it the ordinary way");
+        return None;
+    }
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, converted).await
+}
+
+/// Whether a build this node kept executes as the sealed block does. The
+/// build is found by its parent, number and -- under deferred execution --
+/// the parent's result, all of which a sibling on the same parent shares,
+/// and the sealed header takes the payload's beneficiary, timestamp, randao,
+/// gas limit and base fee; so two blocks of equal transactions (two empty
+/// ones, typically after a view change) matched, and the build's execution
+/// was filed under the other block's hash (loop157 W: node4 filed its own
+/// empty block 183's state root under node2's, and refused block 184). The
+/// seal changes none of these fields -- only the view in the extra data --
+/// so a block of ours always passes, and a block whose fields differ from the
+/// build's is never executed as the build.
+fn build_executes_as_sealed(
+    built: &alloy_consensus::Header,
+    built_withdrawals: Option<&[alloy_eips::eip4895::Withdrawal]>,
+    sealed: &alloy_consensus::Header,
+    payload_withdrawals: Option<&[alloy_eips::eip4895::Withdrawal]>,
+) -> bool {
+    built.beneficiary == sealed.beneficiary
+        && built.timestamp == sealed.timestamp
+        && built.mix_hash == sealed.mix_hash
+        && built.gas_limit == sealed.gas_limit
+        && built.base_fee_per_gas == sealed.base_fee_per_gas
+        && built.parent_beacon_block_root == sealed.parent_beacon_block_root
+        && built.transactions_root == sealed.transactions_root
+        && built_withdrawals.unwrap_or_default() == payload_withdrawals.unwrap_or_default()
 }
 
 /// The hand-off of a build this node kept, under the sealed header consensus
@@ -1337,6 +1369,38 @@ mod tests {
         let block = Block { header, body: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(withdrawals) } };
         let sealed = SealedBlock::seal_slow(block);
         assert_eq!(encode_block_parallel(&sealed), alloy_rlp::encode(&sealed));
+    }
+
+    /// A sibling on the same parent -- another leader's empty block after a
+    /// view change -- is not executed as this node's build: its beneficiary,
+    /// timestamp or rewards differ; this node's own block, which differs only
+    /// in the view the extra data carries, is (loop157 W).
+    #[test]
+    fn a_sibling_on_the_same_parent_is_not_executed_as_the_build() {
+        use alloy_eips::eip4895::Withdrawal;
+        let built = Header {
+            number: 183,
+            beneficiary: Address::repeat_byte(4),
+            timestamp: 1_000,
+            gas_limit: 3_423_000_000,
+            base_fee_per_gas: Some(7),
+            extra_data: vec![0xAA].into(),
+            ..Default::default()
+        };
+        let rewards = [Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(4), amount: 1 }];
+        let mut ours = built.clone();
+        ours.extra_data = vec![0xBB].into();
+        assert!(build_executes_as_sealed(&built, Some(&rewards), &ours, Some(&rewards)));
+
+        let mut sibling = built.clone();
+        sibling.beneficiary = Address::repeat_byte(2);
+        assert!(!build_executes_as_sealed(&built, Some(&rewards), &sibling, Some(&rewards)));
+        let mut later = built.clone();
+        later.timestamp += 1;
+        assert!(!build_executes_as_sealed(&built, Some(&rewards), &later, Some(&rewards)));
+        let theirs = [Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(2), amount: 1 }];
+        assert!(!build_executes_as_sealed(&built, Some(&rewards), &ours, Some(&theirs)));
+        assert!(build_executes_as_sealed(&built, None, &ours, Some(&[])));
     }
 }
 
