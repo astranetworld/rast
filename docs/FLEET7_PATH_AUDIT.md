@@ -230,7 +230,7 @@ also requires the build to execute as the sealed block (`build_executes_as_seale
 gas limit, base fee, beacon root, transactions root and rewards equal). The seal changes only the view in the extra
 data, so this node's own blocks always pass; `a_sibling_on_the_same_parent_is_not_executed_as_the_build` covers it.
 
-### Defect 5: mined transactions in a new leader's block after a stalled handover (open, reproducible)
+### Defect 5: mined transactions in a new leader's block after a stalled handover (root cause found; fix untested)
 
 V3 (block 258), C4 (257) and V4 (130) broke down the same way, at a leader handover. All six followers' engines
 idle about eight seconds on `executed_insert` at the same millisecond; the view times out; the incoming leader
@@ -243,3 +243,48 @@ parent result they reject (36-54 refusals a leg). This is also the mechanism of 
 changes are due: the eight-second `executed_insert` stall at a handover, which is the trigger, and the queue's
 bookkeeping across two siblings at one height, which is the consequence -- a mined-nonce floor per sender that no
 give-back may go under would close the second whatever the order of the engine's notifications.
+
+**Root cause (read in reth v2.5.1 and the node, 2026-09-14).** The mechanism above is the consequence; the cause
+is one step earlier. reth's tree skips an `InsertExecutedBlock` whose number is at or below its canonical block
+number ("outdated block that can be skipped", `engine/tree/src/tree/mod.rs`). The header-only own-block import
+checks the engine's head before the hand-off and moves it to the block's parent when they differ, but a
+forkchoice to the sibling that lands between that check and the tree processing the insert makes the sibling
+canonical first, and the insert of the chain's block at the same height is dropped silently. The header-only
+`newPayload` that follows is then executed by the engine: `convert_payload_to_block` returns the sealed block
+kept for it (163,000 transactions), but `N42EvmConfig::tx_iterator_for_payload` iterates the payload's own
+transaction list, which a header-only payload leaves empty. The block executes as empty -- "Receipt root task
+received incomplete receipts", receipts 0, gas 0 -- and the post-execution guard of loop151 accepted the result,
+so the tree holds the block with none of its state changes. Every block the leader builds on it reads its
+senders at the previous block's nonces (V3: 4032 against the chain's 4992). In all three breakdown legs the
+leader logged that incomplete execution for its own just-proposed block 0.3-2.2 s before the first refusal
+(V3 9be33925 at 257, C4 97115779 at 256, V4 f6990cd4 at 129). The queue's missing prune and full re-offer at the
+reorg follow from the same empty execution.
+
+**Fix, not yet compiled or tested** (local branch `wip/header-only-payload-fix`, e2c8f77c1): the iterator takes the
+kept sealed block's transactions when the payload carries none (`n42_evm::executable_transactions`, with a unit
+test), so a dropped insert costs an engine execution and nothing else; the guard names the real cause and logs at
+error. Still to do: compile and test it, then legs that reach a handover (the loop158 runner in the session
+scratchpad: W V5 C5 B5 V6 C6 with a per-leg count of the fallback's warning and of invalid blocks). Worth adding
+after that: re-check the engine's head after the hand-off and redo the head move and the insert when a sibling
+became canonical meanwhile, so the fallback execution is rare.
+
+**The trigger, not yet explained.** In V3, C4 and V4 the incoming leader's execution layer stops answering its
+validator for 5-7 s right after its first on-seal builds of the tenure (the validator's forkchoice request fails
+with a transport error), the own block's header-only import takes 8.4-9.3 s of which the hand-off is 37-45 ms, and
+the engine loop is idle, not busy, for the whole stall; the followers then idle on `executed_insert` for the same
+eight seconds and the view times out. Something on the execution layer's request path, not the engine tree, holds
+for those seconds; the build-on-seal path's waits (`built_executions` waits up to 3 s per lookup) are the first
+place to look.
+
+## 10. Where the work stopped (2026-09-14)
+
+- main = feat/native-fleet7 at the docs commit that carries this section; the untested defect 5 fix is only on
+  the local branch `wip/header-only-payload-fix`.
+- History from 2026-09-01 was rewritten twice to take assistant attribution out of commit messages and then to
+  point eight messages at the rewritten hashes; the pre-rewrite refs are kept under `refs/backup/` and in bundles
+  under `/data/blockchain/git-backup/`.
+- CI: Clippy passes. Test still dies about seven minutes into its run with exit 143 even with the runner's disk
+  freed and debug info off. Locally every test passes in 1-2 s at no more than 2.6 GB under a runner's limits, so
+  the build is the suspect; the reproduction under 4 CPUs and 16 GB (`taskset` + `CARGO_BUILD_JOBS=4`, not a
+  user scope's `AllowedCPUs`, which this box does not honour) has not run yet.
+- Nothing is running or queued; the box was under another session's claim at the pause.
