@@ -122,19 +122,19 @@ faults per window on a D-A-D-A round, then by windows 2-3.
 
 ## 7. Status (2026-09-10 evening)
 
-- Step 1 done (`056c6a235`): `Entries::{Heap, File}`; `N42_QMDB_ENTRY_FILE=1`. loop123: the
+- Step 1 done (`dd1097e89`): `Entries::{Heap, File}`; `N42_QMDB_ENTRY_FILE=1`. loop123: the
   fleet's anonymous memory peaks 15-20 GB lower, window 2's major faults fall by half to three
   quarters, and both chains paid ~70 ms a block for 266,000 random reads into a mapping
   re-established every 64 MB (minor faults on cached pages).
-- The mapping is chunked (`bad780f40`): sealed 256 MB chunks mapped once with populated page
+- The mapping is chunked (`89fdfd8e4`): sealed 256 MB chunks mapped once with populated page
   tables; loop124 measures it.
-- Step 3a done (delta v2 + slot-only undo, `492a2ab29`): the retired slots are read by nothing
+- Step 3a done (delta v2 + slot-only undo, `1f3fd5fbf`): the retired slots are read by nothing
   on the block path any more; loop125 measures it.
 - Steps 3b and 4 done (the file as the persistence): `forest.ckpt` = cursor + active bits, the
   delta's appended range by its bounds, `sync` before the delta, restart by hashing the file's
   records and rebuilding twigs and index from the bits, a torn tail dropped, the version-1
   checkpoint migrated once, the portable export from the file. loop126 measures it (with the
-  appends buffered and written in one call, `05c7d984c`: the per-record write syscalls were
+  appends buffered and written in one call, `1425e4faa`: the per-record write syscalls were
   the file store's remaining root-phase cost, loop125).
 - Step 5 done: a twig whose slots are all dead, all appended before the retention window's
   oldest cursor and last retired before it too keeps only its root and bits (`trim_dead_twigs`,

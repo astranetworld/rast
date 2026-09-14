@@ -10,7 +10,7 @@ and defect record in `docs/PHASE_D_DEFERRED_EXECUTION.md` (sections 10-16).
 1. **The box.** Read `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md`. At the pause
    `/data/blockchain/.box-claim-datc` was held. Do not start a fleet, a flood or a release build
    while another claim is live; a launcher's `good()` gate plus claim file does this for you.
-2. **The code.** `main` == `feat/native-fleet7` at `92b2cb76a` plus this note. Tree clean.
+2. **The code.** `main` == `feat/native-fleet7` at `8569bb93b` plus this note. Tree clean.
 3. **The binary.** Legs run `target/deferred/release` (built with
    `cargo build -j16 --release --target-dir target/deferred -p n42 --bin n42 -p n42-h2-node
    --example h2_validator --example tx_flood --example h2_keygen --example send_tx`).
@@ -56,16 +56,16 @@ huge-page pool was under ~30 GB at start (`memory :` header) is not comparable.
 **Records**: window 1 **333,416** (loop141 P350a), round **22,518,476** (loop141 P350b).
 Best since the fixes below: loop154 A2, 322,920 / 228,051 / 173,727 = 21.76M.
 
-## 2. What this stretch shipped (e5110ed5b..92b2cb76a)
+## 2. What this stretch shipped (d3eb24472..8569bb93b)
 
 | commit | what | evidence |
 | --- | --- | --- |
-| `9f0244b5f` `590a7cf30` `a2f924705` | The audit's fixes and their regressions: rejected-block evidence withdrawn, SYNCING retries, two imports in flight, a queued block counts as importing, a queued block's commit waits, a refused forkchoice is not a rejection | PHASE_D 14/16/16.1; loop143-145 |
-| `5e52dcd64` | tx-queue: a build cut short mid-run kept its sender out of the rotation; a leader stranded one sender a block and built empty blocks late in its tenure (since 2026-09-02) | loop144 A2, loop146: every block full through the tenures |
-| `acba105e5` | Watchdog tracks the own-block hand-off stage | loop147 stack dump |
-| `9932c9353` | The node launcher's engine service loop: branches timed, a 250 ms tick, a late-tick detector; the backpressure flag | loop148-149 |
-| `7a469e2f5` `7cfa757ab` `4e57e8823` | A follower's commit that runs before the block arrives is repeated when the import lands (three forms) | loop149, 152, 154; PHASE_D 16.3 |
-| `0a8dfc2e2` `8e513160b` `5e7e50669` | The sibling a leader re-proposes after a TC: sealed block found not taken + header-only guard; forest delta rewinds on a shorter sibling; an incomplete execution records no receipts; the engine head moved to the parent before a forking hand-off (reth drops a same-height executed insert) | loop147-154; PHASE_D 16.2 |
+| `b5acfdb82` `93921e23a` `6b498697e` | The audit's fixes and their regressions: rejected-block evidence withdrawn, SYNCING retries, two imports in flight, a queued block counts as importing, a queued block's commit waits, a refused forkchoice is not a rejection | PHASE_D 14/16/16.1; loop143-145 |
+| `e3409bf3b` | tx-queue: a build cut short mid-run kept its sender out of the rotation; a leader stranded one sender a block and built empty blocks late in its tenure (since 2026-09-02) | loop144 A2, loop146: every block full through the tenures |
+| `6003a8d31` | Watchdog tracks the own-block hand-off stage | loop147 stack dump |
+| `e61fba582` | The node launcher's engine service loop: branches timed, a 250 ms tick, a late-tick detector; the backpressure flag | loop148-149 |
+| `f04bb1f0f` `f697a0417` `c9119cd05` | A follower's commit that runs before the block arrives is repeated when the import lands (three forms) | loop149, 152, 154; PHASE_D 16.3 |
+| `089d3faea` `91ce2979e` `da76c0098` | The sibling a leader re-proposes after a TC: sealed block found not taken + header-only guard; forest delta rewinds on a shorter sibling; an incomplete execution records no receipts; the engine head moved to the parent before a forking hand-off (reth drops a same-height executed insert) | loop147-154; PHASE_D 16.2 |
 
 ## 3. The legs, loop141-155
 
@@ -113,8 +113,8 @@ After every leg, before the next one overwrites `node*/el.log`, grep the bench d
     execution layer rejected      a follower refused a header (deferred fields mismatch) -- the chain is dying
     fork chain / reorg:           a sibling was inserted / the canonical chain switched
     could not follow              QMDB forest could not persist the canonical head
-    incomplete execution result   an aborted execution's receipts were refused (8e513160b firing)
-    forks from the engine         the head was moved to a sibling's parent (5e7e50669 firing)
+    incomplete execution result   an aborted execution's receipts were refused (91ce2979e firing)
+    forks from the engine         the head was moved to a sibling's parent (da76c0098 firing)
     direct import failed          a follower waited 3 s for a parent: a lost commit
     engine service loop:          a slow branch, a long idle, or a late tick in the launcher's engine loop
     pruned from the queue ... queued=   a node's queue depth (the ingest gate closes at 407,500)
@@ -143,7 +143,7 @@ into `el.log` six seconds into a stuck stage.
    transactions; its Decide came 1 ms before its body; the engine inserted it at 31.424, but no
    forkchoice made it canonical until block 289's commit at 34.525; the engine's service loop saw
    no message for 3.09 s in between, and the validator logged neither a SYNCING wait nor a refusal.
-   So the repeat of 4e57e8823 either ran before the executed insert reached the tree or did not run.
+   So the repeat of c9119cd05 either ran before the executed insert reached the tree or did not run.
    Blocks under 10,000 transactions log nothing on the import path (`txs >= 10_000` guards in
    `crates/n42/h2-execution/src/driver.rs`), which is why the order cannot be read. Next: log
    every commit (hash, cause: direct / pending / ahead-repeat, answer) and every `ImportReport::Done`

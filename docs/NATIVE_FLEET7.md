@@ -197,24 +197,24 @@ measurement found a defect in the flood that every earlier round ran on.
 **The builder.** `N42_PARALLEL_BUILD=1` (`payload.rs`, `parallel_transfer::
 execute_for_build`, `graft_bundles`, `append_reverts`):
 
-- v1 (f6d329b32) grouped by connected component, as the follower does, and
+- v1 (c5e19eb6f) grouped by connected component, as the follower does, and
   committed each transfer's state into the builder's `State`. Slower than
   serial: 292-342 ms against 192 for a full block (loop67W). A block of
   random transfers is ~9 giant components; and the microbenchmark
   `bench_build_run` (163,000 transfers, 6,000 senders) split the serial
   transfer path into 112 ms of execution, 110 ms of per-transaction commits
   and 55 ms of transition merge -- half the cost is revm's `State`.
-- v2 (b8da4fdb5) groups by sender only (a transfer only adds to its
+- v2 (0c96d9d10) groups by sender only (a transfer only adds to its
   recipient; additions commute) and grafts each batch's bundle straight
   into the builder's cache and bundle, adding accounts two batches touched
   and taking the few the block already holds through a commit; reverts
   join the block's set once the bundle is taken. Microbenchmark: 105 ms
   parallel + 71 graft + 8 merge against 245 serial.
-- v3 (7278d982a) converts the pool transactions on the batch threads
+- v3 (74c33e4f3) converts the pool transactions on the batch threads
   (55-100 ms of the builder's thread otherwise) and runs the batches on
   their own 16-thread pool (`N42_PARALLEL_BUILD_THREADS`): on the fleet the
   batches had queued behind the global pool (execution 25-466 ms a block).
-- Fixes from the legs (a9659d38f, 221a4e809): an account the block touched
+- Fixes from the legs (da54e1ae7, e7f72c0ab): an account the block touched
   again after the graft (a later sender, a withdrawal) got a second revert
   from the merge, and two changeset entries for one account in one block
   fail persistence's history index (`UnsortedInput`) -- a leader died
@@ -256,7 +256,7 @@ harness claims (`recipient()` is documented as writing 163,000 accounts a
 block). The ingest path derived a transfer's recipient from the sender's
 index within the worker's own part, not the global index the JSON-RPC
 path uses, so the 64 workers' senders at one local index paid the same
-recipients at the same nonces. Fixed in ab3c79240; `blockmix.py` on a
+recipients at the same nonces. Fixed in cb94c330a; `blockmix.py` on a
 live block reads 141,000 distinct recipients now. **Every number through
 round 42 -- the 365k and 396k records included -- was measured on blocks
 that touched ~13,000 recipients**, and the follower's import, the roots
@@ -272,7 +272,7 @@ follower's import 736 ms (execution 349 in 212 groups of which the merge
 into the block's state is 265, root 170, hashed 73, convert 46, senders
 33). That is the chain's honest cycle at 163,000 scattered transfers, and
 the parallel builder and the follower's fold are now measured against it
-(loop73, and `N42_FOLLOWER_GRAFT=1`, 344e598d2, which grafts the
+(loop73, and `N42_FOLLOWER_GRAFT=1`, 9db19688a, which grafts the
 follower's groups the way the builder does).
 
 **loop73, the fixed flood, serial against parallel builder (S-P-S-P-S after a
@@ -404,7 +404,7 @@ loop81 tried the two obvious knobs, bookended by the thp:always baseline
   not a purging-cadence problem.
 
 **loop82: the state commit on the worker pool (`N42_PARALLEL_STATE_COMMIT`,
-ca16d8d22).** The follower's root phase at 147,000 accounts was 190 ms:
+a1ca65cd6).** The follower's root phase at 147,000 accounts was 190 ms:
 46 ms building the change set (two `BTreeMap`s), 27 ms keying and
 encoding its leaves serially, then the tree; the hashed post-state another
 72-78 ms of serial keccak. `sorted_operations_from_execution` keys,
@@ -437,9 +437,9 @@ real trigger.**
 
     change / knob                                                    legs      win1 (cycle)              totals            verdict
     twig index: key-prefix hasher + reserve; follower graft skips    N1,N3     228,189 (0.714 s) x2      16.6M x2          +2.4% over O2 222,755;
-      the cache insert (1a09ade1d)                                   O2,O3     222,755 / 186,092         15.5M / 14.6M       import 474 vs 488-503 ms
+      the cache insert (998977d00)                                   O2,O3     222,755 / 186,092         15.5M / 14.6M       import 474 vs 488-503 ms
     provider hashes a large post-state over rayon chunks             N4        246,132 (0.652 s)         (window 2-3 stalled) leader finish 249 -> 116 ms,
-      (dc2dfe08e / 766aa7186), also on the builder's `finish`                                                                build 609 -> 365
+      (93b78f4d5 / 28544bc9a), also on the builder's `finish`                                                                build 609 -> 365
     32-thread build pool (N42_PARALLEL_BUILD_THREADS=32)             T1,T2     242,147 / 239,058         14.5M / 15.9M     null (par_exec 47 vs 52-56 ms)
     builder graft without cache inserts (N42_BUILD_GRAFT_NO_CACHE)   C1,C2     239,056 / 239,056         16.8M / 14.9M     null (fold 83 vs 82 ms)
     baseline, new build, thp:always                                  A1-A3     239,057 / 244,479 / 244,315  11.0M / 16.7M / 10.4M  later windows: the stall lottery
@@ -488,7 +488,7 @@ parallel builder, the grafted follower, the parallel state commit
 (default), the record environment and 450 ms pacing.
 
 **loop91 (2026-09-08 09:00): the follower grouped by sender is null.**
-`N42_FOLLOWER_SENDER_GROUPS=1` (7dbb2cc21) against connected components,
+`N42_FOLLOWER_SENDER_GROUPS=1` (aadd592f7) against connected components,
 450 ms pacing, S-B-S-B on a box just vacated by a 17-31 GB `datc` (every
 leg 20-25% slower than loop87's: majflt 10.6-10.9M a leg, the leader's
 parallel execution 140-151 ms against 48; read within the round only):
@@ -508,8 +508,8 @@ graft's 72-75 ms and the groups' wall time, not the partition).
 **loop92 (2026-09-08 10:00): the stragglers' grace, with progress votes.**
 A quorum is 2f+1, so a leader keeps proposing on the five fastest votes
 while the two slowest importers fall a block behind per view, and the next
-handover stalls. `--straggler-grace-ms` (F7_STRAGGLER_GRACE_MS; ed417f695,
-858f31994, b713b113d) makes the leader wait, after a view is decided,
+handover stalls. `--straggler-grace-ms` (F7_STRAGGLER_GRACE_MS; 8936864c9,
+07f4e1f46, 20b175873) makes the leader wait, after a view is decided,
 until every validator's Round 1 vote for it has arrived or the grace has
 passed; a follower that imports a block after its view moved on sends a
 *progress vote* (a Vote signed over a separate message, never a QC
@@ -537,7 +537,7 @@ The collapse in P450a exposed one more loss: the leader took its own
 block's transactions out of the queue at import, and a block consensus
 never committed carried them away for good (40,000 nonce refusals a block
 for the rest of the leg). The queue now holds an own block's transactions
-until the chain settles its height (7c6b8ce11; loop93 validates it).
+until the chain settles its height (d1185e9b1; loop93 validates it).
 
 loop93 (10:23-10:38, the held-ledger build, box recovered): H300a
 184,319 / 152,080 / 157,476, HG300a 238,998 / 168,395 / 157,490, H300b
@@ -670,7 +670,7 @@ hot allocations got, and a pool of 40 GB or more decides it the right way.
 **loop98 (13:43-14:01): the first follower cuts, bookended, and hugeprep from
 a post-build start.** The unit tests and a release build first (the state
 that gave loop96b's P1 its 184k: pool ~34 GB before prep), then dropcache
-and hugeprep before every leg. S = the loop95 binary (HEAD 42f1cc5eb), B =
+and hugeprep before every leg. S = the loop95 binary (HEAD 93d27c463), B =
 the working tree: `TxEnv`s built on the worker pool, the graft taking the
 largest bundle as the block's bundle instead of re-inserting its 140,000
 accounts, the grafted reverts sorted in parallel. (A third change, the
@@ -870,7 +870,7 @@ answer read 102 ms, where it was 35 with the remembered block.** Skipping
 `remember_sealed` makes the engine decode the payload's 163,000 transactions
 again, so the fast answer traded 35 ms on the vote's path for ~70 ms of extra
 work per block on the node's blocking pool -- and at seven nodes all doing it,
-that is cores the ingest wanted. Second attempt (96072ad05): remember the
+that is cores the ingest wanted. Second attempt (2210b5bd5): remember the
 block after answering, cloning it from the executed block's `Arc` on a worker
 thread, which is off the path and always finishes before the pass reads it.
 loop103 measures that.
@@ -882,7 +882,7 @@ the two walks of the block for the queue, and the engine's acknowledgement are
 between them 8 ms, not the 78 they were suspected of. The remaining ~44 ms is
 the carry cache: 129,000 accounts copied into the next block's read cache, one
 insert at a time, while the validator waits for the answer. It is timed as
-`carry_ms` from 96072ad05, and nothing reads it before the next block.
+`carry_ms` from 2210b5bd5, and nothing reads it before the next block.
 
 **loop101 (01:54-02:21 EDT): the pacing is not the ceiling either, and
 window 1 has a resolution of one block.**
@@ -975,7 +975,7 @@ fast answer is no longer a loss; whether it is a win needs a clean pair.
 F2 also gives the import's best reading yet: **413 ms** -- convert 48,
 senders 36, execution 185, root 64, hashed 27, **carry 25**, state 5,
 header 4, checks 4, and ~15 of dispatch. The carry is 25 ms rather than the
-44 that was inferred, and `N42_CARRY_ASYNC=1` (73af720b6) moves it behind the
+44 that was inferred, and `N42_CARRY_ASYNC=1` (9bc437bad) moves it behind the
 answer; loop104 measures it together with the join and the queue offload,
 ~50 ms in all.
 
@@ -1229,7 +1229,7 @@ day; the swap then refilled with 7 GB of tmpfs pages under the legs' reclaim, wh
 harmless and is what "swap keeps filling" was). Both rounds: pacing 450, grace 600,
 rayon 16, the round-43 configuration, `S` = `N42_BUILD_ON_SEAL=1`, `B` = without.
 
-loop110 (bae77e3e0 as built at 18:05): S1 202,634 / B1 217,246 / S2 232,707 / B2
+loop110 (c15678d02 as built at 18:05): S1 202,634 / B1 217,246 / S2 232,707 / B2
 271,634 -- monotonic across the legs whatever the arm, so the S-vs-B TPS is unreadable
 (the box warmed leg by leg after gov5's run: window-1 major faults 350k, 1.07M, 2k;
 S1 was also the first leg after a debug compile, pool 34 GB). The chain columns were
@@ -1395,7 +1395,7 @@ carries it. After that the checkpoint itself is the next cut: its clone of the t
 under the forest lock and its `move_to(head)`, which reverts the pending build.
 
 **loop117 (2026-09-10 07:11-07:33 EDT): the guard in, and build-on-seal adopted.** The
-stale-request guard (35e5ba4b4) on the loop115 binaries otherwise, W S1 B1 S2 B2:
+stale-request guard (3836bdb98) on the loop115 binaries otherwise, W S1 B1 S2 B2:
 
     W   266,224 / 206,393 / 184,679  (warm-up)
     S1  266,223 / 211,839 / 200,977  = 20,371,170, the best round
@@ -1416,7 +1416,7 @@ grows with the leg's memory state the way the forkchoice build did (the S legs' 
 Adopted: `N42_BUILD_ON_SEAL=1` joins the record configuration (the launchers' `C` set
 next to `N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1`); `=0` is the A/B's off arm. Three
 rounds (loop115-117) read the same shape and the last one read it without a loss. What
-made it pay was not the on-seal path itself (bae77e3e0 read 233-244k against 266-271k)
+made it pay was not the on-seal path itself (c15678d02 read 233-244k against 266-271k)
 but the four defects it exposed and the forest that moved its tree for persistence
 (e7b60c513); the record configuration's next items are the followers' chain (plan v3
 phase B, since the cycle is theirs now) and, on the leader's side, the checkpoint's clone
@@ -1644,7 +1644,7 @@ retention knob (loop122) and the entry file are independent: their memory saving
 
 **loop124 (2026-09-10 20:51-21:13 EDT): the entry file through sealed, populated chunks -- the
 reads were never the faults.** The file mapped in 256 MB chunks, each mapped once with its
-page tables populated (`bad780f40`), E against the heap A, retention 16 on both:
+page tables populated (`89fdfd8e4`), E against the heap A, retention 16 on both:
 
     leg  win1          win2     win3     round    leader finish w1/w2/w3  follower w1  w3 majflt  AnonPages peak  w3 blocks
     E1   259,823 (48)  230,506  191,491  20.47M   155 / 162 / 176         394-460      778k       78 GB           36
@@ -1664,7 +1664,7 @@ the retired slots' reads off the block path altogether (the delta carries a flag
 record a slot number): the memory gain should then stand alone.
 
 **loop125 (2026-09-10 21:38-22:00 EDT): delta v2 and the slot-only undo -- 296,936 and two rounds
-at 21.11M.** Step 3a (`492a2ab29`): the delta says which slots below its base flipped and to what
+at 21.11M.** Step 3a (`1f3fd5fbf`): the delta says which slots below its base flipped and to what
 instead of carrying their entries, and a file-backed tree's undo record carries slot numbers
 (the key is read at revival). E legs the entry file, A legs the heap, retention 16, tenure 64:
 
@@ -1680,7 +1680,7 @@ read 133,000 retired entries there too), the follower's import 326-357 against 3
 **A2's 296,936 is the best window 1 of the campaign, 56 blocks**; both A2 and E2 read
 21.11M, the best rounds (loop118 K1 was 20.70M). The file arm's root phase still read 101-107 ms
 against the heap's 33-35: not reads any more but writes -- `push` wrote each of the 147,000
-records with its own seek and write syscall; fixed after this round (`05c7d984c`: appends go to
+records with its own seek and write syscall; fixed after this round (`1425e4faa`: appends go to
 the tail buffer and reach the file in one write at the next sync, seal or truncation), and
 loop126 measures it with step 3b (the file as the persistence: `forest.ckpt` of bits, fsync
 before the delta, restart from the file). Even so the file arm's windows 2-3 are the best
@@ -1688,9 +1688,9 @@ yet (E2 243,253 / 199,174, 44 blocks in window 3 on the chain's clock against 37
 major faults 73k against 1.77M), and its round ties the heap's.
 
 **loop126 (2026-09-11 00:26-00:48 EDT): the entry file as the persistence -- 21,684,816.** Step
-3b/4 (`e7ccae7a8`: `forest.ckpt` is the cursor and the active bits, the delta names its appended
+3b/4 (`d1ec71d6a`: `forest.ckpt` is the cursor and the active bits, the delta names its appended
 range by its bounds, fsync before the delta, restart from the file) with the appends buffered
-and written in one call (`05c7d984c`). E legs the entry file, A legs the heap, retention 16,
+and written in one call (`1425e4faa`). E legs the entry file, A legs the heap, retention 16,
 tenure 64:
 
     leg  win1          win2     win3     round       leader finish w1/w2/w3  follower w1  w1 majflt  w2 majflt  chain blocks w1/w2/w3
@@ -1715,9 +1715,9 @@ The file arm is now the default candidate: it holds the best window 2 and the be
 its window 1 is the heap's.
 
 **loop127 (2026-09-11 00:58-01:25 EDT): dead twigs trimmed, the fsync off the lock -- 21,836,504
-and 298k on window 1.** Step 5 (`07fd98033`: a twig whose slots are all dead and outside the
+and 298k on window 1.** Step 5 (`20b24edd9`: a twig whose slots are all dead and outside the
 retention window keeps only its root and bits) and the fsync of the entry file's appends moved
-outside the forest lock (`c8e9043ba`). T = entry file with trimming, N = entry file without
+outside the forest lock (`b11615e6c`). T = entry file with trimming, N = entry file without
 (`N42_QMDB_TRIM_TWIGS=0`), A = the heap; retention 16, tenure 64:
 
     leg  win1          win2     win3     round       follower w1  w1 majflt  w2 majflt  w3 majflt  AnonPages peak  chain blocks
@@ -1752,12 +1752,12 @@ designed (`docs/QMDB_ENTRY_LOG.md`): entries in the file, a checkpoint of bits, 
 bounds and flags, restart from the file, trimming by the retention window.
 
 **loop128 (2026-09-11 03:03-03:25 EDT): the vote before the import, first form -- void, and
-the reason it could not work.** `N42_VOTE_BEFORE_IMPORT=1` (`68d8c8453`): under the H2-v4
+the reason it could not work.** `N42_VOTE_BEFORE_IMPORT=1` (`79a59e18c`): under the H2-v4
 profile the follower votes on a verified proposal at once and imports afterwards, to bound
 what deferred execution (`docs/PHASE_D_DEFERRED_EXECUTION.md`) would give the cycle. Its first
 launch stalled in the decay phase: the driver's commit deferral (a forkchoice for a block still
 importing must wait) matched the leader's own block too, which is imported by header and never
-through `execute`, so the leader never finalised (`cce893446` narrows it to an import in
+through `execute`, so the leader never finalised (`a0055be46` narrows it to an import in
 flight). The relaunch, V = the flag, F = as adopted, all file mode:
 
     leg  win1          win2     win3     round    Cached at start  R1_collect  leader on-seal build
@@ -1769,7 +1769,7 @@ flight). The relaunch, V = the flag, F = as adopted, all file mode:
 Two findings, neither about the protocol. The round is void: every leg started with 20-22 GB
 cached and a 36-38 GB huge-page pool (the clean legs of loop127: 9.6-10.5 GB and 44-53 GB),
 right after a gov5 run; F1 read 250k on the configuration that read 298k in loop127. The
-bench now also drops gov5's datadir pages before a leg (`631f10420`) -- which, measured
+bench now also drops gov5's datadir pages before a leg (`126cb404c`) -- which, measured
 afterwards, freed nothing: the residual 9 GB of clean file pages that survive the drop are
 not theirs and not ours, and the tmpfs (Shmem) has grown to 10.1 GB. And the flag did not do
 what it says: the validator's loop awaits the import inline (`driver.handle_output(ExecuteBlock)`
@@ -1782,7 +1782,7 @@ on, and a commit that arrived meanwhile runs its forkchoice then). loop129 runs 
 
 **loop129, first run (2026-09-11 03:30-03:40 EDT): the import off the loop works, and the box was
 not ours.** With `N42_VOTE_BEFORE_IMPORT=1` now also running the follower's import on a task
-(`f880de3ce`), V1 collected its votes in 5-21 ms instead of 499 and made 59 blocks in window 1
+(`fdd1fa346`), V1 collected its votes in 5-21 ms instead of 499 and made 59 blocks in window 1
 at a 0.508 s cycle -- the mechanism does what the bound needs. The leg is void all the same:
 two `eth-el-framed` jobs (gov5's eth-el mode bootstrapping mainnet snapshots under
 `/data/blockchain/ethel-test`, 1.6-4.4 GB each, I/O heavy) were running beside the fleet, the
@@ -1881,7 +1881,7 @@ reached) and on the same genesis with `deferredExecutionTime: 0` (A legs), recor
 Defect 1 (loop132 A1/A2): with the vote sent on the check, the Decide for a block arrives while
 the block is still executing, and the validator's service dropped that commit as "a block the
 execution layer has not imported"; the block never got its forkchoice, never became canonical,
-and the next block's check waited the whole parent timeout. Fixed (d628d085d): a commit for a
+and the next block's check waited the whole parent timeout. Fixed (1d91ac749): a commit for a
 block in flight goes to the driver, which runs the forkchoice when the import lands. Blocks
 1-81 of every gated leg (the base-fee decay) had passed because empty blocks import before the
 Decide, and the smoke run for the same reason.
@@ -1890,7 +1890,7 @@ Defect 2 (loop133 A1/A2): the service holds a block that is more than one past t
 layer's tip, and the tip was the driver's head, which moves when an import *lands* -- so from
 the fork on every second block was held until the previous one landed (node2's followers:
 `import starting since_body_ms=200-340` on every block, a serial chain again), and a follower
-that fell behind at a tenure change stalled the fleet 31 s. Fixed (568ded61c): the imports in
+that fell behind at a tenure change stalled the fleet 31 s. Fixed (5f531d2be): the imports in
 flight count as the tip; loop134 measures it.
 
 What A2 says about the follower at full blocks (163,000 0x50 transfers, every node's execution
@@ -1927,7 +1927,7 @@ with the tenure-handover fix on top:
 Defect 3 (loop134 A1/A2): at every tenure boundary (views 128, 192, 256) the new leader had voted
 for the parent on its check and was still importing it; the execution layer answered its build
 with SYNCING, the failed build was not retried, and the view timed out -- 6.9 s of every 30 s
-window, the whole difference between 46 and 56 blocks. Fixed (f34405fb6): the proposal is
+window, the whole difference between 46 and 56 blocks. Fixed (90dc25265): the proposal is
 deferred while the parent is in flight and asked again on the retry cadence; loop135's gated
 legs have no timeout past view 1.
 
@@ -2124,21 +2124,21 @@ section 16) measured on the adopted configuration (gated bench genesis, seal-fir
 two legs a build:
 
     leg          build                  win1          win2     win3     what happened
-    loop143 A1   9f0244b5f (audit)      284,806 (54)  119,557  225,656  tenure timeouts: a queued block was not "importing"
-    loop143 A2   9f0244b5f              300,210 (56)  142,924   28,041  window 3 at 17% occupancy (see loop144 A2)
-    loop144 A1   590a7cf30              300,245 (56)        0        0  node0's head stuck at 173 while consensus ran on
-    loop144 A2   590a7cf30              316,429 (59)    5,468        0  the leader's blocks 163k, 126k, 32k, 0; flood stalled
-    loop145 A1   a2f924705              296,666 (55)  211,481  193,739  full round, 21.07M
-    loop145 A2   a2f924705              242,516 (46)  224,726  203,987  full round, 20.14M (0.65 s window-1 cycle)
+    loop143 A1   b5acfdb82 (audit)      284,806 (54)  119,557  225,656  tenure timeouts: a queued block was not "importing"
+    loop143 A2   b5acfdb82              300,210 (56)  142,924   28,041  window 3 at 17% occupancy (see loop144 A2)
+    loop144 A1   93921e23a              300,245 (56)        0        0  node0's head stuck at 173 while consensus ran on
+    loop144 A2   93921e23a              316,429 (59)    5,468        0  the leader's blocks 163k, 126k, 32k, 0; flood stalled
+    loop145 A1   6b498697e              296,666 (55)  211,481  193,739  full round, 21.07M
+    loop145 A2   6b498697e              242,516 (46)  224,726  203,987  full round, 20.14M (0.65 s window-1 cycle)
 
 loop143's regressions were the audit's own: a block queued behind the two imports in flight did
 not count as importing (the new leader proposed on it, the tenure timed out), the check's
 intrinsic-gas pass ran serially (+40 ms), and the seal-first fold's cache inserts were back
-(+36 ms) -- `590a7cf30`. loop144 A1 is the liveness defect the fix uncovered: the commit for a
+(+36 ms) -- `93921e23a`. loop144 A1 is the liveness defect the fix uncovered: the commit for a
 *queued* block ran a forkchoice the engine refused (SYNCING), the driver took the refusal as a
 rejection, withdrew the vote evidence, and the measured node's canonical head stopped at 173
 while the chain went on to view 327; the commit of a queued block now waits like an executing
-one's, and a refused forkchoice is a log line (`a2f924705`).
+one's, and a refused forkchoice is a log line (`6b498697e`).
 
 loop144 A2 (and loop143 A2's window 3) is older than any of this. The leader's blocks shrank
 163k -> 126k -> 32k -> 0 fifty blocks into its tenure while every node's queue, its own included,
@@ -2155,12 +2155,12 @@ of a 64-view tenure the stranded lanes held most of the leader's queue count, th
 A1's per-tenure shapes show the mild form: every tenure's first ~25 blocks full, then partial
 blocks (27k, 108k, 118k ...) in its second half, and the next leader starting full again, since
 its lanes were whole and its predecessor's stranded lanes are pruned as it mines them. This is in
-every round since 875d454bc (2026-09-02) and is part of why windows 2-3 read well under window 1.
-Fixed in `5e52dcd64`: the build's start returns the run's sender to the front of the arrival
+every round since fa006f03e (2026-09-02) and is part of why windows 2-3 read well under window 1.
+Fixed in `e3409bf3b`: the build's start returns the run's sender to the front of the arrival
 order; a regression test cuts a run short and checks the next build offers that sender first.
 
 **loop146 (2026-09-12 06:34-06:46 EDT): the queue fix -- every block full through the round,
-327,484 / 238,126 and 22.33M.** The same binary plus `5e52dcd64`, two legs:
+327,484 / 238,126 and 22.33M.** The same binary plus `e3409bf3b`, two legs:
 
     leg          win1          win2          win3          full blocks        round total
     loop146 A1   244,159 (45)  244,034 (45)  160,391 (30)  43/45 44/45 27/30  19.46M
@@ -2271,7 +2271,7 @@ quarter second throughout, so the request was not sitting in front of an unpolle
 not yet in the channel, or the tree's handling of it took the time. What the stall then does is
 now the reproducible part: the TC, the sibling, the fork insert executing an empty body, the
 forest's `DeltaBase` refusal on the switch to a shorter sibling, and every header after it
-rejected. Both are fixed in `0a8dfc2e2` (the sealed block is found, not taken, and a payload
+rejected. Both are fixed in `089d3faea` (the sealed block is found, not taken, and a payload
 with no transactions for a block this node sealed with some is refused so the validator falls back
 to the full payload; the measured delta rewinds below the persisted cursor when a move recorded
 the rewind -- `a_switch_to_a_shorter_sibling_rewinds_the_persisted_cursor`). The driver's
@@ -2287,7 +2287,7 @@ the same block landed a few milliseconds earlier, reth's payload processor abort
 part way ("receipt root task received incomplete receipts"), and `validate_block_post_execution`
 recorded the partial result -- receipts root empty, gas 0 -- over the build's fields. Every header
 after it was rejected as before. A result whose receipts do not cover the block's transactions is
-not recorded now (`8e513160b`); loop152 measures it.
+not recorded now (`91ce2979e`); loop152 measures it.
 
     leg          win1          win2          win3          round     what happened
     loop151 A1   260,743 (48)        0             0        7.82M    stall, TC, sibling; the partial result recorded; chain stood at 129
@@ -2307,11 +2307,11 @@ its canonical block number ("outdated block"), so the hand-off of a sibling at t
 own block already made canonical was skipped, the header-only `newPayload` executed it on the
 fork path, and on QMDB that execution ran against the head's state (every transaction refused,
 0 receipts, gas 0). The next build ran on that state and its root differed from the followers'.
-The hand-off now moves the engine's head to the sibling's parent first (`5e7e50669`), so the
+The hand-off now moves the engine's head to the sibling's parent first (`da76c0098`), so the
 executed insert extends the head and the payload finds the block already known. A1 was the
 follower cascade of loop149 in its second form -- the early forkchoice was answered as done, not
 SYNCING -- so the driver now repeats the forkchoice when an import lands for the block consensus
-last committed (`7cfa757ab`). loop154 measures both.
+last committed (`f697a0417`). loop154 measures both.
 
 **loop154 (2026-09-12 08:24-08:36 EDT): a stall and a TC cost their seconds; the follower's
 lost commit in its third form.** Two legs with the engine's head moved to the parent before a
@@ -2327,7 +2327,7 @@ block after block, and the repeat-on-import rule keyed on "the block consensus l
 never matched -- by the time an import landed the next block's commit had moved on, so no
 forkchoice ever followed an import on that node. The driver now keeps the imports that landed
 and the commits that ran for blocks it had not imported, and repeats each of those when its
-block lands (`4e57e8823`,
+block lands (`c9119cd05`,
 `commits_ahead_of_their_imports_are_each_repeated_when_the_import_lands`). loop155 measures it.
 
 **loop155 (2026-09-12 08:38-08:50 EDT): every commit ahead of its import repeated.** Two legs:
@@ -2336,7 +2336,7 @@ block lands (`4e57e8823`,
     loop155 A1   298,718 (55)  228,056 (42)  183,903 (43)  21.35M    clean: no stall, 1 TC, 0 rejected, 0 parent waits
     loop155 A2   314,915 (58)  233,487 (43)  152,065 (37)  21.03M    clean: no stall, 1 TC, 0 rejected; 9 parent waits late in window 3
 
-Four legs in a row since `5e7e50669` ran to the end with no header rejected (loop154 A1 through
+Four legs in a row since `da76c0098` ran to the end with no header rejected (loop154 A1 through
 its stall and two TCs, loop154 A2, loop155 A1, loop155 A2), against one dead leg in two from
 loop147 to loop152. Adopted on main. What the round loses now is the stall itself when it
 happens (7-10 s and a TC at a tenure change, still open) and the late-window memory phase.
@@ -4898,7 +4898,7 @@ not round-trip through a payload, isolated into the `#[ignore]`d test
 `header_profile.rs` at all. On the raw-payload path a V4 payload was given
 `slot_number = block number` while the EL-built header the fast seal signs
 carried `slot_number: None`, so block 1 failed with "no gov5 header variant
-hashes". Fixed in `crates/n42/h2-el-rpc/src/engine.rs` (`1b5a77cfe`), with an
+hashes". Fixed in `crates/n42/h2-el-rpc/src/engine.rs` (`b923b1260`), with an
 Amsterdam round-trip test, by the other session working this tree. The
 candidate-dimension work I added to `reconstruct_gov5_h2_block` was aimed at a
 field that was never wrong.
@@ -4916,7 +4916,7 @@ edit is reverted.
 The shared lesson is not about Amsterdam. Both errors are the same move:
 **reading a dirty or unfamiliar tree as my own and acting before running
 `git log`.** The same move committed another session's working tree as
-`ab98225dc`, and launched fleet rounds that destroyed two of its measurements
+`c53d17ad7`, and launched fleet rounds that destroyed two of its measurements
 mid-window. One tree and one fleet root need one writer at a time: take
 `flock /data/blockchain/rust-fleet7-bench/.round.lock`, or at minimum check
 `pgrep -f 'fleet7-benc[h].sh'`, before any round.
@@ -4999,7 +4999,7 @@ block number as EIP-7843's slot while the header the fast seal signed had none,
 and every importer rebuilt a header with the payload's slot and could not
 reproduce the hash. Block 1 refused on every node. Fixed with a unit test that
 takes an Amsterdam block over the raw path, seals it from the header and
-reconstructs it as a follower would (`1b5a77cfe`). The Osaka rounds never saw
+reconstructs it as a follower would (`b923b1260`). The Osaka rounds never saw
 it because only V4 carries a slot.
 
 Two sessions were launching rounds on one fleet root that evening and wiped
@@ -5397,7 +5397,7 @@ to give, and every follower still executes every block.
 
 ### The record, three rounds
 
-`rep-c`, the configuration as committed at `7c2c15e8b` (direct push, body
+`rep-c`, the configuration as committed at `9f5db035c` (direct push, body
 channel, no block prewarming, persistence every eight, parallel conversion
 and assembly, batched QMDB root), three consecutive rounds:
 
@@ -5536,7 +5536,7 @@ or, on a chain with a tenure, supply that is aimed at the leader rather
 than at seven pools. Both are the generator's and the ingest's business,
 not the chain's.
 
-### The tenure's three-round record (async ingest, pool 489k, tree at 4cfa2abec)
+### The tenure's three-round record (async ingest, pool 489k, tree at d7ac3f31b)
 
 `scripts/fleet7-repeat.sh 3` on the configuration of `tenure16o`:
 
@@ -5582,7 +5582,7 @@ demand is seven times its profile's average.
 `F7_PIN_PHYSICAL=1`, now the default: node i gets 16i..16i+15 and their
 siblings, the generator the sixteen physical cores the nodes leave. Three
 rounds of the tenure configuration (tenure 16, ingest-all, async ingest,
-pool 489k, tree a55750e57):
+pool 489k, tree 4a2c0ab38):
 
 | | run 1 | run 2 | run 3 | median |
 |---|---:|---:|---:|---:|
@@ -5695,7 +5695,7 @@ side number needs the round position it was taken at.
 
 ## Round 33: the leader drift was 512 threads, and the first two windows over 150,000
 
-Branch `feat/tenure-leader` (403c934ca), tenure 16, 250 ms pacing, `--ingest-all`,
+Branch `feat/tenure-leader` (467d192de), tenure 16, 250 ms pacing, `--ingest-all`,
 async ingest, whole physical cores. Everything below is from single rounds
 unless it says otherwise; the spread rule of round 27 stands.
 
@@ -5807,7 +5807,7 @@ is 2 to 16 past a multiple of 256, the last group's members all share their
 next nibble, the subtrie's root is an extension node, and the parent puts a
 second extension in front of it. Full blocks of 163,000 (residue 184) never
 hit it; the test list (4,097; 65,537; 163,000) never did either. Fixed in
-84202bb47 — such a group's members go up as leaves — with a test over every
+ec192b364 — such a group's members go up as leaves — with a test over every
 residue modulo 256 at three- and four-byte keys, which reproduced 8,194
 before the fix.
 
@@ -5854,7 +5854,7 @@ syscall it is.
 
 ### Addendum 3: the collapse is kernel time on the runtime's workers, and its rate is page faults
 
-Three more rounds of the other branch's gate watcher (574401f23: one
+Three more rounds of the other branch's gate watcher (efb6caa2d: one
 watcher task and a `Notify` instead of a 2 ms poll per connection) changed
 nothing: 194,894 / 93k / 68k, 193,774 / 125k / 86k, 194,702 / 85k / 71k. Nor
 did jemalloc keeping large allocations in its arenas (`oversize_threshold:0`
@@ -5888,7 +5888,7 @@ client is pushed past its rate.
 
 The supply session's A-B-A of its frame reuse (three legs, all flat at
 ~4.3 µs/tx on the followers, windows 2-3 at 120-125k) had one thing in every
-leg that no collapsing round had: e3eca2e95 -- the body channel's pooled
+leg that no collapsing round had: 98f2f7452 -- the body channel's pooled
 receive buffers and the validator's body store cut from 4,096 remembered
 bodies to 64. Bookended here with `N42_H2_REMEMBERED_BODIES` on this tree
 (without the supply session's ingest `BufReader`), direct configuration,
@@ -6135,7 +6135,7 @@ in the loop around the executor: pool 108, exec 222, finish 57, assemble
 a state read of the sender's account to skip a stale transaction before
 executing it (redundant with a queue pruned by canonical blocks, and the
 executor refuses a stale one anyway), and a second clone of the
-transaction into the executor. Both removed (9ee6ce0eb; the read stays
+transaction into the executor. Both removed (3a31fa440; the read stays
 behind `N42_BUILDER_STALE_CHECK=1`).
 
 Bookend with yesterday's binary as the A legs (`target/release-old`),
@@ -6168,7 +6168,7 @@ was full the builder kept taking one candidate per queued sender (6,000)
 and each refusal scanned the 165,000 transactions the build had taken to
 drop the refused one. Now the queue pops the refused transaction when it
 is the last yielded (always) and the builder stops before taking anything
-once less than a transfer's gas is left (782334c92, 2e1e9611b for the
+once less than a transfer's gas is left (8ecb02700, 544e12c65 for the
 "check before taking" order -- a transaction taken and left neither built
 nor returned is lost from the queue's lanes).
 
@@ -6181,7 +6181,7 @@ means "queued", the `newPayload` is what proves the insert landed (and
 executes the block if it did not), and without it the next forkchoice
 read Syncing. Kept, made cheap instead: the hand-off registers the sealed
 block under its hash and the validator's conversion takes it from there
-(eaaf134c1). Own import 127 -> 71 ms.
+(506bd43b1). Own import 127 -> 71 ms.
 
 Same box, quiet, 16 recovery slots, fresh datadirs, `target/release-old`
 = round 36's binary:
@@ -6202,7 +6202,7 @@ in the full-block regime, bookended.**
 
 ### The fast transfer path: right on the followers, invisible on the leader
 
-`N42_FAST_TRANSFER=1` (39810f139) applies a plain transfer -- a call with
+`N42_FAST_TRANSFER=1` (da92cc0bd) applies a plain transfer -- a call with
 no calldata, no access list, no blob, no authorisation, between accounts
 without code, on Prague/Osaka -- without the interpreter: revm's own
 arithmetic in revm's order, the accounts its journal would return, the
@@ -6229,7 +6229,7 @@ all. The builder's 1.6 µs a transaction is therefore
 not the interpreter; it is the state reads -- two million recipients,
 almost every one a cold miss on the parent state, read serially. A
 parallel prefetch of the next batch's accounts into the build's read
-cache (`N42_BUILDER_PREFETCH=<n>`, 2e1e9611b; a state provider per chunk,
+cache (`N42_BUILDER_PREFETCH=<n>`, 544e12c65; a state provider per chunk,
 since the build's own is not `Sync`) is the answer to that, measured
 below.
 
@@ -6269,7 +6269,7 @@ counter is **0** on every leader block with `N42_FAST_TRANSFER=1` -- the
 path that took 40 ms off the followers' import never applied on the
 builder, so the "interpreter is not the cost" verdict above was drawn
 from a leg where the interpreter was never bypassed on the leader. The
-refusal counters (fe393c159) and a `perf` profile of the leader's build
+refusal counters (ed944ccb0) and a `perf` profile of the leader's build
 (profiling binary, `--profile-node`) are the next instrument; the
 prefetch stays in the tree, off.
 
@@ -6281,7 +6281,7 @@ consulted the path. `spawn_payload_builder_service` constructed its own
 `EthEvmConfig::new(chain_spec)` and ignored the node's EVM configuration,
 so every leader-side EVM change of the day (and the sender-recovery
 cache attached in `build_evm`) had reached the engine only. The builder
-now takes the node's factory (9d95b8e0f). Same binary, 16 slots, the
+now takes the node's factory (c4638de3f). Same binary, 16 slots, the
 flag alone:
 
 | leg | fast | win1 | win2 | win3 | build (buckets) | exec | follower engine | cycle |
@@ -6297,7 +6297,7 @@ million system-wide major faults and a page cache that did not grow
 (11 GB flat where every other leg reaches 57-69 GB), the round-34
 signature; the repeat did not, and the bundle written through revm's
 `State` is equal to the interpreter's field by field (tests
-17bf429c5), so it is not the path. Cause not established -- a
+1ee634720), so it is not the path. Cause not established -- a
 `perf report` of the 2.3 GB profiling binary, without `--no-inline`,
 was running on the box at the time (that flag is now in
 `fleet7-profile.sh`; with it a report takes 35 s, without it it did not
@@ -6336,7 +6336,7 @@ No single hotspot; the largest is the clock. The loop's own three
 account for 17% in the vDSO, and the frame-pointer chains do not say who
 does (they stop at the vDSO boundary); a DWARF-unwound profile of the
 `payload-builder` threads is the next leg. The two known parts are fixed
-(5976f6ef2: alloy's address hasher in the queue, one clock read per
+(f2970360c: alloy's address hasher in the queue, one clock read per
 transaction boundary) and bookended in the same round.
 
 The followers' engine thread, same profile: the transfer path 9.9%,
@@ -6374,7 +6374,7 @@ main clause. A read costs 21 ns in a tight loop on this box (tsc,
 constant/nonstop), so 309k reads are ~6.5 ms a block against the 63 ms
 the profile charged to the vDSO: part of that share is sampling skid
 onto rdtsc. The timers are now sampled, one transaction in 32
-(cb169b2b7), and bookended; registered before the legs: build level
+(eed71915a), and bookended; registered before the legs: build level
 -10 to -60 ms, TPS +1 to +9%, under 1% meaning the profile's share was
 mostly skid.
 
@@ -6400,7 +6400,7 @@ undecided. It landed at ~20 ms: undecided by the letter, and the
 reading is that a third of the profile's vDSO share was real time and
 two thirds sampling skid onto rdtsc. (The one-in-32 sampling biased the
 pool/execution split itself -- the scaled sums overshot the build --
-so the split is now timed with rdtsc, d2d4692f6.)
+so the split is now timed with rdtsc, fe961f41e.)
 
 The cycle did not move at all, 0.638 s in all four legs, and the
 phases say why: publish -> receive 74 ms, receive -> vote 447 ms,
@@ -6414,11 +6414,11 @@ From here the target is the follower's 447 ms: decode 13, conversion
 the engine thread's profile names the per-transaction metrics and
 `quanta` (~4%), the receipt-root and payload-convert channels (~3.5%)
 and the precompile lookup (2%, replaced by an address check,
-d1bca8315).
+ee3977ba1).
 
 ## Supply session, A-B-A one: the A-B-A on buffer reuse, and what it settled
 
-Three legs back to back on e3eca2e95 + the supply commits, direct
+Three legs back to back on 98f2f7452 + the supply commits, direct
 configuration (tenure 16, ingest-all, async ingest, recovery cap 8 / nice
 10, queue, direct-to-queue, --pertx 4000), conditions sampled every 5 s
 inside the script. Prediction, written first: if reusing the raw payload
@@ -6435,7 +6435,7 @@ The bookends agree (followers within ~3%, windows 2-3 to the block), so the
 middle leg is readable, and it says **no**: with fresh frames the follower
 is as flat and windows 2-3 as full as with retained ones. Frame reuse is
 not the mechanism; it stays as hygiene. What all three legs share, and the
-collapsing rounds (gate1-3, direct3-5) did not have, is e3eca2e95 -- the
+collapsing rounds (gate1-3, direct3-5) did not have, is 98f2f7452 -- the
 validator's body store cut from 4,096 bodies to 64, i.e. several
 gigabytes of retained block bodies per validator gone from a box whose
 page cache is the contended resource -- and that is the other session's
@@ -6455,7 +6455,7 @@ occupancy, quantises at 61-100 blocks and is not a comparison.
 
 ## Supply session, A-B-A two: the within-round collapse was the ingest's unbuffered reads
 
-A-B-A on one binary (feat/supply-direct f0f6f7bdb: e3eca2e95 + the supply
+A-B-A on one binary (feat/supply-direct f0f6f7bdb: 98f2f7452 + the supply
 commits) with one flag, `N42_TX_INGEST_UNBUFFERED`, on the direct
 configuration; conditions sampled every 5 s inside the launcher, one EL's
 environment dumped per leg (the flag present in B's only). Prediction,
@@ -6512,7 +6512,7 @@ and this fleet's numbers are on the heavier, more realistic workload. The
 
 The followers' import is the critical path (round 37), and its engine
 phase costs ~2.1 µs a transfer where the builder's loop costs 1.2 µs on
-the same fast path. `N42_FOLLOWER_EXEC_PROBE=1` (c6c819a30) executes
+the same fast path. `N42_FOLLOWER_EXEC_PROBE=1` (53c4118de) executes
 each imported block once more with reth's plain `BasicBlockExecutor` on
 the parent's state, after the engine has taken it, and logs the time --
 an instrument (leg `probe1`, TPS excluded: 149k, the probe's own load).
@@ -6540,16 +6540,16 @@ import 447 -> ~250 ms, cycle 0.64 -> ~0.45 s.
 `N42_FOLLOWER_DIRECT_IMPORT=1` with `N42_SENDER_CACHE_MULT=4` (reth's
 recovery cache holds 131k entries, less than one block; at 4x, 95% of
 senders hit), the body check taking the transactions root the conversion
-proved (798c65adb), and a read cache carried from the previous block's
-post-state (52e64f6ae). Per block: convert 35, header 1, senders 37,
+proved (361a4f044), and a read cache carried from the previous block's
+post-state (65ba61621). Per block: convert 35, header 1, senders 37,
 execution 140, checks 7, root 11, hashed 4 = **263 ms**, against ~340-390
 in the engine's path. Two things it exposed: a first-try `senders 509`
 was the pool not holding the block's transactions (every sender
 recovered), and a first-try `exec 284` was the 121 ms probe having run on
 caches the engine had just warmed. And two leader-side faults at the
 faster cycle: a build prepared ahead that resolved with a block on the
-previous parent, trusted and proposed (c6aa9294d checks the delivered
-parent), and the QC-moved race (d24618e9a) -- see `N42_26_PORT.md`.
+previous parent, trusted and proposed (842dc28cd checks the delivered
+parent), and the QC-moved race (67495e92d) -- see `N42_26_PORT.md`.
 
 | leg | pacing | win1 | win2 | win3 | cycle | occupancy |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
@@ -6567,7 +6567,7 @@ the builder slows as the block grows (383 ms for 163k against 179 ms for
 66, seal and body ~10, vote and decide). The lever is the builder's
 throughput: at 1.75 µs a transaction, ~100 ms of a full block is the
 queue's per-transaction lock and inbox drain, now batched
-(`N42_TX_QUEUE_BATCH`, 0311b30b3), to be measured.
+(`N42_TX_QUEUE_BATCH`, ecc872ea5), to be measured.
 
 ### Round 38, continued: the raw channel's shifted responses, and reth's job that rebuilt every second
 
@@ -6583,8 +6583,8 @@ block on the *previous* parent, "built" in 2 ms, which every voter refused
 as not extending the justify QC (the halts of loop16D and loop17D); or,
 one shift later, a request waiting for a response already consumed --
 the leader silent for the whole view (loop22P400b, 00:58:47 to the
-timeout). The driver's parent check (c6aa9294d) caught the first form and
-rebuilt; 1f62b06f3 removes the cause: the connection is taken out of the
+timeout). The driver's parent check (842dc28cd) caught the first form and
+rebuilt; c40acbb0f removes the cause: the connection is taken out of the
 channel for a request and put back only after the whole response, so a
 dropped request drops the connection.
 
@@ -6600,13 +6600,13 @@ layer answering nothing for 8 s under it. `F7_EL_EXTRA="--builder.interval
 own pacing sets the cadence.
 
 Also on the way: the engine transport retries once a request that failed
-before any response (51735ac64; a server-closed keep-alive connection cost
+before any response (7df9508c7; a server-closed keep-alive connection cost
 a view each time), the queue takes transactions in batches under one lock
-(`N42_TX_QUEUE_BATCH`, 0311b30b3), returns what a superseded build took
-minus what the chain mined meanwhile (1fac24593, 705911f9c -- the first
+(`N42_TX_QUEUE_BATCH`, ecc872ea5), returns what a superseded build took
+minus what the chain mined meanwhile (729aa4e53, 481eb0232 -- the first
 version returned mined ones too and the builder refused 42,000 stale
 transactions a block), and can drain its inbox off the builder's thread
-(`N42_TX_QUEUE_DRAINER=1`, f635c2739, to be measured).
+(`N42_TX_QUEUE_DRAINER=1`, 5e903e030, to be measured).
 
 | leg | pacing | jobs | win1 | win2 | win3 | occupancy |
 | --- | ---: | --- | ---: | ---: | ---: | --- |
@@ -6689,7 +6689,7 @@ supply's ceiling and where it lives.
 
 `tx_flood` signed with the local signer's k256 at ~51 us a transaction on
 its 32 SMT threads. At 269k/s that is 22 of 64 workers signing and 42 in
-`recv`, which read like a generator at its signing ceiling. a727fac37 signs
+`recv`, which read like a generator at its signing ceiling. e2fafff5f signs
 with libsecp256k1 (byte-identical signatures, RFC 6979 low-s; a test recovers
 both against k256), `TX_FLOOD_K256_SIGN=1` restores the old path.
 
@@ -6708,7 +6708,7 @@ gate was the next suspect. Gate 407,500 -> 266,223 win1; gate 650,000 ->
 271,655 (+2%, inside single-round noise); the flood's rate and wait did not
 move, the deepest pool simply rose to the new gate within ten seconds.
 Meanwhile the ingest's split -- `busy_us_per_tx` inside the recovery task,
-`slot_wait_us_per_tx` outside it (7cf043a15; the first cut instrumented only
+`slot_wait_us_per_tx` outside it (37d20badc; the first cut instrumented only
 the synchronous path and read 0) -- said: busy 46-50 us, slot wait 0, the 16
 slots 71-86% busy. Not the node's CPU either.
 
@@ -6727,7 +6727,7 @@ frames, each worker blocking in `recv` for all seven answers), its rate is
 frames in flight over an answer's latency, and the node answers only after
 the frame's slot is acquired.
 
-691f9b42a and 090ffe613 time both ends. The node's stats line adds, per
+29fe41ff8 and f3b9f78ed time both ends. The node's stats line adds, per
 frame, `reply_us` (frame fully read to answer written) split into `gate_us`,
 `acq_us` (waiting for a recovery slot), `spawn_us` (permit granted to the
 task running on a blocking thread) and `chan_us` (room in the connection's
@@ -6758,7 +6758,7 @@ measured the gate, not the frame size. Withdrawn.
 ### Batch 500 at equal depth: every block full (03:42-03:52)
 
 Batch 500 with window 6 (3,000 transactions in flight per worker, the same
-as 32 x 100), one binary 090ffe613:
+as 32 x 100), one binary f3b9f78ed:
 
     leg      win1     win2     win3    full blocks         3-window total  flood @60 s
     A1 100   266,224  249,832  258,597  49/50 30/55 20/60   23,240,400      260.6k/s
@@ -6784,7 +6784,7 @@ cycle -- build 380 + own import 70 + seal 30 on the leader, the followers'
 number.
 
 Flags: `--rpcbatch 500` with `F7_FLOOD_WINDOW=6` (keep window x batch near
-3,000 a worker; the flood's frame cap is 2,000 since 4b2080db3). The
+3,000 a worker; the flood's frame cap is 2,000 since 484640460). The
 generator levers that remain parked: `F7_FLOOD_PROCS` (no extra cores),
 24 recovery slots (measured worse on the followers by n42-rs-36).
 

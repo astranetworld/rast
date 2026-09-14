@@ -114,7 +114,7 @@ heap profiles, the instrument a CPU profile cannot replace).
 
 **Round 43 (2026-09-07) found that the flood's ingest path had every worker's senders paying the same
 recipients: a "full" 163k block touched ~13,000 accounts, so every number below through round 42 was
-measured on that shape (fixed in ab3c79240; `docs/NATIVE_FLEET7.md` round 43). With the flood fixed a full
+measured on that shape (fixed in cb94c330a; `docs/NATIVE_FLEET7.md` round 43). With the flood fixed a full
 block touches ~147,000 accounts and the fleet reads 163-168k TPS at a 0.97-1.0 s cycle with the round-41
 configuration, ~200k at 0.8 s with `N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1` (the leader's transfers in
 parallel per-sender batches grafted onto the block's state; the follower's groups grafted the same way;
