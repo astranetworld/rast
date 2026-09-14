@@ -413,7 +413,7 @@ your side will go into our header tests as agreed.
 
 ## 16. Audit of the session's code (2026-09-12 05:30), what it found and what changed
 
-Two independent reviews of `289953d01..HEAD` (builder/store side, follower/driver side). Fixed:
+Two independent reviews of `9ba1470c2..HEAD` (builder/store side, follower/driver side). Fixed:
 
 - **A rejected block kept its vote evidence and lost its commit.** `BlockChecked` put the hash in
   `imported_blocks`; an import that then failed left it there (a re-proposal of the hash would be
@@ -458,15 +458,15 @@ finish replaces it.
 ### 16.1 What the bench found in the audited build (loop143-145)
 
 - A block queued behind the two imports in flight was not "importing": the new leader proposed
-  on it and the tenure timed out. `is_importing` covers the queue (`93921e23a`); the check's
+  on it and the tenure timed out. `is_importing` covers the queue (`5c38c8798`); the check's
   intrinsic-gas pass runs inside the per-sender parallel loop, and the seal-first fold does not
   re-insert every account into the cache (both were regressions of the audit's own changes).
 - The commit for a queued block ran a forkchoice the engine answered SYNCING; the driver took
   that as a rejection, withdrew the block's vote evidence and the node's head stopped (loop144 A1,
   node0 at 173 with consensus at view 327). A queued block's commit now waits for its import like
-  an executing one's, and a refused forkchoice is a warning and `Ignored` (`6b498697e`).
+  an executing one's, and a refused forkchoice is a warning and `Ignored` (`98ceadeb4`).
 - Not deferred execution's, but found by these legs: the transaction queue stranded the sender
-  whose run a full block cut short (`e3409bf3b`, `NATIVE_FLEET7.md` loop143-145).
+  whose run a full block cut short (`9465fdb9f`, `NATIVE_FLEET7.md` loop143-145).
 
 ### 16.2 The reorg path after a sibling re-proposal (loop147-154), fixed
 
@@ -485,18 +485,18 @@ loop147), neither reachable while the chain does not fork:
   entries were appended after the branch it replaced had filed its own, and the delta's cursor
   bookkeeping assumes the file's tail is the branch being extended.
 
-Both fixed in `089d3faea` (`built_executions::find_sealed` + the header-only guard in
+Both fixed in `4e55c33ed` (`built_executions::find_sealed` + the header-only guard in
 `engine_validator`; `QmdbForest::delta_since` rewinding to the move's low-water mark). loop151-152
 then showed two more on the same path:
 
 - The hand-off's executed insert and the header-only `newPayload` of the same sibling raced in the
   tree; the payload's execution was aborted part way and `validate_block_post_execution` recorded
   the partial result (receipts root empty, gas 0). A result whose receipts do not cover the
-  block's transactions is not recorded (`91ce2979e`).
+  block's transactions is not recorded (`27d13a625`).
 - reth's tree drops an executed insert whose number is not above its canonical block number
   ("outdated block"), so a sibling at the height of the own block already made canonical was never
   inserted and the payload executed it on the fork path, against the head's QMDB state. The
-  hand-off now moves the engine's head to the sibling's parent first (`da76c0098`).
+  hand-off now moves the engine's head to the sibling's parent first (`df0e9f4c2`).
 
 With all four in, loop154 A1 went through a stall and two TCs with no header rejected, and
 loop154 A2, loop155 A1 and A2 ran clean (`NATIVE_FLEET7.md` loop154-155).
@@ -508,9 +508,9 @@ load, sometimes block after block). The commit's forkchoice then names a block t
 not have; nothing makes the block canonical after its import lands; the next block's direct
 import waits `PARENT_WAIT` (3 s) for a parent the provider cannot see and falls to the ordinary
 path; the node falls behind, its queue crosses the ingest gate, and the flood (which waits for
-every node) stops. Three forms, three fixes: the engine answers SYNCING (`f04bb1f0f`: the commit
+every node) stops. Three forms, three fixes: the engine answers SYNCING (`61af2de22`: the commit
 waits for the import); the engine answers as if done and the import lands for the last committed
-block (`f697a0417`); commits run ahead of several imports in a row (`c9119cd05`: the driver keeps
+block (`6f5007b58`); commits run ahead of several imports in a row (`f888c8257`: the driver keeps
 the imports that landed and the commits that ran for blocks it had not imported, and repeats each
 when its block lands). loop155 A2 still showed one 3 s parent wait late in window 3, on an empty
 block (open; `docs/FLEET7_HANDOFF.md`).

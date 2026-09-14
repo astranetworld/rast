@@ -120,7 +120,7 @@ is credited 21,000 gwei a block in the database, and 38 reads check with 0 misma
 ## 8. The fleet legs (loop156, 2026-09-14)
 
 Eight legs on the loop155 configuration, in this order: W (warm-up) A1 B1 C1 V1 A2 B2 C2. A is the loop155
-build (kept as `rust-fleet7-bin/pre-audit-loop155`, built 2026-09-12 08:36); B is 1f177ff94 (QMDB stages 1-6b,
+build (kept as `rust-fleet7-bin/pre-audit-loop155`, built 2026-09-12 08:36); B is b94012c27 (QMDB stages 1-6b,
 the fixes of section 4, the APoS fix of section 7); C is B with `N42_CHECK_ON_PARENT_OUTPUT=1`; V is B with
 `N42_QMDB_READS=verify`. WAL and RocksDB are the largest of the seven nodes at the end of the round; the pool is
 the huge-page pool `hugeprep` left before the leg (a leg under ~30 GB is not comparable).
@@ -194,7 +194,7 @@ reorg is the next thing to trace.
 
 ## 9. The confirmation legs (loop157, 2026-09-14)
 
-The working tree with the fixes of defects 1 and 2 (committed as 9e14dbf60), six legs on one binary in the
+The working tree with the fixes of defects 1 and 2 (committed as cdb074fa2), six legs on one binary in the
 order W C3 V3 B3 C4 V4. Invalid blocks counts the execution layers' "Encountered invalid block" lines; the first
 is the lowest block refused and how many nodes refused it.
 

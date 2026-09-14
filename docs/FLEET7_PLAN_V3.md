@@ -1,7 +1,7 @@
 # Fleet7 plan v3 -- two chains and one box
 
 *2026-09-09 evening. Written after re-reading plan v2, the A1/A2 commit
-(c15678d02), the loop110 launcher, and loop108 R16b's logs split into 30 s
+(48372fef8), the loop110 launcher, and loop108 R16b's logs split into 30 s
 windows on both sides. Supersedes the round order in `FLEET7_PLAN_V2.md`
 section 4; sections 1-3 of v2 (the leader's chain, the plumbing, the
 storage-v2 finding) still stand and are not repeated here.*
@@ -11,7 +11,7 @@ storage-v2 finding) still stand and are not repeated here.*
 ### 1.1 The state of the in-flight work
 
 - **A1/A2 is built and unmeasured.** `target/release/{n42,examples/h2_validator}`
-  were built at 18:05 EDT from the tree that became c15678d02 at 18:06 (the
+  were built at 18:05 EDT from the tree that became 48372fef8 at 18:06 (the
   lock-file commit after it changes no code). `run-loop110.sh` is the S-B-S-B
   round (S = `N42_BUILD_ON_SEAL=1`, B = without), pacing 450, grace 600, rayon 16.
 - **The launcher would hang.** Its first gate is
@@ -199,7 +199,7 @@ window 1 -- parity -- and S2's windows 2-3 the best of the campaign (217k / 185k
 (flood replies 2 s, builds waiting 618 ms for the queue), unexplained. loop116 repeats
 the round: loop116 S1 248,774 / 211,787 / 206,361 = 20,007,660 (the best round), B1/B2 19.5M /
 18.9M, and S2 collapsed -- a stale build-ahead request after a slow hand-off became a reorg
-(NATIVE_FLEET7 loop116); the guard (3836bdb98) went into loop117, which read S 266,223 / 211,839 / 200,977 =
+(NATIVE_FLEET7 loop116); the guard (18a8f4f40) went into loop117, which read S 266,223 / 211,839 / 200,977 =
 20,371,170 and 266,222 / 211,842 / 190,086 against B 19.39M / 19.23M with no collapse.
 **A1/A2 done and adopted** (`N42_BUILD_ON_SEAL=1` in the record configuration). Window
 1 now reads 49 blocks on both arms: the cycle is the followers' chain, so phase B is next

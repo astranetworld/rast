@@ -517,13 +517,13 @@ pairs a newer justify with an older parent, and every voter refuses the
 block as not extending its justify QC. Both guard it, leader-locally and
 deliberately differently: this client compares the parent with the block
 the QC certifies after the build and **rebuilds** on a mismatch
-(67495e92d; a build is ~0.4 s); gov5 **drops** the proposal before
+(d5613db61; a build is ~0.4 s); gov5 **drops** the proposal before
 journalling it (bdc76990; a build there is 1.6-2 s), counting
 `hotstuff_proposal_stale_parent_total`. The halt this fleet actually saw
 at a 0.43 s cycle (round 38) was a second shape: a build prepared ahead
 resolved with a block on the *previous* parent -- the execution layer's
 answer did not extend the parent asked for -- and the driver trusted it;
-842dc28cd checks the delivered payload's parent against the request. In
+b759c48f3 checks the delivered payload's parent against the request. In
 gov5 the two shapes are one check, because its requested parent is
 always the locked QC's block; here they are two, because the parent and
 the QC are read at different moments. Nothing crosses the wire

@@ -19,7 +19,7 @@ shape a real chain would produce, and record what the ceiling is made of.
 ## What is true now
 
 - **Shape.** The bench's blocks carry 163,000 plain transfers and touch
-  ~147,000 accounts, since the flood fix (cb94c330a). Every number before
+  ~147,000 accounts, since the flood fix (9a40a002a). Every number before
   round 43 was measured on ~13,000-account blocks and does not transfer.
   Every round prints a `shape` line (senders, distinct recipients, run
   lengths). `docs/BLOCK_SHAPE_SURVEY.md` places that shape against Ethereum
@@ -179,8 +179,8 @@ is still not comparable (loop100 F1: 217k).
 
 **loop99** (done, see the cut table) (launcher `~/.claude/jobs/2127e0ae/tmp/run-loop99.sh`, waiting at
 its gate for eight foreign `txflood-r34` processes from another session to
-exit): the S-B-R bookend of the import cuts in 9f155e821 -- S = the loop95
-binary (`target/profiling`, HEAD 93d27c463), B = `target/release` built by the
+exit): the S-B-R bookend of the import cuts in 22d7b4c1c -- S = the loop95
+binary (`target/profiling`, HEAD a87d00459), B = `target/release` built by the
 launcher, R = B with `RAYON_NUM_THREADS=32`. Six legs, dropcache and hugeprep
 before each. What it decides: whether the offline cuts (root, conversion,
 senders, hashed state; ~60 ms of a 470 ms import) move the barrier, and

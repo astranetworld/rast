@@ -12,7 +12,7 @@
 | 记录 | 365,399 TPS（win1）| loop53Q300a |
 | 供给上限（每节点 20 个恢复槽） | ~340–355k/s，槽 95% 忙 | loop54-55 |
 | ecrecover 成本 | 空闲 36–43 µs，SMT 争用 48–63 µs | loop56-58 |
-| 节点 CPU 中签名恢复占比 | 约 3/4（负载下） | commit c8a24eff4 |
+| 节点 CPU 中签名恢复占比 | 约 3/4（负载下） | commit eb8166b44 |
 | 链周期（并行 follower） | 0.36–0.38 s → 容量 ~450k/s | loop54-55 |
 | 本机 Ed25519 批量验证 | 单条 26 µs，批 64 为 13 µs，批 256 为 10 µs | sigbench |
 
@@ -41,8 +41,8 @@
 - **3A 已完成（round 43，`N42_PARALLEL_BUILD=1`）**：按发送方分组、独立线程池、批次 bundle 直接嫁接进构建者状态（绕过 revm State 的逐笔 commit/transition merge），
   区块按候选顺序排布；等价测试逐账户比对 original/status/revert。leader 满块构建 1054 → 537 ms（真实状态形状下）。
 - **round 43 的洪流缺陷**：ingest 路径按连接内局部序号派生收款人，"满块 163k 笔"实际只落到 ~1.3 万收款人；此前所有数字（含 396k）都在这种形状上量得。
-  修正（cb94c330a）后满块触及 ~14.7 万账户，round-41 配置读 163–168k TPS、周期 0.97–1.0 s；并行构建不改周期（follower 导入 0.74–0.76 s 成为长杆）。
-- **follower 嫁接（`N42_FOLLOWER_GRAFT=1`，9db19688a）**：follower 的分组 bundle 同样嫁接，导入 736–759 → 622–657 ms，win1 201–206k 对 172–182k（两对书挡 +14–17%），周期 0.77–0.81 s。
+  修正（9a40a002a）后满块触及 ~14.7 万账户，round-41 配置读 163–168k TPS、周期 0.97–1.0 s；并行构建不改周期（follower 导入 0.74–0.76 s 成为长杆）。
+- **follower 嫁接（`N42_FOLLOWER_GRAFT=1`，7b99e17ae）**：follower 的分组 bundle 同样嫁接，导入 736–759 → 622–657 ms，win1 201–206k 对 172–182k（两对书挡 +14–17%），周期 0.77–0.81 s。
   现状：**~200k TPS @ 0.8 s**；剩余长杆是 follower 的 QMDB root（190 ms）、hashed post-state（75）、body convert（55）与执行分组（~110）。
 - 新缺陷：链在 200–222 块附近负载下停顿 12 s 甚至停摆（#8，与 round 40 的停摆同高度）；分叉后队列把被孤立块的交易当作已上链剪掉，此后区块半空（#11）。
 - 阶段 3 的目标（1,000k）需要在真实状态形状上重新排期：供给侧不再是第一瓶颈，状态提交（root/hashed/graft/persistence）才是。

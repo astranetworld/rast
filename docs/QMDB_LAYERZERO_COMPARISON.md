@@ -2,7 +2,7 @@
 
 *2026-09-13. Measured on the fleet7 box beside a DATC run (each run in a 20 GB memory scope,
 swap off, stopped if the box's MemAvailable fell under 30 GB). LayerZero `qmdb` at commit
-`f14a2a09c` (2026-05-29, MIT); ours at `f006b3e54`. The harness is
+`f14a2a09c` (2026-05-29, MIT); ours at `18c40208f`. The harness is
 `/home/n42/src/n42/qmdb-compare` (outside this repository: it depends on both code bases by path).
 Performance sections are filled in from the runs; this section is written from the code.*
 
@@ -408,7 +408,7 @@ the comparisons between stages stay valid (all ran the same harness), the absolu
 pessimistic. Stage 5b turned the set into a `Vec`, which is why its harness numbers fell so far (L p50 87.7 -> 39.3).
 
 `QMDBCMP_PERSIST=1` now takes each block's delta and clears the bookkeeping as the node does. Stage 5a (a worktree
-at `1efd44613`) against stage 5b+5c, both node-like, alternating 5a / 5b / 5a / 5b, roots identical in every run
+at `2dd8d0e50`) against stage 5b+5c, both node-like, alternating 5a / 5b / 5a / 5b, roots identical in every run
 (`/data/blockchain/qmdb-compare/persist-ab`):
 
     run                           stage 5a                       stage 5b+5c
