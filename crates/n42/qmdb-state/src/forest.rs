@@ -42,6 +42,11 @@ use crate::{BlockChanges, StateError};
 /// shorter) and the bench has used it since.
 pub const DEFAULT_RETAIN_DEPTH: u64 = 16;
 
+/// The most blocks below the head a reader's keep ([`QmdbForest::set_keep_from`])
+/// holds records for: the retention depth the fleet ran with before it was
+/// lowered to 16, so a database that far behind costs no more than it did then.
+pub const READER_KEEP_CAP: u64 = 64;
+
 /// A block's root and operations, computed but not yet filed under its hash.
 ///
 /// A block producer does not know its block's hash until the header — state
@@ -275,6 +280,9 @@ pub struct QmdbForest {
     records: HashMap<B256, BlockRecord>,
     head: (u64, B256),
     retain_depth: u64,
+    /// The lowest block a reader still needs the record of; see
+    /// [`Self::set_keep_from`].
+    keep_from: Option<u64>,
     /// Slots the tree has deactivated or revived since the last delta was
     /// taken. Every move of the tree goes through a [`BlockUndo`], and an undo
     /// record names exactly the slots it flips, so recording them here — on the
@@ -417,6 +425,7 @@ impl QmdbForest {
             records,
             head: (number, hash),
             retain_depth: DEFAULT_RETAIN_DEPTH,
+            keep_from: None,
             trim_twigs: true,
             dirty_slots: Vec::new(),
             dirty_slots_deduped: 0,
@@ -440,6 +449,16 @@ impl QmdbForest {
     pub const fn with_retain_depth(mut self, depth: u64) -> Self {
         self.retain_depth = depth;
         self
+    }
+
+    /// Keeps the records of blocks from `number` up past the retention depth
+    /// (up to [`READER_KEEP_CAP`] below the head), for a reader that still has
+    /// to list their changes when the database persists them; `None` releases
+    /// them to the retention depth at the next head move. Under load the
+    /// database persists 17-18 blocks behind the head, past a depth of 16, and
+    /// the read view lost the next block's changes on every node (loop156 V1).
+    pub const fn set_keep_from(&mut self, number: Option<u64>) {
+        self.keep_from = number;
     }
 
     /// What a filed block changed, as the entry file holds it: for each of its
@@ -782,7 +801,10 @@ impl QmdbForest {
             self.move_to(block_hash)?;
         }
         self.head = (number, block_hash);
-        let cutoff = number.saturating_sub(self.retain_depth);
+        let mut cutoff = number.saturating_sub(self.retain_depth);
+        if let Some(keep) = self.keep_from {
+            cutoff = cutoff.min(keep.max(number.saturating_sub(READER_KEEP_CAP)));
+        }
         self.records
             .retain(|hash, record| record.number >= cutoff || *hash == block_hash);
         if self.trim_twigs {
@@ -1536,5 +1558,33 @@ mod tests {
         for (key, offset) in live {
             assert_eq!(view.key(offset), key);
         }
+    }
+
+    /// A reader's keep holds the records from its block up past the retention
+    /// depth, and releasing it prunes them at the next head move.
+    #[test]
+    fn a_readers_keep_holds_records_past_the_retention_depth() {
+        let dir = std::env::temp_dir().join(format!("n42-forest-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new())
+            .unwrap()
+            .with_retain_depth(2)
+            .with_entry_file(&dir.join("entries.log"))
+            .unwrap();
+        forest.set_keep_from(Some(2));
+        let mut parent = GENESIS;
+        for n in 1..=6u8 {
+            forest.apply(parent, h(n), n as u64, &changes(n)).unwrap();
+            forest.set_canonical(h(n)).unwrap();
+            parent = h(n);
+        }
+        assert!(!forest.contains(&h(1)), "below both the depth and the keep");
+        assert!(forest.block_changes(&h(2)).is_some(), "kept for the reader past a depth of 2");
+        forest.set_keep_from(None);
+        forest.apply(h(6), h(7), 7, &changes(7)).unwrap();
+        forest.set_canonical(h(7)).unwrap();
+        assert!(!forest.contains(&h(2)), "released with the keep");
+        assert!(forest.contains(&h(5)));
     }
 }

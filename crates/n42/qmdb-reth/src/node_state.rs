@@ -379,6 +379,9 @@ impl QmdbNodeState {
         match built {
             Ok(view) => {
                 forest.set_truncation_guard(Some(view.clone()));
+                // The records of the blocks the database has yet to persist are
+                // what the view advances by; keep them past the retention depth.
+                forest.set_keep_from(Some(head.0 + 1));
                 info!(
                     target: "n42.qmdb",
                     block = head.0, keys = view.len(), build_ms = started.elapsed().as_millis() as u64,
@@ -406,21 +409,24 @@ impl QmdbNodeState {
     }
 
     /// The database persisted `blocks` (ascending by number): the read view
-    /// moves with them, and is invalidated if it cannot follow exactly.
+    /// moves with them, and is invalidated if it cannot follow exactly. The
+    /// forest keeps the records of the blocks after the view's head for it
+    /// until then (`QmdbForest::set_keep_from`), and drops the keep once the
+    /// view is invalid.
     pub fn on_persisted(&self, blocks: &[(u64, B256)]) {
         use crate::read_view::Position;
         let Some(view) = self.inner.read_view.get() else { return };
         for &(number, hash) in blocks {
             match view.position(number, hash) {
                 Position::Held => {}
-                Position::Invalid => return,
+                Position::Invalid => return self.release_reader_records(),
                 Position::Mismatch => {
                     view.invalidate("a persisted block is not the block the view holds");
-                    return;
+                    return self.release_reader_records();
                 }
                 Position::Gap => {
                     view.invalidate("the database persisted past the view's next block");
-                    return;
+                    return self.release_reader_records();
                 }
                 Position::Next => {
                     let changes = self.with_forest(|forest| {
@@ -428,6 +434,7 @@ impl QmdbNodeState {
                         let changes = forest.block_changes(&hash);
                         if let Some(changes) = &changes {
                             view.raise_floor(changes);
+                            forest.set_keep_from(Some(number + 1));
                         }
                         Ok(changes)
                     });
@@ -435,16 +442,25 @@ impl QmdbNodeState {
                         Ok(Some(changes)) => view.advance(number, hash, &changes),
                         Ok(None) => {
                             view.invalidate("a persisted block's changes are not on the tree's path");
-                            return;
+                            return self.release_reader_records();
                         }
                         Err(_) => {
                             view.invalidate("the forest could not list a persisted block's changes");
-                            return;
+                            return self.release_reader_records();
                         }
                     }
                 }
             }
         }
+    }
+
+    /// An invalid view needs no records kept: the forest goes back to its
+    /// retention depth.
+    fn release_reader_records(&self) {
+        let _ = self.with_forest(|forest| {
+            forest.set_keep_from(None);
+            Ok(())
+        });
     }
 
     /// Whether the entries live in the file.
@@ -2068,5 +2084,56 @@ mod tests {
         state.compute(hashes[26], &BlockChanges::new()).unwrap();
         assert!(!view.is_valid(), "records the view reads were cut");
         assert_eq!(view.account(&addresses[0], 27), None);
+    }
+
+    /// A database persisting further behind the head than the forest's
+    /// retention depth (16) leaves the view valid: the records of the blocks it
+    /// has not persisted are kept for the view (loop156 V1: 17-18 behind
+    /// invalidated it on every node), up to the reader cap of 64 blocks, past
+    /// which the view is invalidated as before.
+    #[test]
+    fn the_read_view_follows_a_database_behind_the_retention_depth() {
+        use alloy_primitives::{keccak256, Address, KECCAK256_EMPTY, U256};
+        use n42_qmdb_state::AccountState;
+        use reth_primitives_traits::Account;
+
+        let chain = qmdb_chain();
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), scratch("read-view-behind"), true);
+        state.set_read_view_wanted(true);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let view = state.read_view().expect("the view is built at initialisation");
+        let extend = |hashes: &mut Vec<B256>, to: usize| {
+            for n in hashes.len()..=to {
+                let mut changes = BlockChanges::new();
+                changes.set_account(
+                    Address::with_last_byte((n % 40) as u8 + 1),
+                    AccountState { nonce: n as u64, balance: U256::from(n), code_hash: KECCAK256_EMPTY },
+                );
+                let parent = hashes[n - 1];
+                let hash = keccak256((n as u64).to_be_bytes());
+                let root = state.compute(parent, &changes).unwrap().root;
+                state.validate_block(parent, hash, n as u64, &changes, root).unwrap();
+                state.on_canonical(hash).unwrap();
+                hashes.push(hash);
+            }
+        };
+        let mut hashes = vec![chain.genesis_hash()];
+
+        // 40 blocks canonical before the database persists any: 39 past a depth of 16.
+        extend(&mut hashes, 40);
+        let persisted: Vec<(u64, B256)> = (1..=40).map(|n| (n as u64, hashes[n])).collect();
+        state.on_persisted(&persisted);
+        assert!(view.is_valid(), "the records the view needed were kept");
+        assert_eq!(view.head(), (40, hashes[40]));
+        assert_eq!(
+            view.account(&Address::with_last_byte(1), 40),
+            Some(Some(Account { nonce: 40, balance: U256::from(40), bytecode_hash: None }))
+        );
+
+        // 70 more before the next persistence: past the cap of 64.
+        extend(&mut hashes, 110);
+        let persisted: Vec<(u64, B256)> = (41..=110).map(|n| (n as u64, hashes[n])).collect();
+        state.on_persisted(&persisted);
+        assert!(!view.is_valid(), "a database further behind than the cap invalidates the view");
     }
 }

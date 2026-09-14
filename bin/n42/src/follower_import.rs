@@ -122,8 +122,17 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
 }
 
 /// The parent's header and published execution output, once its execution
-/// fields are recorded; `None` if they do not appear within [`PARENT_WAIT`].
-fn wait_for_parent_output(parent_hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
+/// fields are recorded; `None` as soon as `parent_in` says the parent is in
+/// the engine without one, or if neither happens within [`PARENT_WAIT`].
+/// Only this path publishes: a parent this node built, or one the engine
+/// imported by its own path, never appears, and waiting the whole
+/// [`PARENT_WAIT`] for it put three seconds before the child's vote. Behind
+/// a 350 ms cycle the child then missed its own import, went by the engine's
+/// path too, and so did every block after it (loop156 C1).
+fn wait_for_parent_output(
+    parent_hash: B256,
+    parent_in: impl Fn() -> bool,
+) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
     let deadline = std::time::Instant::now() + PARENT_WAIT;
     let (count, landed) = &IMPORT_LANDED;
     let mut seen = *count.lock().unwrap_or_else(|p| p.into_inner());
@@ -138,6 +147,9 @@ fn wait_for_parent_output(parent_hash: B256) -> Option<(reth_primitives_traits::
             if n42_engine_types::executed_fields::get(&parent_hash).is_some() {
                 return Some(found);
             }
+        }
+        if parent_in() {
+            return None;
         }
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -168,6 +180,27 @@ fn account_after_parent(bundle: &reth_revm::db::BundleState, sender: &Address) -
 /// block up to the engine's ordinary path (which answers SYNCING).
 const PARENT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The parent's sealed header if it is in: known to the provider and, past
+/// the fork, executed here (its result recorded).
+fn parent_in<Provider>(
+    provider: &Provider,
+    parent_hash: B256,
+    genesis: &alloy_genesis::Genesis,
+    deferred: bool,
+) -> Result<Option<reth_primitives_traits::SealedHeader>, String>
+where
+    Provider: HeaderProvider<Header = alloy_consensus::Header>,
+{
+    let Some(parent) = provider.sealed_header_by_hash(parent_hash).map_err(|err| format!("parent header: {err}"))? else {
+        return Ok(None);
+    };
+    // A parent before the fork carries its own result in its header; one past
+    // it has its result recorded here once executed.
+    let executed_here =
+        deferred && parent.number > 0 && reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp);
+    Ok((!executed_here || n42_engine_types::executed_fields::get(&parent_hash).is_some()).then_some(parent))
+}
+
 /// The parent's sealed header once the parent is in: known to the provider
 /// and, under deferred execution, executed here (its result recorded), so
 /// the header's fields can be checked and the transactions read against its
@@ -187,18 +220,8 @@ where
     let (count, landed) = &IMPORT_LANDED;
     let mut seen = *count.lock().unwrap_or_else(|p| p.into_inner());
     loop {
-        if let Some(parent) = provider
-            .sealed_header_by_hash(parent_hash)
-            .map_err(|err| format!("parent header: {err}"))?
-        {
-            // A parent before the fork carries its own result in its header;
-            // one past it has its result recorded here once executed.
-            let executed_here = deferred
-                && parent.number > 0
-                && reth_chainspec::qmdb::deferred_execution_active_at(genesis, parent.timestamp);
-            if !executed_here || n42_engine_types::executed_fields::get(&parent_hash).is_some() {
-                return Ok(parent);
-            }
+        if let Some(parent) = parent_in(provider, parent_hash, genesis, deferred)? {
+            return Ok(parent);
         }
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -497,7 +520,14 @@ where
     // against its post-state.
     let (parent, parent_output) = match parent_known {
         Some(parent) => (parent, None),
-        None => match (deferred && check_on_parent_output()).then(|| wait_for_parent_output(parent_hash)).flatten() {
+        None => match (deferred && check_on_parent_output())
+            .then(|| {
+                wait_for_parent_output(parent_hash, || {
+                    parent_in(provider, parent_hash, chain_spec.genesis(), deferred).ok().flatten().is_some()
+                })
+            })
+            .flatten()
+        {
             Some((parent, output)) => (parent, Some(output)),
             None => (wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?, None),
         },
@@ -810,5 +840,15 @@ mod parent_output_tests {
         let account = account_after_parent(&bundle, &destroyed).expect("destroyed by the parent");
         assert_eq!((account.nonce, account.balance), (0, U256::ZERO));
         assert!(account_after_parent(&bundle, &untouched).is_none());
+    }
+
+    /// A parent already in the engine that nothing published (one this node
+    /// built, or one the engine imported by its own path) ends the wait at
+    /// once instead of after [`PARENT_WAIT`] (loop156 C1).
+    #[test]
+    fn a_parent_in_the_engine_without_an_output_ends_the_wait_at_once() {
+        let started = std::time::Instant::now();
+        assert!(wait_for_parent_output(B256::with_last_byte(0xee), || true).is_none());
+        assert!(started.elapsed() < PARENT_WAIT / 10, "waited {:?}", started.elapsed());
     }
 }
