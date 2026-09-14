@@ -98,3 +98,22 @@ runs.
 | the QMDB delta per block repeats what the entry file and its active bits hold; the checkpoint grows a bit per slot ever written | encode + keccak over ~1.3 MB a block; periodic full rewrites | a log format change with a migration |
 | ~14 static-file fsyncs per save (two per segment) | device-dependent | reth's static-file writer; one sync per commit needs a change there |
 
+## 7. Fixed after the audit: the APoS beneficiary
+
+The QMDB read view's verify mode (stage 6b) showed the database and the QMDB forest disagreeing about one account
+on the APoS dev chain. The payload builder credits a block's fees to its signer (its coinbase), but the engine's
+execution credited the header's beneficiary, which on APoS is a signer-vote target (zero, or the proposed signer),
+and `validate_block[_operations]` returns an already-filed block's root without recomputing, so the forest kept the
+builder's execution while the database kept the engine's. An N42 fix for this (`b6c61af56`, recovering the signer
+in `evm_env_for_payload`) had been lost when the vendored EVM crate was unforked.
+
+`N42EvmConfig` (`crates/n42/engine-types/src/n42_evm.rs`) now credits the signer recovered from the Clique seal in
+`evm_env` and `evm_env_for_payload` on any chain whose genesis is not a HotStuff chain (checked once), falling back
+to the header's beneficiary when no seal recovers. HotStuff chains, the fleet included, are unchanged: their
+beneficiary is the leader's fee recipient on both sides. This is gov5's rule: `NewEVMBlockContext` (`N42-gov5/internal/evm.go`
+36-47) credits `engine.Author(header)`, which for APoS is the seal's `ecrecover` (`internal/consensus/apos/apos.go`
+245), and falls back to `header.Coinbase` only when that yields the zero address. The Rust node had drifted from it.
+The deferred-execution vectors (`crates/n42/n42-testing/testdata/deferred_execution_vectors.json`, Rust-only) change
+accordingly: the state roots of the blocks that carry a transfer, and the hashes and seals that follow from them. The end-to-end verify test now runs with tips: the signer
+is credited 21,000 gwei a block in the database, and 38 reads check with 0 mismatches.
+

@@ -48,7 +48,7 @@
 
 ## 模块5: ethereum/evm
 ### 定制内容:
-- `evm_env()` 中使用 `recover_address()` 获取 beneficiary
+- `evm_env()` 中使用 `recover_address()` 获取 beneficiary（已过时：该 fork 早已退回上游。2026-09-13 起此逻辑在 `crates/n42/engine-types/src/n42_evm.rs`：非 HotStuff 链执行区块时，`evm_env` 与 `evm_env_for_payload` 以 Clique 封签恢复出的签名者为 beneficiary，与出块器的 coinbase 一致；HotStuff 链沿用区块头 beneficiary）
 - `blob_max_and_target_count_by_hardfork()` 方法
 
 ## 模块6: node/builder

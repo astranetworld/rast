@@ -63,6 +63,8 @@ pub struct N42EvmConfig<C = ChainSpec, EvmF = crate::fast_transfer::N42EvmFactor
     pub block_assembler: EthBlockAssembler<C>,
     /// Cache of recovered senders, when the node keeps one.
     pub sender_recovery_cache: Option<SenderRecoveryCache>,
+    /// Whether the chain is a HotStuff chain, read from its genesis once.
+    hotstuff: std::sync::OnceLock<bool>,
 }
 
 impl<C, EvmF> N42EvmConfig<C, EvmF> {
@@ -72,12 +74,44 @@ impl<C, EvmF> N42EvmConfig<C, EvmF> {
             block_assembler: EthBlockAssembler::new(chain_spec.clone()),
             sender_recovery_cache: None,
             executor_factory: EthBlockExecutorFactory::new(N42ReceiptBuilder, chain_spec, evm_factory),
+            hotstuff: std::sync::OnceLock::new(),
         }
     }
 
     /// The chain spec.
     pub const fn chain_spec(&self) -> &Arc<C> {
         self.executor_factory.spec()
+    }
+
+    /// The beneficiary an executed block credits: on an APoS chain the signer
+    /// recovered from the header's Clique seal, the account the payload
+    /// builder credits (`payload.rs`, its coinbase); anywhere else, or when
+    /// no seal recovers, the header's beneficiary. An APoS header's
+    /// beneficiary is the target of a signer vote (zero, or the proposed
+    /// signer), never the fee recipient: executing with it credited the
+    /// block's fees to that address while the builder, whose execution the
+    /// QMDB forest keeps, had credited them to the signer.
+    fn block_beneficiary(&self, header: &Header) -> alloy_primitives::Address
+    where
+        C: EthChainSpec,
+    {
+        let hotstuff = *self
+            .hotstuff
+            .get_or_init(|| n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(self.chain_spec().genesis()).is_ok());
+        if hotstuff {
+            return header.beneficiary;
+        }
+        n42_clique_utils::recover_address(header).unwrap_or(header.beneficiary)
+    }
+
+    /// Whether blocks are credited to their signer (an APoS chain).
+    fn credits_signer(&self) -> bool
+    where
+        C: EthChainSpec,
+    {
+        !*self
+            .hotstuff
+            .get_or_init(|| n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(self.chain_spec().genesis()).is_ok())
     }
 
     /// Uses `cache` for sender recovery on import.
@@ -117,12 +151,14 @@ where
     }
 
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<SpecId>, Self::Error> {
-        Ok(EvmEnv::for_eth_block(
+        let mut env = EvmEnv::for_eth_block(
             header,
             self.chain_spec(),
             self.chain_spec().chain().id(),
             self.chain_spec().blob_params_at_timestamp(header.timestamp),
-        ))
+        );
+        env.block_env.beneficiary = self.block_beneficiary(header);
+        Ok(env)
     }
 
     fn next_evm_env(&self, parent: &Header, attributes: &NextBlockEnvAttributes) -> Result<EvmEnv, Self::Error> {
@@ -213,9 +249,23 @@ where
                 BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
             });
 
+        // On an APoS chain the payload's fee recipient is a vote target: the
+        // block credits its signer, recovered from the seal over the header
+        // the payload rebuilds (raw transactions, no decode).
+        let beneficiary = if self.credits_signer() {
+            payload
+                .payload
+                .clone()
+                .into_block_with_sidecar_raw(&payload.sidecar)
+                .ok()
+                .and_then(|block| n42_clique_utils::recover_address(&block.header).ok())
+                .unwrap_or_else(|| payload.payload.fee_recipient())
+        } else {
+            payload.payload.fee_recipient()
+        };
         let block_env = BlockEnv {
             number: U256::from(block_number),
-            beneficiary: payload.payload.fee_recipient(),
+            beneficiary,
             timestamp: U256::from(timestamp),
             difficulty: if spec >= SpecId::MERGE { U256::ZERO } else { payload.payload.as_v1().prev_randao.into() },
             prevrandao: (spec >= SpecId::MERGE).then(|| payload.payload.as_v1().prev_randao),

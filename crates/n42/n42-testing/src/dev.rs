@@ -1429,11 +1429,10 @@ async fn test_qmdb_chain__read_view_verifies_against_the_hashed_tables() -> eyre
             nonce: nonce as u64,
             gas_limit: 21_000,
             max_fee_per_gas: 10_000_000_000,
-            // No tip: on this APoS dev path the builder credits fees to the
-            // local signer while the engine's execution credits the header's
-            // beneficiary, and the forest keeps the builder's execution. A
-            // tip would test that divergence, not the read view.
-            max_priority_fee_per_gas: 0,
+            // A tip, so every block credits its signer: the builder and the
+            // engine's execution must credit the same account (the APoS
+            // beneficiary is the recovered signer on both sides).
+            max_priority_fee_per_gas: 1_000_000_000,
             to: alloy_primitives::TxKind::Call(Address::with_last_byte(0x70 + number as u8)),
             value: U256::from(1_000u64 * number),
             ..Default::default()
@@ -1459,16 +1458,14 @@ async fn test_qmdb_chain__read_view_verifies_against_the_hashed_tables() -> eyre
         let header = node.provider.latest_header()?.expect("a head");
         assert_eq!(header.number, number, "block {number} was not accepted");
         qmdb.on_canonical(header.hash())?;
-        // Diagnostics: who was paid, and what each store holds for it.
+        // Diagnostics: who was paid, and what the database holds for it.
         let head_state = reth_provider::StateProviderFactory::latest(&node.provider)?;
-        let persisted = reth_provider::BlockNumReader::best_block_number(&node.provider)?;
+        let signer = n42_clique_utils::recover_address(&header).ok();
         println!(
-            "block {number}: beneficiary={} gas_used={} persisted={persisted} head_state={:?} view_at_head={:?} view={:?}",
+            "block {number}: header beneficiary={} signer={signer:?} gas_used={} signer_account={:?}",
             header.beneficiary,
             header.gas_used,
-            reth_provider::AccountReader::basic_account(&head_state, &header.beneficiary)?,
-            qmdb.read_view().and_then(|v| { let h = v.head().0; v.account(&header.beneficiary, h) }),
-            qmdb.read_view().map(|v| v.head()),
+            signer.map(|s| reth_provider::AccountReader::basic_account(&head_state, &s)).transpose()?,
         );
     }
 

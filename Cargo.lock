@@ -7912,6 +7912,7 @@ dependencies = [
  "futures-util",
  "metrics",
  "n42-clique",
+ "n42-clique-utils",
  "n42-consensus-traits",
  "n42-engine-primitives",
  "n42-h2-consensus",
