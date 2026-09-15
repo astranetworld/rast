@@ -230,7 +230,7 @@ also requires the build to execute as the sealed block (`build_executes_as_seale
 gas limit, base fee, beacon root, transactions root and rewards equal). The seal changes only the view in the extra
 data, so this node's own blocks always pass; `a_sibling_on_the_same_parent_is_not_executed_as_the_build` covers it.
 
-### Defect 5: mined transactions in a new leader's block after a stalled handover (root cause found; fix untested)
+### Defect 5: mined transactions in a new leader's block after a stalled handover (fixed in e5d859d82)
 
 V3 (block 258), C4 (257) and V4 (130) broke down the same way, at a leader handover. All six followers' engines
 idle about eight seconds on `executed_insert` at the same millisecond; the view times out; the incoming leader
@@ -276,10 +276,57 @@ eight seconds and the view times out. Something on the execution layer's request
 for those seconds; the build-on-seal path's waits (`built_executions` waits up to 3 s per lookup) are the first
 place to look.
 
+**The first fix was not enough (loop158).** The iterator change above ran the kept block's transactions, and V5 and
+C5 still broke down (54 and 55 refused blocks): the fallback fired once in each, and the execution still came
+back with receipts 0 and gas 0. reth's `execute_block` takes `transaction_count = input.transaction_count()`,
+which for a payload is the payload's own list, and executes that many, whatever block the conversion returned
+and whatever the iterator can yield. That change was withdrawn.
+
+**The fix (e5d859d82).** The header-only own-block `newPayload` lists the block's transactions (encoded on the
+worker pool). When the executed insert landed, the engine answers from its tree without executing; when it was
+dropped, the execution is complete. The post-execution guard for an incomplete result names this cause and logs at
+error. One more consequence of the old path, now also gone: an incomplete result never recorded the block's
+receipts, so `executed_fields::get` stayed empty for it and its children's direct imports waited out their parent.
+
+**Confirmed on the fleet (loop159, six legs W V7 C7 B7 V8 C8).**
+
+| leg | win1 | round (M tx) | TC | refused blocks | incomplete executions |
+| --- | --- | --- | --- | --- | --- |
+| W | 303,920 | 9.13 | 6 | 0 | 0 |
+| V7 | 279,566 | 9.70 | 4 | 0 | 0 |
+| C7 | 271,535 | 19.40 | 4 | 0 | 0 |
+| B7 | 284,125 | 19.44 | 2 | 0 | 0 |
+| V8 | 287,715 | 13.68 | 1 | 0 | 0 |
+| C8 | 293,266 | 18.39 | 2 | 0 | 0 |
+
+In C8 the case that broke V5 and C5 happened: node4 re-proposed a sibling at block 257, its executed insert was
+dropped, and the engine executed the block itself (a fork-chain insert of 537 ms against 4 ms for an insert that
+lands) -- completely this time, with no refused block after it. The read view held through V7 and V8 (2,097,152
+and 1,048,576 reads verified, 0 mismatches). The own-block import did not get slower (14-31 ms).
+
+**Still open: the handover stall that starts it.** Every leg still has TCs at leader handovers, and W and V7 lost
+windows to them. What the logs show so far, on loop158 W's node4 (the node that lagged):
+
+- A commit's forkchoice never reached the execution layer for 6.5 s. Block 188's Decide came before its import;
+  the driver deferred the forkchoice to the import's landing (52.76 s), but the engine logged no forkchoice at all
+  until 59.30 s, for block 189. Meanwhile block 189's direct import waited for 188 to be canonical, gave up after
+  3 s, and went the engine's way (5.2 s), as did 190 (5.8 s): the node fell behind from there.
+- The driver's loop itself stood still: blocks whose bodies arrived at 55.5 s started importing at 59.3 s.
+- Catching up, the node started a build ahead for every block it imported (26 payload jobs in 3 s on node4, 27 on
+  B5's node5, 12 on V6's node4). The driver aborts the previous build's task, not the execution layer's job, and
+  every one of those builds stands on a parent the queue has already pruned past, so the parallel path refuses
+  nearly every transaction on its nonce and the serial loop does the rest (1.2-1.4 s each).
+- `--builder.interval 60` is read by reth as 60 seconds, so a job builds once and does not rebuild; the abandoned
+  jobs cost one build each, not a stream of them.
+
+The next step is the transport under the driver's calls (`h2-el-rpc` `EngineApiClient`: the forkchoice over
+JSON-RPC, the builds and imports over three mutex-guarded raw channels) and the driver loop's awaits, to find what
+held the forkchoice; then not starting builds ahead while the node is behind the committed chain.
+
 ## 10. Where the work stopped (2026-09-14)
 
-- main = feat/native-fleet7 at the docs commit that carries this section; the untested defect 5 fix is only on
-  the local branch `wip/header-only-payload-fix`.
+- (Updated 2026-09-15.) Defect 5 is fixed and confirmed on the fleet (e5d859d82, loop159); the local WIP branch
+  was withdrawn. The handover stall that starts it is the open item (see defect 5 above).
 - History from 2026-09-01 was rewritten twice to take assistant attribution out of commit messages and then to
   point eight messages at the rewritten hashes; the pre-rewrite refs are kept under `refs/backup/` and in bundles
   under `/data/blockchain/git-backup/`.
