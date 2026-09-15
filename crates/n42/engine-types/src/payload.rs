@@ -774,6 +774,10 @@ where
     // The transactions root, computed beside the graft for a block that
     // will seal early.
     let mut early_transactions_root: Option<B256> = None;
+    // `N42_DIRECT_RECEIPTS=1`: for a block that will seal early, the receipts and the gas the
+    // executor's finish reports, built beside the parallel step instead of one executor commit
+    // per transaction (see `direct_receipts_enabled`); taken by the finish behind the seal.
+    let mut direct_receipts: Option<(Vec<n42_tx_types::Receipt>, u64)> = None;
     let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     // What the seal-first path needs of the chain and the block, short of
     // the block being full (known after the parallel step).
@@ -833,25 +837,77 @@ where
                     let beneficiary = group_env.block_env.beneficiary;
                     par_collect_ms = run.phases.collect_ms;
                     let fold_at = std::time::Instant::now();
-                    // The receipts and the gas, one transfer at a time, with
-                    // no state to commit: the state comes in one piece below.
                     let executed_count = run.executed.len();
-                    for built in run.executed {
-                        let recovered = built.tx;
-                        let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
-                        total_fees += U256::from(tip) * U256::from(built.gas_used);
-                        cumulative_gas_used += built.gas_used;
-                        tx_count += 1;
-                        let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(recovered.inner());
-                        builder.executor.commit_transaction(alloy_evm::eth::EthTxResult {
-                            result: revm::context::result::ResultAndState {
-                                result: built.result,
-                                state: revm::state::EvmState::default(),
-                            },
-                            blob_gas_used: 0,
-                            tx_type,
-                        });
-                        builder.transactions.push(recovered);
+                    let executed_gas: u64 = run.executed.iter().map(|built| built.gas_used).sum();
+                    // This block seals early -- full or drained after this step,
+                    // with nothing committed before it -- so nothing executes on
+                    // this builder again: the executor's commit per transfer
+                    // (receipt, gas counters, a Cancun check and an empty state
+                    // commit, 53 ms a full block on the leader's serial chain,
+                    // loop165) only feeds the receipts and the gas its finish
+                    // reports. Both are built here on the worker pool instead and
+                    // handed to that finish; the executor commits none.
+                    let seals_early_here = seal_early_possible
+                        && block_blob_count == 0
+                        && executed_count > 0
+                        && cumulative_gas_used == 0
+                        && builder.transactions.is_empty()
+                        && (block_gas_limit.saturating_sub(executed_gas) < MIN_TRANSACTION_GAS || par_drained);
+                    if seals_early_here && direct_receipts_enabled() {
+                        use rayon::prelude::*;
+                        let mut cumulative = Vec::with_capacity(executed_count);
+                        let mut tx_gas = 0u64;
+                        for built in &run.executed {
+                            tx_gas += built.result.gas().tx_gas_used();
+                            cumulative.push(tx_gas);
+                        }
+                        total_fees += run
+                            .executed
+                            .par_iter()
+                            .map(|built| {
+                                let tip = built.tx.effective_tip_per_gas(base_fee).unwrap_or_default();
+                                U256::from(tip) * U256::from(built.gas_used)
+                            })
+                            .reduce(|| U256::ZERO, |a, b| a + b);
+                        let (transactions, receipts): (Vec<_>, Vec<_>) = run
+                            .executed
+                            .into_par_iter()
+                            .zip(cumulative.into_par_iter())
+                            .map(|(built, cumulative_gas_used)| {
+                                let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(built.tx.inner());
+                                let receipt = n42_tx_types::Receipt {
+                                    tx_type,
+                                    success: built.result.is_success(),
+                                    cumulative_gas_used,
+                                    logs: built.result.into_logs(),
+                                };
+                                (built.tx, receipt)
+                            })
+                            .unzip();
+                        cumulative_gas_used += executed_gas;
+                        tx_count += executed_count as u64;
+                        builder.transactions = transactions;
+                        direct_receipts = Some((receipts, tx_gas));
+                    } else {
+                        // The receipts and the gas, one transfer at a time, with
+                        // no state to commit: the state comes in one piece below.
+                        for built in run.executed {
+                            let recovered = built.tx;
+                            let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
+                            total_fees += U256::from(tip) * U256::from(built.gas_used);
+                            cumulative_gas_used += built.gas_used;
+                            tx_count += 1;
+                            let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(recovered.inner());
+                            builder.executor.commit_transaction(alloy_evm::eth::EthTxResult {
+                                result: revm::context::result::ResultAndState {
+                                    result: built.result,
+                                    state: revm::state::EvmState::default(),
+                                },
+                                blob_gas_used: 0,
+                                tx_type,
+                            });
+                            builder.transactions.push(recovered);
+                        }
                     }
                     // The batches' changes, grafted onto the block's state;
                     // the beneficiary, whom every batch credited from the
@@ -1050,10 +1106,17 @@ where
             // when consensus commits it, and the error is loud.
             let behind_the_seal = || -> Result<(), PayloadBuilderError> {
             let finish_at = std::time::Instant::now();
-            let (evm, execution_result) = builder
+            let (evm, mut execution_result) = builder
                 .executor
                 .finish()
                 .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+            // Receipts built beside the parallel step: the executor committed
+            // none, so its finish reports none and no gas.
+            let direct_receipts_used = direct_receipts.is_some();
+            if let Some((receipts, gas_used)) = direct_receipts {
+                execution_result.receipts = receipts;
+                execution_result.gas_used = gas_used;
+            }
             let (db, _evm_env) = reth_evm::Evm::finish(evm);
             db.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
             let merge_ms = finish_at.elapsed().as_millis() as u64;
@@ -1160,6 +1223,7 @@ where
                     par_exec_ms,
                     par_collect_ms,
                     par_commit_ms,
+                    direct_receipts = direct_receipts_used,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,
@@ -1189,6 +1253,13 @@ where
         }
         // Not sealable early: the hook goes unused and the caller waits for
         // the ordinary outcome.
+    }
+    // Receipts built for an early seal belong to its finish; this block's
+    // executor committed none of those transactions, so it must not go on.
+    if direct_receipts.is_some() {
+        return Err(PayloadBuilderError::other(std::io::Error::other(
+            "receipts were built for an early seal that did not happen",
+        )));
     }
 
     loop {
@@ -1822,6 +1893,14 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
 fn build_graft_no_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_BUILD_GRAFT_NO_CACHE").is_ok_and(|v| v == "1"))
+}
+
+/// Whether a block that will seal early builds its receipts beside the parallel step
+/// (`N42_DIRECT_RECEIPTS=1`) instead of one executor commit per transfer. Off until a fleet leg
+/// measures it.
+fn direct_receipts_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_DIRECT_RECEIPTS").is_ok_and(|v| v == "1"))
 }
 
 fn parallel_build() -> bool {
