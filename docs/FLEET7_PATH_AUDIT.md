@@ -411,10 +411,49 @@ pass beside it is gone), persistence saved more often at a lower cost each, and 
 slower. Before a node can run with it outside a bench leg, an unwind and a restart must stop invalidating or
 emptying the read view (`docs/QMDB_UPGRADE_PLAN.md`, stage 6c).
 
+### What binds the round after 6c (loop166-169)
+
+With defects 5-9 fixed and the tables off, the round sits at ~22.8M transactions and window 1 at ~320-325k. Three
+rounds went into finding what holds it there.
+
+**The leader's profile (loop166-167).** loop166's seven concurrent `perf record` sessions all wrote 0 bytes: on 256
+CPUs each session's ring buffers need more than the 8 MB memlock limit, so profiles run one process at a time. loop167
+profiled the leader (node2) alone. Ed25519 verification with its SHA-512 took 39% of the node's samples and keccak 9%,
+both on tokio runtime threads (the ingest of the flood). The build and import threads were a small share. Frame-pointer
+call graphs on this build attribute inclusive time wrongly, so only self samples and the code's own phase timers are
+used.
+
+**Supply-side verification (43c4b1c83, loop168).** The flood's ingest frames are runs of 500 nonces from one sender. A
+batch equation that sums each key's A terms keeps dalek's transcript, the order of its z coefficients and its verdict,
+and takes one-sender batches from 11.4 to 7.7 µs a signature; mixed batches are unchanged (`N42_ED25519_MERGE=0` goes
+back to dalek's equation). loop168 ran it against the unmerged equation in three pairs (reads on, tables off). It cut
+the ingest's recover time from 23 to 17 µs and its busy time from 21 to 13-14 µs a transaction, and the follower
+check's p50 from 169-201 to 162-167 ms. The round did not move: 22.78M / 319k unmerged, 22.64M / 325k merged, the
+means of three legs each. The merge stays on, but verification CPU is not the constraint.
+
+**The follower's check before the vote (loop169).** `N42_CHECK_ON_PARENT_OUTPUT=1` cut the check's p50 from 152-196 to
+140-147 ms with 0 invalid blocks. The round went from 22.84 to 22.99M and window 1 from 325.2k to 325.5k, both noise.
+The vote does not bind either.
+
+**What remains is the leader's serial chain.** The leader seals at ~293 ms. Its fold then takes 123-139 ms (median):
+the receipts loop is ~53 ms and the graft of the per-sender bundles onto the block state is ~70 ms. The next build
+waits for that grafted post-state. Moving the whole fold behind the seal buys nothing for that reason. The two cuts
+worth measuring:
+
+- Build the receipts in parallel from the batches' results instead of through `commit_transaction`
+  (`N42_DIRECT_RECEIPTS=1`, uncommitted, waiting for a quiet box).
+- Make the graft cheaper: senders never repeat across batches, while recipients and the beneficiary do.
+
+**CI's Test step (7328976f9).** Test died at exit 143 because the integration tests never shut their nodes down. Each
+node allocates reth's fixed-capacity cross-block cache (4 GB by default) at start, so the ninth test ran out of a
+runner's 16 GB. The harness now caps the cache at 64 MB and the whole suite peaks at 4.7 GB locally. CI shows it once
+the branch reaches main.
+
 ## 10. Where the work stopped (2026-09-15)
 
 - Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,
-  loop163, loop165). Stage 6c's hashed-tables-off experiment holds and adds 6.5% a round (above). Next on the path to
+  loop163, loop165). Stage 6c's hashed-tables-off experiment holds and adds 6.5% a round (above). Neither supply-side
+  verification (loop168) nor the follower's check before the vote (loop169) binds the round. Next on the path to
   1M: the leader's fold (123-139 ms median: the receipts loop ~53 ms and the graft ~70 ms), then the production
   prerequisites of the tables off. Also seen, not yet chased: 3-12 commit forkchoices a leg answered Valid after
   500 ms or more, without a stall. Defect 3 (an invalid block after a hang, a TC and a reorg) has not recurred since
@@ -422,7 +461,5 @@ emptying the read view (`docs/QMDB_UPGRADE_PLAN.md`, stage 6c).
 - History from 2026-09-01 was rewritten twice to take assistant attribution out of commit messages and then to
   point eight messages at the rewritten hashes; the pre-rewrite refs are kept under `refs/backup/` and in bundles
   under `/data/blockchain/git-backup/`.
-- CI: Clippy passes. Test still dies about seven minutes into its run with exit 143 even with the runner's disk
-  freed and debug info off. Locally every test passes in 1-2 s at no more than 2.6 GB under a runner's limits, so
-  the build is the suspect; the reproduction under 4 CPUs and 16 GB (`taskset` + `CARGO_BUILD_JOBS=4`, not a
-  user scope's `AllowedCPUs`, which this box does not honour) has not run yet.
+- CI: Clippy passes. Test's exit 143 was the test nodes' 4 GB cross-block caches, not the build (fixed in 7328976f9,
+  above); CI confirms it once the branch is merged to main.
