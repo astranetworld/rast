@@ -257,6 +257,19 @@ impl AheadBuild {
     }
 }
 
+/// Takes an own block off [`ExecutionDriver::is_importing_own_block`]'s set
+/// when its import task ends, however it ends.
+struct OwnImportDone {
+    importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
+    hash: B256,
+}
+
+impl Drop for OwnImportDone {
+    fn drop(&mut self) {
+        self.importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.hash);
+    }
+}
+
 /// Drives an [`ExecutionLayer`] on behalf of the consensus engine.
 #[derive(Debug)]
 pub struct ExecutionDriver<E> {
@@ -276,6 +289,9 @@ pub struct ExecutionDriver<E> {
     own_imports: tokio::sync::mpsc::UnboundedSender<B256>,
     /// The receiving end, until the loop takes it.
     own_imports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<B256>>,
+    /// This node's own blocks whose import task has not ended. See
+    /// [`Self::is_importing_own_block`].
+    own_importing: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>>,
     /// **Bench only** (`N42_VOTE_BEFORE_IMPORT=1`): a follower's import runs
     /// on a task instead of being awaited by the loop, so the loop can vote
     /// on the next proposal while the block executes -- what deferred
@@ -342,6 +358,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             prepared: None,
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
+            own_importing: Default::default(),
             spawn_imports: false,
             deferred_execution_time: None,
             foreign_imports: foreign_tx,
@@ -785,7 +802,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let header = built.header.clone();
         let hash = built.hash;
         let imported = self.own_imports.clone();
+        self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
+        let done = OwnImportDone { importing: std::sync::Arc::clone(&self.own_importing), hash };
         tokio::spawn(async move {
+            let _done = done;
             let started = std::time::Instant::now();
             match el.import_own_block(header.as_ref(), payload).await {
                 Ok(status) => {
@@ -821,6 +841,18 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         if let Some(prepared) = self.prepared.take() {
             prepared.discard();
         }
+    }
+
+    /// Whether this node's own block `block_hash` is still on its way into the
+    /// execution layer ([`Self::spawn_import_own_block`]). A leader whose next
+    /// proposal builds on it is answered SYNCING until it lands, and asks again
+    /// then instead of losing the view (loop162 C13: view 276 timed out after
+    /// "could not build a block to propose" while the parent's own import was
+    /// still landing). Kept apart from [`Self::is_importing`] on purpose: a
+    /// commit for a block counted there waits for a follower import's report,
+    /// which an own import never sends.
+    pub fn is_importing_own_block(&self, block_hash: &B256) -> bool {
+        self.own_importing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(block_hash)
     }
 
     /// The channel [`Self::spawn_import_own_block`] reports on, once.

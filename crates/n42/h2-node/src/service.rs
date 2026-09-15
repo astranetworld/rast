@@ -1894,7 +1894,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // "forkchoiceUpdated returned no payload id (status Syncing)"
                 // at every tenure boundary, then a full view timeout). Ask
                 // again once it lands, as with a declined attribute builder.
-                if self.driver.is_importing(&head) {
+                // The parent may also be this leader's own block, whose import
+                // runs on a task the follower set does not count (loop162 C13:
+                // view 276 lost that way in the middle of a tenure).
+                if self.driver.is_importing(&head) || self.driver.is_importing_own_block(&head) {
                     info!(target: "n42.h2.node", %err, view, parent = ?head, "the parent is still importing; proposing once it lands");
                     self.proposed_view = None;
                     self.proposal_deferred = true;

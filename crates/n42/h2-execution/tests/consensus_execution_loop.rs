@@ -85,6 +85,28 @@ async fn leader_builds_a_block_and_can_serve_its_own_execute_request() {
     assert_eq!(action.imported_block(), Some(built.hash));
 }
 
+/// A leader's own block counts as importing until its import task ends, so a
+/// proposal that builds on it asks again instead of losing the view (loop162
+/// C13), and it never counts as a follower import, whose commits wait for a
+/// report an own import does not send.
+#[tokio::test]
+async fn an_own_block_counts_as_importing_until_its_import_ends() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let built = driver.build_block(attrs(), 1).await.unwrap();
+    assert!(!driver.is_importing_own_block(&built.hash));
+
+    driver.spawn_import_own_block(&built);
+    assert!(driver.is_importing_own_block(&built.hash), "counted from the moment the import is started");
+    assert!(!driver.is_importing(&built.hash), "not a follower import");
+
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!driver.is_importing_own_block(&built.hash), "off the set once the import has ended");
+    assert!(el.calls().iter().any(|c| matches!(c, ElCall::NewPayload(_))));
+}
+
 #[tokio::test]
 async fn follower_votes_only_after_its_own_execution_layer_accepts() {
     let el = MockExecutionLayer::new();
