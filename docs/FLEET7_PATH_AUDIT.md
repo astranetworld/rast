@@ -380,11 +380,44 @@ counts follower imports, not the leader's own import on its task. The driver now
 (`is_importing_own_block`), and the proposal retries on either. It is kept out of `is_importing` on purpose: a commit
 for a block counted there waits for a follower import's report, which an own import never sends.
 
+### Defect 9: a follower's import deadlocked on the QMDB forest inside the worker pool (fixed in bdb8a802e)
+
+loop164 O17 and T17 stopped the chain at a new leader's tenure (node3 at view 192, node4 at view 256): the leader's
+import of its parent stuck at the "hashed-state" stage and its build ahead at "finishing" for the rest of the leg,
+the watchdog repeating every 6 s, every rayon and engine thread asleep in the sampler, and the leader asking again
+for a parent that never landed until the round ended (9.6M transactions instead of ~22M). The import ran its QMDB root
+and hashed post-state with `rayon::join`, so the root job was a rayon job holding the forest's mutex while the forest's
+hashing waited on the pool; a worker that waits steals other jobs, and with two imports in flight (or a build's
+assembly beside one) the other root job, which needs the same mutex, landed on a thread that could never get it. The
+assembler's root has run on a thread of its own for exactly this since loop113. The import's root now does the same,
+with the hashed post-state on the calling thread. loop165, six legs: no import stuck, one TC a leg (start-up).
+
+### Stage 6c on the fleet: the hashed tables off (loop164-165)
+
+`N42_HASHED_TABLES=off` (96b52c19a) ran on all seven nodes in four legs with 0 unanswered reads, 0 gas-used
+mismatches and 0 invalid blocks; the QMDB reader answered at least 4,194,304 reads a node with 0 declines. Against
+`on` legs with the tables written, alternated in the same loop:
+
+| pair | round (M tx) on / off | win1 on / off | win2 on / off | win3 on / off |
+| --- | --- | --- | --- | --- |
+| loop164 O16 / T16 | 21.82 / 22.82 | 314,076 / 325,919 | 227,747 / 249,753 | 184,634 / 184,653 |
+| loop165 O18 / T18 | 21.20 / 23.31 | 310,061 / 336,733 | 222,651 / 249,832 | 173,679 / 190,122 |
+| loop165 O19 / T19 | 21.40 / 22.65 | 321,120 / 320,244 | 206,002 / 222,658 | 184,602 / 211,806 |
+| loop165 O20 / T20 | 21.66 / 22.49 | 319,689 / 304,163 | 222,681 / 233,526 | 179,222 / 211,807 |
+
+Every pair's round is larger with the tables off (loop165 mean +6.5%), the gain sitting in windows 2 and 3 (+8%, +14%)
+while window 1 is unchanged within its noise. The follower's root phase fell from 45-48 to 32-36 ms (the hashed
+pass beside it is gone), persistence saved more often at a lower cost each, and the follower's execution was 0-15 ms
+slower. Before a node can run with it outside a bench leg, an unwind and a restart must stop invalidating or
+emptying the read view (`docs/QMDB_UPGRADE_PLAN.md`, stage 6c).
+
 ## 10. Where the work stopped (2026-09-15)
 
-- Defects 5-7 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5; loop159, loop162). Defect 8's fix is
-  written and unit-tested; loop163 (W V14 O14 C14 O15) confirms it and runs the QMDB plan's stage 6c
-  `N42_QMDB_READS=on` legs. Defect 3 (an invalid block after a hang, a TC and a reorg) has not recurred since
+- Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,
+  loop163, loop165). Stage 6c's hashed-tables-off experiment holds and adds 6.5% a round (above). Next on the path to
+  1M: the leader's fold (123-139 ms median: the receipts loop ~53 ms and the graft ~70 ms), then the production
+  prerequisites of the tables off. Also seen, not yet chased: 3-12 commit forkchoices a leg answered Valid after
+  500 ms or more, without a stall. Defect 3 (an invalid block after a hang, a TC and a reorg) has not recurred since
   defect 5's fix; the C9 one-off (node6's state root for an empty block 79) is not explained.
 - History from 2026-09-01 was rewritten twice to take assistant attribution out of commit messages and then to
   point eight messages at the rewritten hashes; the pre-rewrite refs are kept under `refs/backup/` and in bundles
