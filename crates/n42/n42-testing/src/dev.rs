@@ -61,6 +61,13 @@ pub struct CliqueTest {
 }
 
 #[cfg(test)]
+/// A test node's cross-block execution cache, in megabytes. reth's default is 4,096 MB and the cache
+/// is allocated whole when a node starts (a fixed-capacity table); a test's node is not shut down
+/// before the next test starts its own, so nine tests in one process filled a CI runner's 16 GB
+/// within three seconds -- the kernel killed the test binary and the job lost its runner (exit 143).
+/// The fleet runs with 128 MB; a dev chain needs far less.
+const TEST_CROSS_BLOCK_CACHE_MB: usize = 64;
+
 fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
     let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) / Address::len_bytes();
 
@@ -351,7 +358,7 @@ impl CliqueTest {
         let mut accounts = TesterAccountPool::new();
         let chainspec = self.gen_chainspec(&mut accounts);
 
-        let node_config = NodeConfig::new(Arc::new(chainspec))
+        let mut node_config = NodeConfig::new(Arc::new(chainspec))
             .with_network(network_config.clone())
             .with_unused_ports()
             .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
@@ -360,6 +367,7 @@ impl CliqueTest {
                 consensus_signer_private_key: Some(B256::random().to_string()),
                 ..Default::default()
             });
+        node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
 
         let capturing_consensus = CapturingConsensusBuilder::default();
         let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
@@ -1399,6 +1407,7 @@ async fn test_qmdb_chain__read_view_verifies_against_the_hashed_tables() -> eyre
             ..Default::default()
         });
     node_config.engine.persistence_threshold = 0;
+    node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));
     let NodeHandle { node, .. } = NodeBuilder::new(node_config)
@@ -1551,7 +1560,7 @@ async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::
     let _ = std::fs::remove_dir_all(&dir);
     let qmdb = QmdbNodeState::new(chainspec.clone(), &dir);
 
-    let node_config = NodeConfig::new(chainspec.clone())
+    let mut node_config = NodeConfig::new(chainspec.clone())
         .with_network(NetworkArgs {
             discovery: DiscoveryArgs {
                 disable_discovery: true,
@@ -1566,6 +1575,7 @@ async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::
             consensus_signer_private_key: Some(B256::random().to_string()),
             ..Default::default()
         });
+    node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
 
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));
@@ -1730,7 +1740,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
     let _ = std::fs::remove_dir_all(&dir);
     let qmdb = QmdbNodeState::new(chainspec.clone(), &dir);
 
-    let node_config = NodeConfig::new(chainspec.clone())
+    let mut node_config = NodeConfig::new(chainspec.clone())
         .with_network(NetworkArgs {
             discovery: DiscoveryArgs {
                 disable_discovery: true,
@@ -1745,6 +1755,7 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
             consensus_signer_private_key: Some(B256::random().to_string()),
             ..Default::default()
         });
+    node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
 
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));
@@ -1974,7 +1985,7 @@ async fn test_altsig_transfer__is_mined_and_typed_0x50() -> eyre::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     let qmdb = QmdbNodeState::new(chainspec.clone(), &dir);
 
-    let node_config = NodeConfig::new(chainspec.clone())
+    let mut node_config = NodeConfig::new(chainspec.clone())
         .with_network(NetworkArgs {
             discovery: DiscoveryArgs {
                 disable_discovery: true,
@@ -1989,6 +2000,7 @@ async fn test_altsig_transfer__is_mined_and_typed_0x50() -> eyre::Result<()> {
             consensus_signer_private_key: Some(B256::random().to_string()),
             ..Default::default()
         });
+    node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
 
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));

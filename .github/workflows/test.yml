@@ -36,9 +36,10 @@ jobs:
     - name: Run tests
       # One test at a time: every test starts a node in this process, and 27
       # of them at once exhaust a hosted runner (the job lost its runner).
-      # Locally, under a runner's 16 GB and 4 CPUs, every test takes 1-2 s and at
-      # most 2.6 GB; a job that dies minutes into this step is out of disk or
-      # memory in the build, which the step below reports.
+      # A test's node is not shut down before the next one starts, so each
+      # test's memory stays: under a runner's 16 GB and 4 CPUs the step used to
+      # be OOM-killed at the ninth test (reth's 4 GB cross-block cache per node;
+      # the harness caps it at 64 MB, and the whole run peaks at ~4.7 GB).
       run: cargo test -p n42-testing -- --test-threads=1
     - name: Runner resources
       if: always()
