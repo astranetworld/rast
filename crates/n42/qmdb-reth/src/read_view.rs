@@ -12,14 +12,18 @@
 //! - a key -> record-offset index at the view's head H, the records read through its own mapping
 //!   of the entry file (records never change once appended);
 //! - for each of the last [`JOURNAL_DEPTH`] blocks up to H, the offset each of its keys held
-//!   before it, so a reader whose F is behind H undoes those blocks for its key;
+//!   before it and the file length the view read before it, so a reader whose F is behind H
+//!   undoes those blocks for its key, and the view itself can step back through them;
 //! - a block being applied publishes its journal before the index changes, so no reader at or
 //!   below H sees a half-applied block.
 //!
-//! It moves as the database persists (`QmdbNodeState::on_persisted`), declines what it cannot
-//! answer exactly (a reader ahead of it, or further behind than its journals), and is invalidated
-//! for good when the tree cuts records it may read (a revert below its head, told through
-//! [`TruncationGuard`]) or when a persisted block is not the one it holds.
+//! It moves as the database persists (`QmdbNodeState::on_persisted`) and declines what it cannot
+//! answer exactly (a reader ahead of it, or further behind than its journals). When the database
+//! unwinds below H, or the tree is about to cut records the view reads (a revert below H, told
+//! through [`TruncationGuard`] before the cut), the view steps back through its journals to the
+//! newest block whose records survive -- the index is rewritten while every record it compares
+//! is still in the file. It is invalidated for good only when the journals do not reach that
+//! far, or when a persisted block is not the one it holds.
 
 use std::{
     collections::VecDeque,
@@ -38,7 +42,7 @@ use n42_twig_core::{
 };
 use rayon::prelude::*;
 use reth_primitives_traits::Account;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// How many blocks behind its head the view answers for.
 pub const JOURNAL_DEPTH: usize = 64;
@@ -46,12 +50,26 @@ pub const JOURNAL_DEPTH: usize = 64;
 /// For one block, sorted by key: the offset of each key's live record before the block.
 type Journal = Arc<Vec<(Hash, Option<u64>)>>;
 
+/// One block the view advanced by.
+#[derive(Debug)]
+struct Step {
+    number: u64,
+    hash: B256,
+    journal: Journal,
+    /// The entry-file bytes the view read before this block.
+    floor_before: u64,
+}
+
 #[derive(Debug)]
 struct Versions {
     valid: bool,
+    /// The head's hash is `B256::ZERO` when the view stepped back past its oldest journal's
+    /// block and no longer knows it.
     head: (u64, B256),
+    /// The entry-file bytes the view reads at its head.
+    head_floor: u64,
     /// Blocks `head - len + 1 ..= head`, oldest first.
-    journals: VecDeque<(u64, B256, Journal)>,
+    journals: VecDeque<Step>,
     /// The block whose index writes may be in flight (the head's child).
     pending: Option<Journal>,
 }
@@ -71,14 +89,26 @@ pub enum Position {
     Invalid,
 }
 
+/// What [`QmdbReadView::raise_floor`] hands to [`QmdbReadView::advance`]: the file length the
+/// block's records end at, and the tree's cuts counted when the floor went up -- a cut in
+/// between may have taken the block's records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Raised {
+    floor: u64,
+    cuts: u64,
+}
+
 /// The read view: see the module documentation.
 pub struct QmdbReadView {
     file: EntryFileView,
     index: SharedOffsetIndex,
     versions: RwLock<Versions>,
-    /// Bytes of the entry file the view may read: past its newest block's last record.
+    /// Bytes of the entry file the view may read: past its newest block's last record,
+    /// including a block whose floor was raised and that has not advanced yet.
     floor: AtomicU64,
-    /// Advances one at a time.
+    /// Cuts below `floor` the tree announced.
+    cuts: AtomicU64,
+    /// Advances and steps back one at a time.
     advancing: Mutex<()>,
 }
 
@@ -140,8 +170,15 @@ impl QmdbReadView {
         Ok(Arc::new(Self {
             file,
             index,
-            versions: RwLock::new(Versions { valid: true, head, journals: VecDeque::new(), pending: None }),
+            versions: RwLock::new(Versions {
+                valid: true,
+                head,
+                head_floor: floor,
+                journals: VecDeque::new(),
+                pending: None,
+            }),
             floor: AtomicU64::new(floor),
+            cuts: AtomicU64::new(0),
             advancing: Mutex::new(()),
         }))
     }
@@ -182,7 +219,7 @@ impl QmdbReadView {
             .journals
             .iter()
             .skip(versions.journals.len() - behind)
-            .map(|(_, _, journal)| journal)
+            .map(|step| &step.journal)
             .chain(versions.pending.iter())
             .find_map(|journal| journal.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| journal[i].1));
         let offset = match undone {
@@ -223,10 +260,10 @@ impl QmdbReadView {
         } else if number > head.0 + 1 {
             Position::Gap
         } else if number == head.0 {
-            if hash == head.1 { Position::Held } else { Position::Mismatch }
+            if hash == head.1 || head.1 == B256::ZERO { Position::Held } else { Position::Mismatch }
         } else {
-            match versions.journals.iter().find(|(n, _, _)| *n == number) {
-                Some((_, held, _)) if *held != hash => Position::Mismatch,
+            match versions.journals.iter().find(|step| step.number == number) {
+                Some(step) if step.hash != hash => Position::Mismatch,
                 _ => Position::Held,
             }
         }
@@ -234,26 +271,33 @@ impl QmdbReadView {
 
     /// Raises the floor past the records `changes` names. Called under the
     /// forest's lock, before the lock that could let the tree cut them is
-    /// released.
-    pub fn raise_floor(&self, changes: &[(Hash, Option<u64>)]) {
-        if let Some(offset) = changes.iter().filter_map(|(_, offset)| *offset).max() {
-            self.floor.fetch_max(record_end(&self.file, offset), Ordering::SeqCst);
-        }
+    /// released; the result goes to [`Self::advance`].
+    pub fn raise_floor(&self, changes: &[(Hash, Option<u64>)]) -> Raised {
+        let floor = changes.iter().filter_map(|(_, offset)| *offset).max().map_or(0, |offset| record_end(&self.file, offset));
+        self.floor.fetch_max(floor, Ordering::SeqCst);
+        Raised { floor, cuts: self.cuts.load(Ordering::SeqCst) }
     }
 
     /// Moves the view to its head's child `number`, whose `changes` (sorted by
     /// key: the appended record's offset, or `None` for a deletion) are
-    /// flushed to the file and covered by [`Self::raise_floor`].
-    pub fn advance(&self, number: u64, hash: B256, changes: &[(Hash, Option<u64>)]) {
+    /// flushed to the file and covered by [`Self::raise_floor`], which gave `raised`.
+    pub fn advance(&self, number: u64, hash: B256, changes: &[(Hash, Option<u64>)], raised: Raised) {
         let _one = self.advancing.lock().unwrap_or_else(PoisonError::into_inner);
         {
             let versions = self.versions.read().unwrap_or_else(PoisonError::into_inner);
             if !versions.valid {
                 return;
             }
-            if number != versions.head.0 + 1 {
+            let why = if number != versions.head.0 + 1 {
+                Some("advanced to a block that is not the head's child")
+            } else if self.cuts.load(Ordering::SeqCst) != raised.cuts {
+                Some("the tree cut records between a block's floor and its advance")
+            } else {
+                None
+            };
+            if let Some(why) = why {
                 drop(versions);
-                self.invalidate("advanced to a block that is not the head's child");
+                self.invalidate(why);
                 return;
             }
         }
@@ -265,16 +309,74 @@ impl QmdbReadView {
         self.index.apply_sorted(changes, key_at);
         let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
         versions.pending = None;
-        versions.journals.push_back((number, hash, journal));
+        let floor_before = versions.head_floor;
+        versions.journals.push_back(Step { number, hash, journal, floor_before });
         versions.head = (number, hash);
+        versions.head_floor = floor_before.max(raised.floor);
         while versions.journals.len() > JOURNAL_DEPTH {
             versions.journals.pop_front();
         }
     }
 
+    /// Steps the view back to block `number` (the database unwound the state
+    /// above it). Returns whether the view is valid at or below `number`
+    /// afterwards; a view whose journals do not reach that far is invalidated.
+    pub fn revert_to(&self, number: u64) -> bool {
+        let _one = self.advancing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        if !versions.valid {
+            return false;
+        }
+        if self.step_back(&mut versions, number) {
+            return true;
+        }
+        Self::invalidate_locked(&mut versions, "the database unwound below the view's journals");
+        false
+    }
+
+    /// Undoes the journals above `number`, newest first, one key at a time
+    /// (the caller may hold the forest's lock: no work goes to the worker pool,
+    /// whose threads could take that lock while this one waits). Every offset
+    /// the index compares is the view's own, below its floor, so still in the
+    /// file. Callers hold `advancing` and the versions lock.
+    fn step_back(&self, versions: &mut Versions, number: u64) -> bool {
+        if number >= versions.head.0 {
+            return true;
+        }
+        let depth = (versions.head.0 - number) as usize;
+        if depth > versions.journals.len() {
+            return false;
+        }
+        let key_at = |offset: u64| self.file.key(offset);
+        let from = versions.head.0;
+        for _ in 0..depth {
+            let step = versions.journals.pop_back().expect("depth checked against the journals");
+            for (key, before) in step.journal.iter() {
+                match before {
+                    Some(offset) => {
+                        self.index.insert(*key, *offset, key_at);
+                    }
+                    None => {
+                        self.index.remove(key, key_at);
+                    }
+                }
+            }
+            versions.head_floor = step.floor_before;
+        }
+        let hash = versions.journals.back().map_or(B256::ZERO, |step| step.hash);
+        versions.head = (number, hash);
+        self.floor.store(versions.head_floor, Ordering::SeqCst);
+        info!(target: "n42.qmdb", from, to = number, journals = versions.journals.len(), "the QMDB read view stepped back");
+        true
+    }
+
     /// Stops the view answering, for good.
     pub fn invalidate(&self, why: &str) {
         let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        Self::invalidate_locked(&mut versions, why);
+    }
+
+    fn invalidate_locked(versions: &mut Versions, why: &str) {
         if versions.valid {
             versions.valid = false;
             warn!(target: "n42.qmdb", why, head = versions.head.0, "the QMDB read view is invalidated; state reads go to the database");
@@ -283,9 +385,25 @@ impl QmdbReadView {
 }
 
 impl TruncationGuard for QmdbReadView {
+    /// The tree is about to cut the entry file to `new_len`. Records the view
+    /// reads at its head are among them only when the tree reverts below the
+    /// head: the view steps back to the newest block whose records all lie
+    /// below `new_len`, before they go. A block whose floor was raised and has
+    /// not advanced is caught by the cut count ([`Raised`]).
     fn before_truncate(&self, new_len: u64) {
-        if new_len < self.floor.load(Ordering::SeqCst) {
-            self.invalidate("the tree cuts entry-file records the view reads");
+        if new_len >= self.floor.load(Ordering::SeqCst) {
+            return;
+        }
+        let _one = self.advancing.lock().unwrap_or_else(PoisonError::into_inner);
+        self.cuts.fetch_add(1, Ordering::SeqCst);
+        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        if !versions.valid || versions.head_floor <= new_len {
+            return;
+        }
+        let target = versions.journals.iter().rev().find(|step| step.floor_before <= new_len).map(|step| step.number - 1);
+        match target {
+            Some(number) if self.step_back(&mut versions, number) => {}
+            _ => Self::invalidate_locked(&mut versions, "the tree cuts entry-file records older than the view's journals"),
         }
     }
 }

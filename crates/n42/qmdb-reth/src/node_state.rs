@@ -431,15 +431,14 @@ impl QmdbNodeState {
                 Position::Next => {
                     let changes = self.with_forest(|forest| {
                         forest.flush_entries_for_sync()?;
-                        let changes = forest.block_changes(&hash);
-                        if let Some(changes) = &changes {
-                            view.raise_floor(changes);
+                        Ok(forest.block_changes(&hash).map(|changes| {
+                            let raised = view.raise_floor(&changes);
                             forest.set_keep_from(Some(number + 1));
-                        }
-                        Ok(changes)
+                            (changes, raised)
+                        }))
                     });
                     match changes {
-                        Ok(Some(changes)) => view.advance(number, hash, &changes),
+                        Ok(Some((changes, raised))) => view.advance(number, hash, &changes, raised),
                         Ok(None) => {
                             view.invalidate("a persisted block's changes are not on the tree's path");
                             return self.release_reader_records();
@@ -451,6 +450,24 @@ impl QmdbNodeState {
                     }
                 }
             }
+        }
+    }
+
+    /// The database unwound the state above `number`: the read view steps
+    /// back through its journals to it, and the forest keeps the records of
+    /// the blocks after it for the view's next advances.
+    pub fn on_unwound(&self, number: u64) {
+        let Some(view) = self.inner.read_view.get() else { return };
+        if view.head().0 <= number {
+            return;
+        }
+        if view.revert_to(number) {
+            let _ = self.with_forest(|forest| {
+                forest.set_keep_from(Some(number + 1));
+                Ok(())
+            });
+        } else {
+            self.release_reader_records();
         }
     }
 
@@ -2080,10 +2097,15 @@ mod tests {
         assert!(view.is_valid(), "the tree cut only records above the view");
         check(&worlds, 27);
 
-        // A computation on block 26 reverts persisted block 27 on the tree.
+        // A computation on block 26 reverts persisted block 27 on the tree: the
+        // view steps back to 26 before the cut instead of being invalidated.
         state.compute(hashes[26], &BlockChanges::new()).unwrap();
-        assert!(!view.is_valid(), "records the view reads were cut");
-        assert_eq!(view.account(&addresses[0], 27), None);
+        assert!(view.is_valid(), "the view stepped back through its journals");
+        assert_eq!(view.head(), (26, hashes[26]));
+        for at in 24..=26 {
+            check(&worlds, at);
+        }
+        assert_eq!(view.account(&addresses[0], 27), None, "above the view's head");
     }
 
     /// A database persisting further behind the head than the forest's
@@ -2135,5 +2157,99 @@ mod tests {
         let persisted: Vec<(u64, B256)> = (41..=110).map(|n| (n as u64, hashes[n])).collect();
         state.on_persisted(&persisted);
         assert!(!view.is_valid(), "a database further behind than the cap invalidates the view");
+    }
+
+    /// The database unwinding below the view's head steps the view back
+    /// through its journals instead of invalidating it, and the view follows
+    /// the new branch after; so does a revert the tree makes before the
+    /// database unwinds. A cut between a block's floor and its advance still
+    /// invalidates the view.
+    #[test]
+    fn the_read_view_steps_back_through_its_journals() {
+        use alloy_primitives::{keccak256, Address, KECCAK256_EMPTY, U256};
+        use n42_qmdb_state::AccountState;
+        use reth_primitives_traits::Account;
+
+        let chain = qmdb_chain();
+        let state = QmdbNodeState::new_with_entry_file(chain.clone(), scratch("read-view-step-back"), true);
+        state.set_read_view_wanted(true);
+        state.initialize((0, chain.genesis_hash())).unwrap();
+        let view = state.read_view().expect("the view is built at initialisation");
+        // Block `n` of `branch` sets account `n % 4 + 1` to nonce `n` and balance `branch * 1000 + n`.
+        let block = |hashes: &mut Vec<B256>, n: usize, branch: u64| {
+            let mut changes = BlockChanges::new();
+            changes.set_account(
+                Address::with_last_byte((n % 4) as u8 + 1),
+                AccountState { nonce: n as u64, balance: U256::from(branch * 1000 + n as u64), code_hash: KECCAK256_EMPTY },
+            );
+            let parent = hashes[n - 1];
+            let hash = keccak256([(n as u64).to_be_bytes(), branch.to_be_bytes()].concat());
+            let root = state.compute(parent, &changes).unwrap().root;
+            state.validate_block(parent, hash, n as u64, &changes, root).unwrap();
+            state.on_canonical(hash).unwrap();
+            hashes.truncate(n);
+            hashes.push(hash);
+        };
+        let account = |n: u64, branch: u64| {
+            Some(Some(Account { nonce: n, balance: U256::from(branch * 1000 + n), bytecode_hash: None }))
+        };
+        let address = Address::with_last_byte;
+        let mut hashes = vec![chain.genesis_hash()];
+        for n in 1..=12 {
+            block(&mut hashes, n, 0);
+        }
+        state.on_persisted(&(1..=10).map(|n| (n as u64, hashes[n])).collect::<Vec<_>>());
+        assert_eq!(view.head(), (10, hashes[10]));
+
+        // The database unwinds to 7 before the tree moves.
+        state.on_unwound(7);
+        assert!(view.is_valid(), "stepped back, not invalidated");
+        assert_eq!(view.head(), (7, hashes[7]));
+        assert_eq!(view.account(&address(1), 7), account(4, 0));
+        assert_eq!(view.account(&address(4), 7), account(7, 0));
+        assert_eq!(view.account(&address(4), 5), account(3, 0), "the journals below the head still answer");
+        assert_eq!(view.account(&address(1), 8), None, "a reader above the new head is declined");
+        // The new branch persists from 8.
+        block(&mut hashes, 8, 1);
+        state.on_persisted(&[(8, hashes[8])]);
+        assert_eq!(view.head(), (8, hashes[8]));
+        assert_eq!(view.account(&address(1), 8), account(8, 1));
+        assert_eq!(view.account(&address(4), 8), account(7, 0));
+
+        // The tree reverts persisted blocks for a sibling of 10 before the database unwinds.
+        for n in 9..=12 {
+            block(&mut hashes, n, 1);
+        }
+        state.on_persisted(&(9..=11).map(|n| (n as u64, hashes[n])).collect::<Vec<_>>());
+        assert_eq!(view.head(), (11, hashes[11]));
+        block(&mut hashes, 10, 2);
+        assert!(view.is_valid(), "the view stepped back before the cut");
+        assert_eq!(view.head(), (9, hashes[9]));
+        assert_eq!(view.account(&address(2), 9), account(9, 1));
+        assert_eq!(view.account(&address(3), 10), None, "above the view's head");
+        state.on_unwound(9);
+        state.on_persisted(&[(10, hashes[10])]);
+        assert_eq!(view.head(), (10, hashes[10]));
+        assert_eq!(view.account(&address(3), 10), account(10, 2));
+        assert_eq!(view.account(&address(2), 10), account(9, 1));
+
+        // A block whose floor went up, then a cut of its records, then its advance.
+        for n in 11..=13 {
+            block(&mut hashes, n, 2);
+        }
+        state.on_persisted(&[(11, hashes[11])]);
+        let old_twelve = hashes[12];
+        let changes = state
+            .with_forest(|forest| {
+                forest.flush_entries_for_sync()?;
+                Ok(forest.block_changes(&old_twelve))
+            })
+            .unwrap()
+            .expect("block 12's records");
+        let raised = view.raise_floor(&changes);
+        block(&mut hashes, 12, 3);
+        assert!(view.is_valid(), "the cut took only the records of the block not advanced yet");
+        view.advance(12, old_twelve, &changes, raised);
+        assert!(!view.is_valid(), "a cut between the floor and the advance invalidates the view");
     }
 }

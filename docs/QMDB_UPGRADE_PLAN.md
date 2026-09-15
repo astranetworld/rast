@@ -240,18 +240,25 @@ written adds:
   latest-value fallbacks. Straight from the tables: state and storage roots, proofs and witnesses (`eth_getProof`,
   debug state root and witness), `DatabaseProvider::basic_account(s)` / `plain_state_storages`, an unwind's current
   values, `storage_root_by_hash`, and reth's trie changeset cache and overlay factory.
-- *Declines.* None in normal running (loop163 V14: 0 in 2,097,152). Three normal cases decline or invalidate: an
-  unwind below the view's head invalidates it for good; a restart builds the view at `best_number` with no journals,
+- *Declines.* None in normal running (loop163 V14: 0 in 2,097,152). Three normal cases declined or invalidated: an
+  unwind below the view's head invalidated it for good; a restart builds the view at `best_number` with no journals,
   so a hashed version behind it declines; persistence lagging more than `READER_KEEP_CAP` (64) blocks loses the
-  records the view needs and invalidates it.
+  records the view needs and invalidates it. The first two are handled now (items 4 and 5 below); the lag cap stays.
 - *Change list, behind one flag.* (1) Refuse to start unless `N42_QMDB_READS=on` and the reader is registered.
   (2) Skip the hashed-state write in `save_blocks`, keeping the reader's persisted hook and the checkpoint.
   (3) Under the flag a decline is a `ProviderError`, never a stale table read. (4) Unwinds skip the hashed writes and
   revert the view through its journals instead of invalidating it: each journal already holds every key's offset
   before its block, so reverting head H to U (H - U <= 64) re-applies those offsets newest first and drops the
   journals; each journal must also keep the floor from before its block, so the forest truncating the reverted
-  records does not invalidate the view. (5) A restart builds the view at the hashed tables' version (the `Finish`
-  checkpoint's `partial_state_trie`), not at `best_number`. (6) The follower's and the leader's hashed passes go;
+  records does not invalidate the view. *Done:* each journal keeps the floor from before its block; the database's
+  unwind (`on_state_unwound`) and a tree revert below the head (`TruncationGuard::before_truncate`, before the cut)
+  step the view back through its journals, one key at a time while every record the index compares is still in
+  the file; a cut between a block's `raise_floor` and its `advance` still invalidates it (the cut count);
+  `the_read_view_steps_back_through_its_journals`. (5) A restart builds the view at the hashed tables' version (the
+  `Finish` checkpoint's `partial_state_trie`), not at `best_number`. *Done differently:* that version lags the
+  database tip only with `--engine.num-state-masking-blocks` above 0 (reth's default is 0, the fleet does not set
+  it), so `bin/n42` refuses `N42_HASHED_TABLES=off` with a masking suffix and the view at `best_number` is at the
+  version readers ask for. (6) The follower's and the leader's hashed passes go;
   reth's validator keeps its own unless patched. (7) RPC that reads the tables directly (proofs, state root,
   witness) answers an error until it is served from QMDB proofs.
 - *Before turning it on.* Unit tests for no decline across a restart, an unwind within 64 blocks and a persistence

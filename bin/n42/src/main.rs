@@ -184,6 +184,14 @@ fn main() {
             if qmdb_for_startup.is_none() {
                 n42_qmdb_reth::check_hashed_tables_setting().map_err(|err| eyre::eyre!(err))?;
             }
+            // A state masking suffix leaves the hashed-state version behind the database tip,
+            // and a view built at restart holds no journals to answer behind its head.
+            if n42_qmdb_reth::n42_state::hashed_tables_off() && node.config.engine.num_state_masking_blocks > 0 {
+                return Err(eyre::eyre!(
+                    "N42_HASHED_TABLES=off needs --engine.num-state-masking-blocks 0 (got {}): the QMDB read view answers at the database tip",
+                    node.config.engine.num_state_masking_blocks
+                ));
+            }
             if let Some(qmdb) = &qmdb_for_startup {
                 let info = node.provider.chain_info()?;
                 let head_hash = node

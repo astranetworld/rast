@@ -35,11 +35,7 @@ impl N42StateReader for QmdbStateReader {
     }
 
     fn on_state_unwound(&self, block: BlockNumber) {
-        if let Some(view) = self.state.read_view_ref()
-            && view.head().0 > block
-        {
-            view.invalidate("the database unwound state below the view's head");
-        }
+        self.state.on_unwound(block);
     }
 }
 
