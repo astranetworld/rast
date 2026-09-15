@@ -225,7 +225,15 @@ where
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            return Err(format!("parent {parent_hash} not imported within {PARENT_WAIT:?}"));
+            // Which half was missing: a parent the provider cannot see is not
+            // canonical yet (its commit's forkchoice has not run); one with no
+            // complete execution fields was not executed here, or its receipts
+            // were never recorded.
+            let header_known = provider.sealed_header_by_hash(parent_hash).ok().flatten().is_some();
+            let fields_known = n42_engine_types::executed_fields::get(&parent_hash).is_some();
+            return Err(format!(
+                "parent {parent_hash} not imported within {PARENT_WAIT:?} (header known: {header_known}, execution fields known: {fields_known})"
+            ));
         }
         // A landing bumps the count; a block that arrives by the engine's
         // own path bumps nothing, so the wait is also a poll.

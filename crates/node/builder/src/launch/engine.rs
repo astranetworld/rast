@@ -237,6 +237,18 @@ impl EngineNodeLauncher {
             // would replay only the messages that were observed by the engine
             // during this run.
             .maybe_store_messages(node_config.debug.engine_api_store.clone());
+        // N42: `N42_ENGINE_MESSAGE_TRACE=1` logs every engine message as the
+        // engine's handler takes it off this stream. The leader's stall at a
+        // tenure change (docs/FLEET7_PATH_AUDIT.md section 9) holds a newPayload
+        // and a forkchoice for 8-11 s; beside the tree's own "Received new
+        // payload" and "Forkchoice updated" lines this says whether they waited
+        // before this stream was polled or inside the tree.
+        let trace_engine_messages = std::env::var("N42_ENGINE_MESSAGE_TRACE").is_ok_and(|v| v == "1");
+        let consensus_engine_stream = consensus_engine_stream.inspect(move |message| {
+            if trace_engine_messages {
+                info!(target: "reth::cli", %message, "engine message taken off the stream");
+            }
+        });
 
         let engine_kind = if ctx.chain_spec().is_optimism() {
             EngineApiKind::OpStack

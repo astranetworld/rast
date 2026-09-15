@@ -1488,8 +1488,12 @@ impl<E: ExecutionLayer> H2Service<E> {
             // The engine commits what the fleet certifies, imported here or
             // not; the execution layer follows only what it has. The pull
             // brings the rest, and the commits after it are for blocks it
-            // holds.
-            debug!(target: "n42.h2.node", view, ?block_hash, "commit for a block the execution layer has not imported; not finalised here");
+            // holds. A block whose import has not started yet is still
+            // coming: the driver keeps the commit and runs it when the import
+            // lands (dropped, the block never became canonical and the node
+            // fell behind for good: loop160 C10 node5, V10 node1).
+            self.driver.commit_when_imported(*block_hash);
+            debug!(target: "n42.h2.node", view, ?block_hash, "commit for a block the execution layer has not imported; finalised when its import lands");
             return Ok(());
         }
         // A block the eager import already brought in: the engine asked because

@@ -220,9 +220,29 @@ struct AheadBuild {
     /// the import had landed was answered SYNCING and the leader built on
     /// its critical path 38 times).
     refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the build is given up. A build a forkchoice started holds a
+    /// payload job in the execution layer until the job is resolved or its
+    /// deadline passes (12 s at `--builder.deadline 3` once the chain's clock
+    /// runs ahead of the wall clock), and reth takes no engine message while
+    /// a persistence hand-off waits for every payload job to end: an aborted
+    /// task left its job running, and a new leader's commit forkchoice and
+    /// own block sat 10-11 s in front of the tree until a TC (loop161 W,
+    /// node3 and node4). Such a task is told instead, and resolves its job
+    /// before it ends. `None` for a build on the sealed block, which starts
+    /// no job.
+    give_up: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl AheadBuild {
+    /// Drops this build: a task holding a payload job resolves the job and
+    /// discards the block (see `give_up`); any other is aborted.
+    fn discard(self) {
+        match self.give_up {
+            Some(flag) => flag.store(true, std::sync::atomic::Ordering::Release),
+            None => self.task.abort(),
+        }
+    }
+
     /// Whether this build is for a later block than `attrs` asks for. The
     /// chain's attributes carry the block's number as `slot_number`, so two
     /// requests compare without either block being known here.
@@ -433,7 +453,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             return Ok(());
         }
         if let Some(stale) = self.prepared.take() {
-            stale.task.abort();
+            stale.discard();
         }
         // Off the caller's loop entirely: the forkchoice call that starts the
         // build is answered by the same engine the loop's other calls queue
@@ -443,7 +463,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let state = self.forkchoice(parent);
         let task_attrs = attrs.clone();
         info!(target: "n42.h2.el", ?parent, "starting a build ahead of leading");
+        let give_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let given_up = std::sync::Arc::clone(&give_up);
         let task = tokio::spawn(async move {
+            // Given up before it started: no forkchoice, so no job to end.
+            if given_up.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ElError::new("the build ahead was given up before it started"));
+            }
             let started = std::time::Instant::now();
             let updated = el
                 .fork_choice_updated_with_attrs_for(ExecutionPath::LIVE_SEQUENTIAL, state, task_attrs)
@@ -459,6 +485,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 .resolve_payload_for(ExecutionPath::LIVE_SEQUENTIAL, id, ResolveKind::WaitForPending)
                 .await
                 .ok_or_else(|| ElError::new(format!("no payload build for id {id}")))??;
+            if given_up.load(std::sync::atomic::Ordering::Acquire) {
+                info!(target: "n42.h2.el", ?parent, number = built.number, "a build ahead that was given up resolved its payload job");
+                return Err(ElError::new("the build ahead was given up"));
+            }
             info!(
                 target: "n42.h2.el",
                 ?parent,
@@ -469,7 +499,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             );
             Ok(built)
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task, refused: Default::default() });
+        self.prepared = Some(AheadBuild { parent, attrs, task, refused: Default::default(), give_up: Some(give_up) });
         Ok(())
     }
 
@@ -497,7 +527,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             return Ok(());
         }
         if let Some(stale) = self.prepared.take() {
-            stale.task.abort();
+            stale.discard();
         }
         let el = std::sync::Arc::clone(&self.el);
         let task_attrs = attrs.clone();
@@ -538,7 +568,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
             }
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task, refused });
+        self.prepared = Some(AheadBuild { parent, attrs, task, refused, give_up: None });
         Ok(())
     }
 
@@ -616,7 +646,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // A build on the sealed block the execution layer refused, and
             // that nothing replaced: the same as no build ahead.
             Some(prepared) if prepared.refused.load(std::sync::atomic::Ordering::Acquire) => {
-                prepared.task.abort();
+                prepared.discard();
                 None
             }
             Some(prepared) if prepared.parent == parent && prepared.attrs == attrs => {
@@ -641,7 +671,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     same_attrs = prepared.attrs == attrs,
                     "a build prepared ahead does not match the proposal; discarded"
                 );
-                prepared.task.abort();
+                prepared.discard();
                 None
             }
             None => None,
@@ -784,10 +814,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// prepared its next build on the block that was not voted for; the next
     /// proposal extends the last QC's block instead, and a build on the wrong
     /// parent is discarded on the mismatch anyway -- this only stops the
-    /// execution layer finishing a build nobody will collect.
+    /// execution layer finishing a build nobody will collect -- or, for a
+    /// build a forkchoice started, has its payload job resolved at once
+    /// rather than left to its deadline (see `AheadBuild::give_up`).
     pub fn discard_prepared(&mut self) {
         if let Some(prepared) = self.prepared.take() {
-            prepared.task.abort();
+            prepared.discard();
         }
     }
 
@@ -816,6 +848,30 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// dropped as "not imported" but deferred to the import's success.
     pub fn is_importing(&self, block_hash: &B256) -> bool {
         self.executing.contains(block_hash) || self.import_queue.contains(block_hash)
+    }
+
+    /// A commit heard before this block's import started (the Decide came
+    /// ahead of the execute request): nothing is sent now, since the engine
+    /// does not have the block, and the import that brings it in runs the
+    /// commit's forkchoice. Dropped instead, the block was imported but never
+    /// canonical, the next block's direct import waited out its parent, and a
+    /// node that fell behind stayed behind: by then most Decides came before
+    /// the import started (loop160 C10 node5: 187 of 318; V10 node1: 96).
+    pub fn commit_when_imported(&mut self, block_hash: B256) {
+        self.remember_commit_ahead(block_hash);
+    }
+
+    /// Remembers a commit to repeat when `block_hash`'s import lands. Bounded:
+    /// a block imported by a path the driver does not see (a synced range)
+    /// stays in the set until it is bounded away, harmlessly.
+    fn remember_commit_ahead(&mut self, block_hash: B256) {
+        self.commits_ahead.insert(block_hash);
+        if self.commits_ahead.len() > 64 {
+            let stale: Vec<B256> = self.commits_ahead.iter().copied().take(self.commits_ahead.len() - 64).collect();
+            for hash in stale {
+                self.commits_ahead.remove(&hash);
+            }
+        }
     }
 
     /// The blocks whose imports are in flight.
@@ -1140,26 +1196,34 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.finalized = block_hash;
         if !self.imported.contains(&block_hash) {
             // The block has not reached this node: whatever the engine says
-            // to this forkchoice, it runs again when the import lands. A
-            // block imported by a path the driver does not see (a synced
-            // range) stays in the set until it is bounded away, harmlessly.
-            self.commits_ahead.insert(block_hash);
-            if self.commits_ahead.len() > 64 {
-                let stale: Vec<B256> = self.commits_ahead.iter().copied().take(self.commits_ahead.len() - 64).collect();
-                for hash in stale {
-                    self.commits_ahead.remove(&hash);
-                }
-            }
+            // to this forkchoice, it runs again when the import lands.
+            self.remember_commit_ahead(block_hash);
         }
         let state = ForkchoiceState {
             head_block_hash: block_hash,
             safe_block_hash: block_hash,
             finalized_block_hash: block_hash,
         };
-        match self
+        let started = std::time::Instant::now();
+        let ahead = self.commits_ahead.contains(&block_hash);
+        let answer = self
             .el
             .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
-            .await
+            .await;
+        // A commit's forkchoice that is slow or not Valid is what leaves an
+        // imported block short of canonical, and the next block's direct
+        // import then waits out its parent (loop158 W: no forkchoice for block
+        // 188 reached the engine for 6.5 s). Said when it happens.
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let valid = matches!(&answer, Ok(updated) if matches!(updated.payload_status.status, PayloadStatusEnum::Valid));
+        if elapsed_ms >= 500 || !valid {
+            let outcome = match &answer {
+                Ok(updated) => format!("{:?}", updated.payload_status.status),
+                Err(error) => format!("error: {error}"),
+            };
+            info!(target: "n42.h2.el", block = ?block_hash, elapsed_ms, ahead_of_import = ahead, %outcome, "commit forkchoice");
+        }
+        match answer
         {
             Ok(updated) => match updated.payload_status.status {
                 PayloadStatusEnum::Invalid { validation_error } => {

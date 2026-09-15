@@ -43,6 +43,10 @@ pub struct MockBehaviour {
     /// Status returned by `forkchoiceUpdated` without attributes (a commit):
     /// `Syncing` is what an engine answers for a block it does not have.
     pub forkchoice_status: PayloadStatusEnum,
+    /// When set, a resolve waits for a permit before it reaches the mock (and
+    /// is recorded): a test holds a build between its forkchoice and its
+    /// resolve, where a task that is aborted never resolves its job.
+    pub resolve_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Default for MockBehaviour {
@@ -52,6 +56,7 @@ impl Default for MockBehaviour {
             start_builds: true,
             new_payload_error: None,
             forkchoice_status: PayloadStatusEnum::Valid,
+            resolve_gate: None,
         }
     }
 }
@@ -271,6 +276,12 @@ impl ExecutionLayer for MockExecutionLayer {
         id: PayloadId,
         _kind: ResolveKind,
     ) -> Option<Result<BuiltBlock, ElError>> {
+        let gate = self.behaviour.lock().expect("mock behaviour lock").resolve_gate.clone();
+        if let Some(gate) = gate
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
         self.record(ElCall::ResolvePayload(id));
         let (number, parent) = {
             // One past the highest block this mock has built or accepted, so

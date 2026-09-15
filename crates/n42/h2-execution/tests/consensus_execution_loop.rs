@@ -352,3 +352,58 @@ async fn commits_ahead_of_their_imports_are_each_repeated_when_the_import_lands(
     assert_eq!(forkchoices_to(a), 2, "A: the early forkchoice and the one after its import");
     assert_eq!(forkchoices_to(b), 2, "B: the same, although A's import landed after B's commit");
 }
+
+/// A commit heard before the block's import started sends nothing, and the
+/// import that follows runs its forkchoice (loop160 C10 node5: the service
+/// dropped such a commit, the block never became canonical, and the next
+/// block's direct import waited out its parent).
+#[tokio::test]
+async fn a_commit_heard_before_the_import_started_runs_when_the_import_lands() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let hash = B256::repeat_byte(0x57);
+    let forkchoices_to = |hash: B256| {
+        el.calls()
+            .into_iter()
+            .filter(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == hash))
+            .count()
+    };
+    driver.commit_when_imported(hash);
+    assert_eq!(forkchoices_to(hash), 0, "no forkchoice for a block the engine does not have");
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    assert_eq!(driver.handle_output(&execute(hash)).await.imported_block(), Some(hash));
+    assert_eq!(forkchoices_to(hash), 1, "the forkchoice after the import");
+}
+
+/// A build ahead given up after its forkchoice started a payload job still
+/// resolves the job: an aborted task left the job to its deadline, and reth
+/// took no engine message until it ended (loop161 W: a new leader's commit
+/// forkchoice and own block sat 10-11 s, then a TC).
+#[tokio::test]
+async fn a_build_ahead_given_up_still_resolves_its_payload_job() {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        resolve_gate: Some(std::sync::Arc::clone(&gate)),
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let count = |call: fn(&ElCall) -> bool| el.calls().iter().filter(|c| call(c)).count();
+
+    // The build ahead sends its forkchoice and waits at its resolve.
+    driver.prepare_build_on(B256::repeat_byte(0x61), attrs()).await.expect("build ahead started");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(count(|c| matches!(c, ElCall::ForkchoiceUpdatedWithAttrs(_))), 1);
+    assert_eq!(count(|c| matches!(c, ElCall::ResolvePayload(_))), 0);
+
+    // The proposal asks for another parent: the build ahead is given up, and
+    // the build on the asked parent resolves through the same gate.
+    gate.add_permits(2);
+    driver.build_block_on(GENESIS, attrs(), 1).await.expect("built on the asked parent");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(count(|c| matches!(c, ElCall::ForkchoiceUpdatedWithAttrs(_))), 2);
+    assert_eq!(count(|c| matches!(c, ElCall::ResolvePayload(_))), 2, "the given-up build's job was resolved too");
+}
