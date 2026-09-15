@@ -43,6 +43,16 @@ impl N42StateReader for QmdbStateReader {
     }
 }
 
+/// Whether `N42_HASHED_TABLES=off` can hold: it needs `N42_QMDB_READS=on` and a registered
+/// reader, since nothing else would answer the latest state once the tables stop being
+/// written. Called at startup, after registration.
+pub fn check_hashed_tables_setting() -> Result<(), &'static str> {
+    if n42_state::hashed_tables_off() && (n42_state::mode() != ReadsMode::On || n42_state::registered().is_none()) {
+        return Err("N42_HASHED_TABLES=off stops writing HashedAccounts/HashedStorages, which only a registered QMDB read view in N42_QMDB_READS=on replaces; this node has none");
+    }
+    Ok(())
+}
+
 /// Registers the node's read view as the process's state reader, when
 /// `N42_QMDB_READS` asks for one and initialisation built the view. Returns
 /// whether it did.

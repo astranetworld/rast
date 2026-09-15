@@ -1112,7 +1112,13 @@ where
                     qmdb_job.compute_operations(parent_sealed, ops)
                 });
                 let receipts = scope.spawn(move || crate::hotstuff_consensus::gov5_receipt_root_bloom(receipts));
-                let hashed = state_provider.hashed_post_state(bundle_ref);
+                // `N42_HASHED_TABLES=off` (stage 6c): the tables this post-state is written to are
+                // not written, and QMDB answers the reads they served.
+                let hashed = if n42_qmdb_reth::n42_state::hashed_tables_off() {
+                    Ok(Default::default())
+                } else {
+                    state_provider.hashed_post_state(bundle_ref)
+                };
                 let prepared = root.join().expect("the QMDB root job does not panic");
                 let roots = receipts.join().expect("the receipts root job does not panic");
                 (hashed, prepared, roots)

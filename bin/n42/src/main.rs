@@ -179,6 +179,11 @@ fn main() {
             // The forest can only be restored once the database is open and the
             // head is known, which is now; and it has to be ready before anything
             // produces or validates a block, which is what follows.
+            // `N42_HASHED_TABLES=off` needs a registered QMDB reader; a chain without QMDB has
+            // none, so the setting is refused before anything is persisted without its state.
+            if qmdb_for_startup.is_none() {
+                n42_qmdb_reth::check_hashed_tables_setting().map_err(|err| eyre::eyre!(err))?;
+            }
             if let Some(qmdb) = &qmdb_for_startup {
                 let info = node.provider.chain_info()?;
                 let head_hash = node
@@ -191,6 +196,10 @@ fn main() {
                 // providers' latest-state reads (docs/QMDB_UPGRADE_PLAN.md, stage 6).
                 if n42_qmdb_reth::register_state_reader(qmdb) {
                     info!(target: "reth::cli", "QMDB read view registered as the state reader");
+                }
+                n42_qmdb_reth::check_hashed_tables_setting().map_err(|err| eyre::eyre!(err))?;
+                if n42_qmdb_reth::n42_state::hashed_tables_off() {
+                    info!(target: "reth::cli", "hashed state tables are not written; QMDB answers the latest state");
                 }
                 // The head's execution result, for the first header after a
                 // restart under deferred execution: before the fork the

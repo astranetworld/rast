@@ -43,7 +43,7 @@ pub use reth_chainspec::qmdb::{deferred_execution_active_at, deferred_execution_
 pub use n42_qmdb_state::forest::PreparedBlock;
 pub use node_state::{NodeStateError, QmdbNodeState};
 pub use read_view::QmdbReadView;
-pub use state_reader::{register_state_reader, QmdbStateReader};
+pub use state_reader::{check_hashed_tables_setting, register_state_reader, QmdbStateReader};
 /// The latest-state reader registry the providers consult (`N42_QMDB_READS`).
 pub use reth_storage_api::n42_state;
 pub use strategy::{QmdbEngineValidatorBuilder, QmdbStateRootStrategy};

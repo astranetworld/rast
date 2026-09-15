@@ -16,6 +16,13 @@
 //!
 //! A reader declines (`None`) whatever it cannot answer exactly. Persistence and unwinds tell it
 //! how the tables moved. Nothing here changes behaviour while no reader is registered.
+//!
+//! `N42_HASHED_TABLES=off` (stage 6c, experimental) stops writing `HashedAccounts`/`HashedStorages`
+//! when blocks are persisted: the reader then answers every latest-state read, and a read it
+//! declines is an error ([`UnansweredRead`]) rather than a stale table read. The node refuses to
+//! start with it unless `N42_QMDB_READS=on` and a reader is registered. Unwinds and restarts still
+//! decline (the view is invalidated, or built without journals), so it is for fleet legs, not for
+//! a node that must survive either.
 
 use alloc::sync::Arc;
 use alloy_eips::BlockNumHash;
@@ -53,6 +60,31 @@ pub trait N42StateReader: Send + Sync + 'static {
 }
 
 static READER: OnceLock<Arc<dyn N42StateReader>> = OnceLock::new();
+
+/// Whether the hashed state tables are no longer written (`N42_HASHED_TABLES=off`), read once.
+pub fn hashed_tables_off() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("N42_HASHED_TABLES").is_ok_and(|v| v == "off"))
+}
+
+/// A latest-state read the reader did not answer while the hashed tables are not written.
+#[derive(Debug, Clone)]
+pub struct UnansweredRead(alloc::string::String);
+
+impl UnansweredRead {
+    /// The read, described.
+    pub fn new(what: impl core::fmt::Display) -> Self {
+        Self(alloc::format!("{what}"))
+    }
+}
+
+impl core::fmt::Display for UnansweredRead {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the QMDB reader did not answer {}, and N42_HASHED_TABLES=off leaves no table to read it from", self.0)
+    }
+}
+
+impl core::error::Error for UnansweredRead {}
 
 /// The mode, read from `N42_QMDB_READS` once.
 pub fn mode() -> ReadsMode {
@@ -108,16 +140,26 @@ pub fn stats() -> (u64, u64, u64, u64) {
     )
 }
 
-/// Counts a read the reader declined.
+/// Counts a read the reader declined. Said at the first and at every power of two: with the
+/// hashed tables no longer written a decline would read stale state, so `on` legs must show
+/// how many there were (loop163 O14 logged none either way).
 #[inline]
 pub fn record_decline() {
-    DECLINES.fetch_add(1, Ordering::Relaxed);
+    let declines = DECLINES.fetch_add(1, Ordering::Relaxed) + 1;
+    if declines.is_power_of_two() {
+        let answers = ANSWERS.load(Ordering::Relaxed);
+        tracing::warn!(target: "n42::qmdb_reads", declines, answers, "QMDB reader declined a read; the database answered");
+    }
 }
 
-/// Counts a read the reader answered.
+/// Counts a read the reader answered, said at every power of two from 65,536.
 #[inline]
 pub fn record_answer() {
-    ANSWERS.fetch_add(1, Ordering::Relaxed);
+    let answers = ANSWERS.fetch_add(1, Ordering::Relaxed) + 1;
+    if answers.is_power_of_two() && answers >= 1 << 16 {
+        let declines = DECLINES.load(Ordering::Relaxed);
+        tracing::info!(target: "n42::qmdb_reads", answers, declines, "QMDB reads served");
+    }
 }
 
 fn record_check(matched: bool, describe: impl FnOnce() -> String) {

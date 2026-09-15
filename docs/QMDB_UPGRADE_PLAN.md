@@ -111,7 +111,7 @@ hashed tables cannot be dropped until that dependency is found.
 | 5c | done: default retention depth 64 -> 16, as the fleet has run since loop122; harness RSS at depth 16 / 64: 6.31 / 12.27 GB, latency unchanged. Node-like A/B of 5b+5c against 5a: L blocks 58 -> 40 ms p50, 103 -> 90 ms p99 | comparison section 6.9 |
 | 6a | done: QMDB read view (`qmdb-reth/src/read_view.rs`): a key -> entry-file offset index (`twig-core` `SharedOffsetIndex`, one lock per shard) at its head, records read through its own mapping of the entry file (`entry_view.rs`), 64 blocks of "offset before this block" journals so any reader at an older version is answered exactly, a truncation guard that invalidates the view before the tree cuts records it reads. Built at initialisation (file mode), moved by persistence. Random-chain oracle test at the last three persisted versions, forks above and reverts below its head | `qmdb-reth` tests |
 | 6b | done: `reth_storage_api::n42_state` registry (`N42_QMDB_READS=off|verify|on`); the vendored latest and historical providers ask it for accounts and storage at the hashed tables' version; `save_blocks` moves it, unwinds invalidate it; `bin/n42` registers the view. End to end on an in-process QMDB dev chain persisting every block: 60 reads checked, 0 mismatches, 0 declines | `n42-testing` `test_qmdb_chain__read_view_verifies_against_the_hashed_tables` (ignored; run alone) |
-| 6c | in progress. Fleet leg in `verify` (loop156 V1): the view answered on all seven nodes and verified at least 1,048,576 reads with 0 mismatches and 0 declines, then was invalidated on every node 17-18 blocks behind the tip, because the forest pruned records to its retention depth (16) before the database persisted those blocks. Fixed: the forest keeps the records the view still needs (`set_keep_from`, capped at 64 blocks). Next: the verify legs again (loop157), then `on`; hashed tables off only after `on` holds | `docs/FLEET7_PATH_AUDIT.md` section 8, defect 2 |
+| 6c | in progress. `verify` holds on the fleet: after the keep fix (`set_keep_from`, cap 64) every verify leg answered on all seven nodes with 0 mismatches, 0 declines and 0 invalidations (loop163 V14: 2,097,152 reads checked). First `on` leg (loop163 O14): 7 of 7 views registered, 0 invalidations, win1 315,057 and 22.00M transactions against the same loop's W at 315,949 and 21.06M (one leg). `on` legs logged no served or declined counts until `record_answer`/`record_decline` were made to say them (uncommitted, 2026-09-15). Next: an `on` leg with the counters, then the tables-off changes in "Stage 6c: what turning the hashed tables off takes" | `docs/FLEET7_PATH_AUDIT.md` sections 8-9 |
 
 ## Recommended approach
 
@@ -228,6 +228,39 @@ written adds:
   the database and the chain's QMDB root disagree about the fee recipient's balance; every later block reads that
   account as absent. A HotStuff chain configures no local signer and credits the leader's fee recipient on both
   sides, so the fleet is not affected; the end-to-end test uses tip-free transfers to keep this out of its scope.
+
+**Stage 6c: what turning the hashed tables off takes (2026-09-15, code read).**
+- *Writes.* `save_blocks` writes the merged hashed state (`database/provider.rs` 784-799). Engine unwinds rewrite the
+  tables (`remove_block_and_execution_above` -> `unwind_account_hashing` / `unwind_storage_hashing`, then
+  `remove_state_above`). A hashed post-state is computed by the follower's import (`follower_import.rs` 694-700),
+  behind the leader's seal (`payload.rs` 1115), and by reth's own engine validator from the bundle
+  (`payload_validator.rs` 747-762, reth, not vendored). The QMDB root does not use it; the in-memory overlay needs it
+  only for its trie methods and for zeroing destroyed storage.
+- *Reads.* Through the reader: the latest providers' `basic_account` / `storage` and the historical providers'
+  latest-value fallbacks. Straight from the tables: state and storage roots, proofs and witnesses (`eth_getProof`,
+  debug state root and witness), `DatabaseProvider::basic_account(s)` / `plain_state_storages`, an unwind's current
+  values, `storage_root_by_hash`, and reth's trie changeset cache and overlay factory.
+- *Declines.* None in normal running (loop163 V14: 0 in 2,097,152). Three normal cases decline or invalidate: an
+  unwind below the view's head invalidates it for good; a restart builds the view at `best_number` with no journals,
+  so a hashed version behind it declines; persistence lagging more than `READER_KEEP_CAP` (64) blocks loses the
+  records the view needs and invalidates it.
+- *Change list, behind one flag.* (1) Refuse to start unless `N42_QMDB_READS=on` and the reader is registered.
+  (2) Skip the hashed-state write in `save_blocks`, keeping the reader's persisted hook and the checkpoint.
+  (3) Under the flag a decline is a `ProviderError`, never a stale table read. (4) Unwinds skip the hashed writes and
+  revert the view through its journals instead of invalidating it: each journal already holds every key's offset
+  before its block, so reverting head H to U (H - U <= 64) re-applies those offsets newest first and drops the
+  journals; each journal must also keep the floor from before its block, so the forest truncating the reverted
+  records does not invalidate the view. (5) A restart builds the view at the hashed tables' version (the `Finish`
+  checkpoint's `partial_state_trie`), not at `best_number`. (6) The follower's and the leader's hashed passes go;
+  reth's validator keeps its own unless patched. (7) RPC that reads the tables directly (proofs, state root,
+  witness) answers an error until it is served from QMDB proofs.
+- *Before turning it on.* Unit tests for no decline across a restart, an unwind within 64 blocks and a persistence
+  lag; a tables-off copy of the dev-chain read-view test in `on` past the overlay drop, plus the restart tests and a
+  reorg, asserting 0 declines; on the fleet an `on` leg logging 0 declines, then a tables-off leg with a mid-round
+  restart and a TC, with no invalid block and no "gas used mismatch".
+- *What it buys toward 1M TPS.* In persistence ~150,000 MDBX upserts and a keccak per touched key a block; on the
+  paths, the follower's and the leader's hashed passes, including the 28-40 ms the own-block hand-off waits for the
+  hashed post-state (`docs/FLEET7_PATH_AUDIT.md` section 6).
 
 **Stage 4b -- QMDB dead-space reclamation, opt-in (default off). Stage 0 result: 0 of 14,472 full twigs are fully dead on the real state, so punching dead twigs reclaims nothing here; QMDB history on disk only shrinks with live-entry compaction (root-changing, fork-gated). Kept only as an option for workloads with cold history.** `u32` offsets relative to the twig base;
 `fallocate(PUNCH_HOLE|KEEP_SIZE)` over fully dead twigs below finality with a persisted punched set; `snapshot()`,

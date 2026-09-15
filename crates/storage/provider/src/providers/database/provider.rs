@@ -783,18 +783,22 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             // This reduces cursor open/close overhead from N calls to 1.
             if save_mode.with_state() && !state_trie_blocks.is_empty() {
                 let start = Instant::now();
-                let batch = state_trie_blocks
-                    .iter()
-                    .map(|block| block.trie_data.get().sorted.hashed_state.as_ref())
-                    .collect::<Vec<_>>();
-                let mask = state_trie_masking_blocks
-                    .iter()
-                    .map(|block| block.trie_data.get().sorted.hashed_state.as_ref())
-                    .collect::<Vec<_>>();
-                let merged_hashed_state =
-                    HashedPostStateSorted::disjointed_merge_batch(&batch, &mask);
-                if !merged_hashed_state.is_empty() {
-                    self.write_hashed_state(&merged_hashed_state)?;
+                // N42: with `N42_HASHED_TABLES=off` the QMDB reader answers the latest state and
+                // the hashed tables are not written (`docs/QMDB_UPGRADE_PLAN.md`, stage 6c).
+                if !reth_storage_api::n42_state::hashed_tables_off() {
+                    let batch = state_trie_blocks
+                        .iter()
+                        .map(|block| block.trie_data.get().sorted.hashed_state.as_ref())
+                        .collect::<Vec<_>>();
+                    let mask = state_trie_masking_blocks
+                        .iter()
+                        .map(|block| block.trie_data.get().sorted.hashed_state.as_ref())
+                        .collect::<Vec<_>>();
+                    let merged_hashed_state =
+                        HashedPostStateSorted::disjointed_merge_batch(&batch, &mask);
+                    if !merged_hashed_state.is_empty() {
+                        self.write_hashed_state(&merged_hashed_state)?;
+                    }
                 }
                 timings.write_hashed_state += start.elapsed();
 

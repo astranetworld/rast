@@ -121,6 +121,11 @@ impl<Provider: DBProvider + StorageSettingsCache> AccountReader
                     }
                 }
             }
+            if reth_storage_api::n42_state::hashed_tables_off() {
+                return Err(reth_storage_errors::provider::ProviderError::other(
+                    reth_storage_api::n42_state::UnansweredRead::new(format_args!("account {address}")),
+                ))
+            }
             let hashed_address = alloy_primitives::keccak256(address);
             self.tx()
                 .get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)
@@ -377,6 +382,11 @@ impl<Provider: DBProvider + BlockHashReader + StorageSettingsCache> StateProvide
                         None => reth_storage_api::n42_state::record_decline(),
                     }
                 }
+            }
+            if reth_storage_api::n42_state::hashed_tables_off() {
+                return Err(reth_storage_errors::provider::ProviderError::other(
+                    reth_storage_api::n42_state::UnansweredRead::new(format_args!("slot {storage_key} of {account}")),
+                ))
             }
             self.hashed_storage_lookup(
                 alloy_primitives::keccak256(account),

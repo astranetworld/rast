@@ -777,9 +777,14 @@ fn fill_carry(
 /// executes to gas 0 (`docs/QMDB_UPGRADE_PLAN.md`, stage 6). Removing this
 /// pass -- 26 ms of every import and ~15 MB a block -- needs QMDB to serve
 /// those reads first, and the leader's own build handled too.
+///
+/// With `N42_HASHED_TABLES=off` (stage 6c) the QMDB reader serves them and
+/// nothing writes the tables, so the pass is skipped on that setting.
 fn hashed_state_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_HASHED_STATE").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var("N42_HASHED_STATE").map_or(true, |v| v != "0") && !n42_qmdb_reth::n42_state::hashed_tables_off()
+    })
 }
 
 /// Whether the carry is filled on the worker pool after the import returns

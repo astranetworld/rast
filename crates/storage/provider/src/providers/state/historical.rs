@@ -282,6 +282,11 @@ where
                             }
                         }
                     }
+                    if reth_storage_api::n42_state::hashed_tables_off() {
+                        return Err(reth_storage_errors::provider::ProviderError::other(
+                            reth_storage_api::n42_state::UnansweredRead::new(format_args!("slot {lookup_key} of {address}")),
+                        ))
+                    }
                     database()
                 } else {
                     Ok(self
@@ -410,6 +415,11 @@ where
                                 None => reth_storage_api::n42_state::record_decline(),
                             }
                         }
+                    }
+                    if reth_storage_api::n42_state::hashed_tables_off() {
+                        return Err(reth_storage_errors::provider::ProviderError::other(
+                            reth_storage_api::n42_state::UnansweredRead::new(format_args!("account {address}")),
+                        ))
                     }
                     Ok(self.tx().get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)?)
                 } else {
