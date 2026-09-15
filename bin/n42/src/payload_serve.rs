@@ -251,6 +251,18 @@ where
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, converted).await
 }
 
+/// A block's transactions in their EIP-2718 encoding, as a payload lists them,
+/// encoded on the worker pool.
+fn encoded_transactions(block: &reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>) -> Vec<alloy_primitives::Bytes> {
+    use rayon::prelude::*;
+    block
+        .body()
+        .transactions
+        .par_iter()
+        .map(|tx| alloy_primitives::Bytes::from(alloy_eips::eip2718::Encodable2718::encoded_2718(tx)))
+        .collect()
+}
+
 /// Whether a build this node kept executes as the sealed block does. The
 /// build is found by its parent, number and -- under deferred execution --
 /// the parent's result, all of which a sibling on the same parent shares,
@@ -465,6 +477,21 @@ where
     let sealed_hash = header.hash_slow();
     let sealed_header = reth_primitives_traits::SealedHeader::new(header.clone(), sealed_hash);
     let withdrawals = built.block.body().withdrawals.clone().map(|w| w.to_vec()).unwrap_or_default();
+    // The transactions travel with the `newPayload` below. reth executes a
+    // payload for as many transactions as the payload itself lists, whatever
+    // block its conversion returns, and it executes this one whenever the
+    // executed insert did not land first -- dropped as outdated when a sibling
+    // was made canonical a moment before, which no check of the head here can
+    // rule out. An empty list then executed a full block as empty: no receipts,
+    // none of its state changes in the tree, and every block this node built
+    // on it carried nonces the chain had mined (loop157 V3/C4/V4, loop158 V5).
+    // Encoded on the worker pool, a few milliseconds at 163,000.
+    let raw_transactions = {
+        let block = std::sync::Arc::clone(&built.block);
+        tokio::task::spawn_blocking(move || encoded_transactions(&block))
+            .await
+            .map_err(|err| format!("encoding the transactions: {err}"))?
+    };
     // A block that forks from the engine's head (a sibling re-proposed
     // after a TC): the head goes back to the parent first, or the tree
     // drops the executed insert as outdated and executes the payload
@@ -500,14 +527,13 @@ where
     let handoff_ms = handoff_at.elapsed().as_millis() as u64;
     // The payload for the engine's `newPayload`: its conversion takes the
     // sealed block registered above by the payload's block hash before it
-    // looks at anything else, so the transactions need not travel at all --
-    // an empty list here saves encoding 163,000 of them (15 ms and as many
-    // allocations). If the engine ever answered other than Valid, the
-    // validator's fallback sends the whole payload and the engine converts
-    // it the ordinary way.
+    // looks at anything else, so nothing is decoded; the transactions are
+    // there for the execution that follows a dropped insert (see above). If
+    // the engine ever answered other than Valid, the validator's fallback
+    // sends the whole payload and the engine converts it the ordinary way.
     let payload_at = std::time::Instant::now();
     stage.at(3);
-    let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, Vec::new(), withdrawals, None);
+    let data = n42_h2_consensus::execution_data_from_raw_parts(sealed_hash, &header, raw_transactions, withdrawals, None);
     let payload_ms = payload_at.elapsed().as_millis() as u64;
     stage.at(4);
     let status = engine.new_payload(data).await.map_err(|e| format!("engine: {e}"))?;
@@ -1401,6 +1427,32 @@ mod tests {
         let theirs = [Withdrawal { index: 0, validator_index: 0, address: Address::repeat_byte(2), amount: 1 }];
         assert!(!build_executes_as_sealed(&built, Some(&rewards), &ours, Some(&theirs)));
         assert!(build_executes_as_sealed(&built, None, &ours, Some(&[])));
+    }
+
+    /// The header-only own-block payload lists the block's transactions, so an
+    /// engine that executes it runs all of them: they decode back to the block's.
+    #[test]
+    fn an_own_blocks_transactions_are_listed_for_its_payload() {
+        let transactions: Vec<n42_tx_types::N42TxEnvelope> = (0..5u64)
+            .map(|n| {
+                let tx = TxEip1559 { chain_id: 1, nonce: n, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(2)), value: U256::from(n), ..Default::default() };
+                n42_tx_types::N42TxEnvelope::from(TransactionSigned::from(Signed::new_unchecked(tx, Signature::test_signature(), alloy_primitives::B256::with_last_byte(n as u8))))
+            })
+            .collect();
+        let block = n42_tx_types::Block {
+            header: Header { number: 129, ..Default::default() },
+            body: n42_tx_types::BlockBody { transactions: transactions.clone(), ommers: Vec::new(), withdrawals: None },
+        };
+        let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::repeat_byte(1); 5]);
+        let listed = encoded_transactions(&recovered);
+        assert_eq!(listed.len(), transactions.len());
+        for (bytes, tx) in listed.iter().zip(&transactions) {
+            // Compared as encodings: an envelope also caches its hash, and the
+            // test's transactions carry a made-up one.
+            assert_eq!(bytes.as_ref(), alloy_eips::eip2718::Encodable2718::encoded_2718(tx).as_slice());
+            let decoded = <n42_tx_types::N42TxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(bytes.as_ref()).expect("decodes");
+            assert_eq!(alloy_eips::eip2718::Encodable2718::encoded_2718(&decoded).as_slice(), bytes.as_ref());
+        }
     }
 }
 

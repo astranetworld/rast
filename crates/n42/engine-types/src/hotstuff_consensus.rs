@@ -403,16 +403,20 @@ where
             // what its child's header will be checked against. The requests
             // hash is not deferred (section 9 of the proposal): it is this
             // block's own and is held to the EIP here as before the fork.
-            // An execution that did not run to completion -- reth's payload
-            // processor aborted because the same block arrived executed
-            // through the hand-off a moment earlier (a sibling re-proposed
-            // after a TC, loop151: "receipt root task received incomplete
-            // receipts") -- has nothing to say about the block: recording its
-            // partial receipts (empty, gas 0) over the build's put every header
-            // the leader made afterwards on the followers' reject list.
+            // An execution that did not cover the block has nothing to say
+            // about it: recording its partial receipts (empty, gas 0) over the
+            // build's put every header the leader made afterwards on the
+            // followers' reject list (loop151). The cause was not an abort: a
+            // header-only own-block payload, executed when its executed insert
+            // had been dropped as outdated, was executed for the zero
+            // transactions it listed (reth counts the payload's transactions,
+            // not the kept block's); the payload now lists them
+            // (`payload_serve`, loop158). An incomplete result here means
+            // something else is wrong, and its state went into the tree:
+            // reported loudly.
             let transactions = block.body().transactions.len();
             if result.receipts.len() != transactions {
-                tracing::warn!(
+                tracing::error!(
                     target: "n42::hotstuff",
                     number = header.number, block = ?block.hash(), transactions, receipts = result.receipts.len(), gas_used = result.gas_used,
                     "an incomplete execution result under deferred execution; its receipts are not recorded"
