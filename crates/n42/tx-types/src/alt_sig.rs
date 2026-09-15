@@ -20,7 +20,14 @@ use alloy_eips::{
 };
 use alloy_primitives::{keccak256, Address, Bytes, ChainId, Keccak256, TxKind, B256, U256};
 use alloy_rlp::{BufMut, Decodable, Encodable, Header};
+use curve25519_dalek::{
+    constants::ED25519_BASEPOINT_POINT,
+    edwards::{CompressedEdwardsY, EdwardsPoint},
+    scalar::Scalar,
+    traits::{IsIdentity, VartimeMultiscalarMul},
+};
 use ed25519_dalek::{Signature as EdSignature, VerifyingKey};
+use sha2::{Digest, Sha512};
 use serde::{Deserialize, Serialize};
 
 /// The EIP-2718 type byte of the alternative-signature transaction.
@@ -358,7 +365,7 @@ pub fn verify_batch(txs: &[&AltSigTx]) -> Vec<Result<Address, AltSigError>> {
         return out;
     }
     let messages: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
-    if ed25519_dalek::verify_batch(&messages, &sigs, &keys).is_ok() {
+    if batch_holds(&messages, &sigs, &keys) {
         for &i in &index {
             out[i] = Ok(txs[i].tx.sender());
         }
@@ -371,6 +378,114 @@ pub fn verify_batch(txs: &[&AltSigTx]) -> Vec<Result<Address, AltSigError>> {
     }
     out
 }
+
+/// Whether a batch verifies: [`batch_equation_holds`], or ed25519-dalek's own batch
+/// verification with `N42_ED25519_MERGE=0`.
+fn batch_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[VerifyingKey]) -> bool {
+    static MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *MERGE.get_or_init(|| std::env::var("N42_ED25519_MERGE").map_or(true, |v| v != "0")) {
+        batch_equation_holds(messages, signatures, keys)
+    } else {
+        ed25519_dalek::verify_batch(messages, signatures, keys).is_ok()
+    }
+}
+
+/// ed25519-dalek's batch verification (`ed25519_dalek::verify_batch`, 2.2) with the terms of
+/// equal keys merged. It checks
+/// `(-sum z_i s_i) B + sum z_i R_i + sum (z_i H(R_i || A_i || M_i)) A_i = 0`
+/// with the random `z_i` drawn from the same transcript in the same order, and adds the
+/// `A_i` terms of one key into one coefficient, so the sum is the same group element and the
+/// verdict the same. What changes is the multiscalar multiplication: a batch from one sender
+/// -- every ingest frame of a flood, a sender's run of nonces -- puts one key point into it
+/// instead of one per signature, 130 points for 128 signatures rather than 257. The
+/// multiplication was a quarter of a fleet node's samples (loop167's leader profile: Ed25519
+/// and SHA-512 39% of the process, keccak 9%).
+fn batch_equation_holds(messages: &[&[u8]], signatures: &[EdSignature], keys: &[VerifyingKey]) -> bool {
+    if messages.len() != signatures.len() || keys.len() != signatures.len() {
+        return false;
+    }
+    let mut transcript = merlin::Transcript::new(b"ed25519 batch verification");
+    let hrams: Vec<[u8; 64]> = signatures
+        .iter()
+        .zip(keys)
+        .zip(messages)
+        .map(|((signature, key), message)| {
+            let mut hash = Sha512::default();
+            hash.update(signature.r_bytes());
+            hash.update(key.as_bytes());
+            hash.update(message);
+            hash.finalize().into()
+        })
+        .collect();
+    for hram in &hrams {
+        transcript.append_message(b"hram", hram);
+    }
+    for signature in signatures {
+        transcript.append_message(b"sig.s", signature.s_bytes());
+    }
+    let mut rng = transcript.build_rng().finalize(&mut ZeroRng);
+    // As ed25519-dalek parses a signature: R taken as it is, s canonical or the batch fails.
+    let mut s_values = Vec::with_capacity(signatures.len());
+    for signature in signatures {
+        let Some(s) = Option::<Scalar>::from(Scalar::from_canonical_bytes(*signature.s_bytes())) else {
+            return false;
+        };
+        s_values.push(s);
+    }
+    let zs: Vec<Scalar> = signatures
+        .iter()
+        .map(|_| {
+            let mut bytes = [0u8; 16];
+            rand_core::RngCore::fill_bytes(&mut rng, &mut bytes);
+            Scalar::from(u128::from_le_bytes(bytes))
+        })
+        .collect();
+    let base_coefficient: Scalar = s_values.iter().zip(&zs).map(|(s, z)| z * s).sum();
+    let mut key_bytes: Vec<&[u8; 32]> = Vec::new();
+    let mut key_points: Vec<EdwardsPoint> = Vec::new();
+    let mut key_coefficients: Vec<Scalar> = Vec::new();
+    for ((key, hram), z) in keys.iter().zip(&hrams).zip(&zs) {
+        let term = Scalar::from_bytes_mod_order_wide(hram) * z;
+        match key_bytes.iter().position(|seen| *seen == key.as_bytes()) {
+            Some(at) => key_coefficients[at] += term,
+            None => {
+                key_bytes.push(key.as_bytes());
+                key_points.push(key.to_edwards());
+                key_coefficients.push(term);
+            }
+        }
+    }
+    let scalars = core::iter::once(-base_coefficient).chain(zs.iter().copied()).chain(key_coefficients);
+    let points = core::iter::once(Some(ED25519_BASEPOINT_POINT))
+        .chain(signatures.iter().map(|signature| CompressedEdwardsY(*signature.r_bytes()).decompress()))
+        .chain(key_points.into_iter().map(Some));
+    EdwardsPoint::optional_multiscalar_mul(scalars, points).is_some_and(|sum| sum.is_identity())
+}
+
+/// The empty randomness ed25519-dalek finalizes its batch transcript with: the coefficients
+/// come from the transcript of the batch alone, as there.
+struct ZeroRng;
+
+impl rand_core::RngCore for ZeroRng {
+    fn next_u32(&mut self) -> u32 {
+        0
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        0
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        dest.fill(0);
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        dest.fill(0);
+        Ok(())
+    }
+}
+
+impl rand_core::CryptoRng for ZeroRng {}
 
 impl Typed2718 for AltSigTx {
     fn ty(&self) -> u8 {
@@ -527,5 +642,127 @@ impl SignerRecoverable for AltSigTx {
 
     fn recover_signer_unchecked(&self) -> Result<Address, RecoveryError> {
         Ok(self.verify()?)
+    }
+}
+
+#[cfg(test)]
+mod merged_batch_tests {
+    use super::*;
+    use alloy_primitives::address;
+
+    fn key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn signed(seed: u8, nonce: u64) -> AltSigTx {
+        TxAltSig {
+            chain_id: 94,
+            nonce,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 2_000_000_000,
+            gas_limit: 21_000,
+            to: address!("00000000000000000000000000000000000000aa"),
+            value: U256::from(1u64),
+            input: Bytes::new(),
+            access_list: Default::default(),
+            alg_type: ALG_ED25519,
+            pubkey: Bytes::copy_from_slice(key(seed).verifying_key().as_bytes()),
+        }
+        .sign_ed25519(&key(seed))
+    }
+
+    fn parts(txs: &[AltSigTx]) -> (Vec<B256>, Vec<EdSignature>, Vec<VerifyingKey>) {
+        (
+            txs.iter().map(|tx| tx.tx.signing_hash()).collect(),
+            txs.iter().map(|tx| tx.ed25519_signature().expect("a signature")).collect(),
+            txs.iter().map(|tx| tx.tx.ed25519_key().expect("a key")).collect(),
+        )
+    }
+
+    /// The merged equation's verdict, asserted equal to ed25519-dalek's.
+    fn verdict(hashes: &[B256], signatures: &[EdSignature], keys: &[VerifyingKey]) -> bool {
+        let messages: Vec<&[u8]> = hashes.iter().map(|hash| hash.as_slice()).collect();
+        let merged = batch_equation_holds(&messages, signatures, keys);
+        let dalek = ed25519_dalek::verify_batch(&messages, signatures, keys).is_ok();
+        assert_eq!(merged, dalek, "merged {merged}, ed25519-dalek {dalek}");
+        merged
+    }
+
+    #[test]
+    fn merged_batch_verdicts_match_ed25519_dalek() {
+        let one_sender: Vec<AltSigTx> = (0..128).map(|nonce| signed(7, nonce)).collect();
+        let (hashes, signatures, keys) = parts(&one_sender);
+        assert!(verdict(&hashes, &signatures, &keys), "one sender");
+
+        let five_senders: Vec<AltSigTx> = (0..64u64).map(|nonce| signed((nonce % 5) as u8 + 1, nonce)).collect();
+        let (hashes, signatures, keys) = parts(&five_senders);
+        assert!(verdict(&hashes, &signatures, &keys), "five senders interleaved");
+
+        let (mut swapped, signatures, keys) = parts(&five_senders);
+        swapped.swap(3, 4);
+        assert!(!verdict(&swapped, &signatures, &keys), "two signatures over each other's message");
+
+        let (hashes, mut signatures, keys) = parts(&one_sender);
+        let mut undecompressable = [0u8; 32];
+        while CompressedEdwardsY(undecompressable).decompress().is_some() {
+            undecompressable[0] += 1;
+        }
+        let mut bytes = signatures[10].to_bytes();
+        bytes[..32].copy_from_slice(&undecompressable);
+        signatures[10] = EdSignature::from_bytes(&bytes);
+        assert!(!verdict(&hashes, &signatures, &keys), "an R that does not decompress");
+
+        let (hashes, mut signatures, keys) = parts(&one_sender);
+        let mut bytes = signatures[20].to_bytes();
+        bytes[32..].copy_from_slice(&[0xff; 32]);
+        signatures[20] = EdSignature::from_bytes(&bytes);
+        assert!(!verdict(&hashes, &signatures, &keys), "an s that is not canonical");
+
+        assert!(verdict(&[], &[], &[]), "an empty batch");
+    }
+
+    /// Per-signature cost of ed25519-dalek's batch verification and the merged equation, for a
+    /// batch from one sender and a batch from 128 senders. A measurement, not a check:
+    /// `cargo test --release -p n42-tx-types --lib merged_batch_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing; run by hand"]
+    fn merged_batch_timing() {
+        let shapes: [(&str, Vec<AltSigTx>); 2] = [
+            ("one sender", (0..128).map(|nonce| signed(9, nonce)).collect()),
+            ("128 senders", (0..128u64).map(|nonce| signed((nonce % 128) as u8 + 100, nonce)).collect()),
+        ];
+        for (name, txs) in shapes {
+            let (hashes, signatures, keys) = parts(&txs);
+            let messages: Vec<&[u8]> = hashes.iter().map(|hash| hash.as_slice()).collect();
+            let per_signature = |f: &dyn Fn() -> bool| {
+                let mut runs: Vec<f64> = (0..60)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        assert!(f());
+                        started.elapsed().as_secs_f64() * 1e6 / 128.0
+                    })
+                    .collect();
+                runs.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+                runs[runs.len() / 2]
+            };
+            let dalek = per_signature(&|| ed25519_dalek::verify_batch(&messages, &signatures, &keys).is_ok());
+            let merged = per_signature(&|| batch_equation_holds(&messages, &signatures, &keys));
+            println!("{name}: ed25519-dalek {dalek:.1} us a signature, merged {merged:.1} us ({:.0}% less)", (1.0 - merged / dalek) * 100.0);
+        }
+    }
+
+    #[test]
+    fn a_batch_with_one_bad_signature_gives_each_transaction_its_own_verdict() {
+        let mut txs: Vec<AltSigTx> = (0..32u64).map(|nonce| signed((nonce % 3) as u8 + 20, nonce)).collect();
+        let (fields, signature, _) = txs[5].clone().into_parts();
+        let mut corrupted = signature.to_vec();
+        corrupted[40] ^= 1;
+        txs[5] = AltSigTx::new(fields, Bytes::from(corrupted));
+        let refs: Vec<&AltSigTx> = txs.iter().collect();
+        let batch = verify_batch(&refs);
+        for (tx, verdict) in txs.iter().zip(batch) {
+            assert_eq!(verdict.is_ok(), tx.verify().is_ok());
+        }
+        assert!(verify_batch(&refs)[5].is_err());
     }
 }

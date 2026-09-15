@@ -8405,9 +8405,12 @@ dependencies = [
  "alloy-rpc-types-eth 2.4.1",
  "alloy-serde 2.4.1",
  "bytes",
+ "curve25519-dalek",
  "ed25519-dalek",
  "fixed-cache",
  "hex",
+ "merlin",
+ "rand_core 0.6.4",
  "reth-codecs",
  "reth-ethereum-primitives",
  "reth-primitives-traits",
@@ -8415,6 +8418,7 @@ dependencies = [
  "revm 42.0.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
 ]
 

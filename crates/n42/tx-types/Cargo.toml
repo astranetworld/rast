@@ -21,6 +21,12 @@ reth-primitives-traits = { workspace = true, features = ["std", "serde", "reth-c
 reth-ethereum-primitives = { workspace = true, features = ["std", "serde", "reth-codec"] }
 reth-codecs = { workspace = true, features = ["std", "alloy"] }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "fast", "batch", "zeroize"] }
+# ed25519-dalek's batch equation with each key's terms merged (`alt_sig::batch_holds`): the
+# crates, versions and transcript its own batch verification is built on (all in its lock).
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "zeroize", "precomputed-tables"] }
+merlin = { version = "3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bytes.workspace = true
 thiserror.workspace = true
