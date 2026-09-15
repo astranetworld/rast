@@ -707,7 +707,24 @@ where
         (root_ms, hashed_at.elapsed().as_millis() as u64, hashed_state)
     } else {
         stage.at(7);
-        let (root, hashed) = rayon::join(root_job, hashed_job);
+        // The root on a thread of its own, never as a rayon job, the way the
+        // assembler's has run since loop113. The forest's mutex is held for the
+        // whole computation, whose hashing waits on the worker pool, and a
+        // worker that waits steals other jobs: with two imports in flight (or a
+        // build's assembly beside one) the worker holding the lock, or one
+        // running its hashing, took the other import's root job, which then
+        // waited for the lock -- loop164 O17 and T17: a new leader's import
+        // stuck at "hashed-state" and its build at "finishing" with every
+        // thread asleep, and the chain stopped for the rest of the tenure. A
+        // plain thread that waits on the pool blocks and steals nothing.
+        let (root, hashed) = std::thread::scope(|scope| {
+            let root = std::thread::Builder::new()
+                .name("qmdb-root".into())
+                .spawn_scoped(scope, root_job)
+                .expect("a thread for the QMDB root");
+            let hashed = hashed_job();
+            (root.join().unwrap_or_else(|_| Err("the QMDB root thread panicked".to_string())), hashed)
+        });
         root?;
         let both = root_at.elapsed().as_millis() as u64;
         (both, 0, hashed?)
