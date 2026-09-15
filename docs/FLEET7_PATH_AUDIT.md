@@ -323,10 +323,69 @@ The next step is the transport under the driver's calls (`h2-el-rpc` `EngineApiC
 JSON-RPC, the builds and imports over three mutex-guarded raw channels) and the driver loop's awaits, to find what
 held the forkchoice; then not starting builds ahead while the node is behind the committed chain.
 
-## 10. Where the work stopped (2026-09-14)
+### Defect 6: the handover stall -- a given-up build ahead froze reth's tree (fixed in 2ce2f60e5)
 
-- (Updated 2026-09-15.) Defect 5 is fixed and confirmed on the fleet (e5d859d82, loop159); the local WIP branch
-  was withdrawn. The handover stall that starts it is the open item (see defect 5 above).
+**Found (loop160-161, 2026-09-15).** loop160 added the commit forkchoice's timing and loop161 an engine message
+trace (`N42_ENGINE_MESSAGE_TRACE=1`) and a per-second thread sampler. In loop161 W node3's commit forkchoice for block
+190 and its own block 191 were taken off the engine's stream within 40 ms of being sent and answered 11.1 s later;
+node4 did the same at block 256 (9.7 s). The tree thread slept in a futex the whole time, persistence was idle on
+node4, and every follower idled because nothing new arrived; the view timed out and a TC followed. It is not the
+transport, the driver loop or the box: reth v2.5.1's tree, on a completed persistence, defers the in-memory
+hand-off while any payload job holds a build lease (`PayloadBuildTracker`, one lease per forkchoice with
+attributes), and while that hand-off is pending `wait_for_event` waits only for "payload build finished" and takes
+no engine message. The driver aborted a build ahead it gave up (a mismatched proposal, a newer parent, a refused
+build on the sealed block): that drops its own task, not the execution layer's job, which then lives to its
+deadline -- `--builder.deadline` 3 s plus up to three times that while the chain's whole-second timestamps run ahead
+of the wall clock, 12 s in all. Both freezes ended 11.8-12.2 s after the abandoned job was created.
+(`--engine.persistence-backpressure-threshold 1024` rules out reth's other stop, the persistence back-pressure.)
+
+**Fix.** A build ahead that a forkchoice started is told it was given up instead of aborted: it skips its
+forkchoice if it has not sent it, or resolves its job -- resolving always removes a job -- and drops the block. A
+build on the sealed block starts no job and is still aborted. Test: a mock resolve gate holds the build between its
+forkchoice and its resolve; the old code never resolves.
+
+### Defect 7: a follower that fell behind never caught up -- early Decides were dropped (fixed in 2ce2f60e5)
+
+loop160 V10 node1 (94 failed direct imports), C10 node5 (39) and loop161 W node0 (39), B11 node1 (44) fell behind and
+stayed there. The service dropped a Decide for a block that was neither imported nor importing yet ("not finalised
+here"), so the block was imported but never canonical, and each child's direct import waited out its parent
+(`header known: false, execution fields known: true`) and went the engine's slower way. On a node already behind
+most Decides arrive before the import starts (C10 node5: 187 of 318; V10 node1: 96; W node0: 42; healthy nodes 0-1),
+so the cascade fed itself. The driver now keeps such a commit (`commit_when_imported`) and runs its forkchoice when
+the import lands, as it already did for a commit that ran before its body. A parent wait that times out now says
+which half was missing. (A longer wait for a parent whose direct import was still running, tried in loop161, never
+triggered and was removed.)
+
+**Confirmed (loop162, six legs, against loop160-161 on the same configuration).**
+
+| leg | win1 | round (M tx) | TC | handover stalls | failed direct imports | undelivered FCU answers | given-up jobs resolved |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| W | 288,214 | 20.06 | 1 | 0 | 0 | 0 | 3 |
+| V12 | 308,809 | 20.85 | 1 | 0 | 0 | 0 | 3 |
+| C12 | 304,149 | 21.19 | 1 | 0 | 0 | 0 | 4 |
+| B12 | 321,753 | 22.04 | 1 | 0 | 0 | 0 | 4 |
+| V13 | 293,268 | 20.21 | 1 | 0 | 0 | 0 | 3 |
+| C13 | 325,304 | 21.84 | 2 | 0 | 0 | 0 | 4 |
+
+loop160-161's ten legs had 1-5 TCs each, up to 9 engine idles over 5 s, up to 2 undelivered forkchoice answers and
+a node with 39-94 failed direct imports in five of them, at 8.5-20.7M transactions a round. Every TC left in loop162
+is the start-up view 1, except C13's view 276 (defect 8). Window 3 no longer collapses (163-191k against 49-223k).
+
+### Defect 8: a leader lost a view while its own parent was still importing (fix in test, loop163)
+
+loop162 C13 node4, in the middle of its tenure: its own block 275 took 970 ms to reach the engine, the build on the
+sealed block was refused (no QMDB tree for 275 yet), the fallback forkchoice was answered SYNCING, and the service
+gave up the view ("could not build a block to propose") -- it asks again only when `driver.is_importing(head)`, which
+counts follower imports, not the leader's own import on its task. The driver now tracks its own imports in flight
+(`is_importing_own_block`), and the proposal retries on either. It is kept out of `is_importing` on purpose: a commit
+for a block counted there waits for a follower import's report, which an own import never sends.
+
+## 10. Where the work stopped (2026-09-15)
+
+- Defects 5-7 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5; loop159, loop162). Defect 8's fix is
+  written and unit-tested; loop163 (W V14 O14 C14 O15) confirms it and runs the QMDB plan's stage 6c
+  `N42_QMDB_READS=on` legs. Defect 3 (an invalid block after a hang, a TC and a reorg) has not recurred since
+  defect 5's fix; the C9 one-off (node6's state root for an empty block 79) is not explained.
 - History from 2026-09-01 was rewritten twice to take assistant attribution out of commit messages and then to
   point eight messages at the rewritten hashes; the pre-rewrite refs are kept under `refs/backup/` and in bundles
   under `/data/blockchain/git-backup/`.
@@ -334,4 +393,3 @@ held the forkchoice; then not starting builds ahead while the node is behind the
   freed and debug info off. Locally every test passes in 1-2 s at no more than 2.6 GB under a runner's limits, so
   the build is the suspect; the reproduction under 4 CPUs and 16 GB (`taskset` + `CARGO_BUILD_JOBS=4`, not a
   user scope's `AllowedCPUs`, which this box does not honour) has not run yet.
-- Nothing is running or queued; the box was under another session's claim at the pause.
